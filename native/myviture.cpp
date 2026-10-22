@@ -126,11 +126,14 @@ static int safe_get_pose(float* m, double t) {
 constexpr int POSE_FLOATS = 64;
 
 /** Engine pose at device time t (0: its latest visual estimate), row-major. */
+static float g_last_status = 0;
 static bool engine_pose(double t, M4& r) {
     float m[POSE_FLOATS];
+    m[30] = -1;
     int rc;
     { std::lock_guard<std::mutex> l(g_vio_mu); rc = safe_get_pose(m, t); }
     if (rc) return false;
+    g_last_status = m[30];
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) r(i, j) = m[j * 4 + i];  // column-major -> row-major
     return true;
 }
@@ -189,7 +192,8 @@ static std::atomic<bool> g_engine_predict{true};
 static void pose_thread() {
     M4 r, last{};
     while (!g_quit) {
-        if (engine_pose(g_engine_predict ? device_now() : 0.0, r) && memcmp(&r, &last, sizeof r)) {
+        // At the newest IMU sample's own time: the engine cannot integrate past it.
+        if (engine_pose(g_engine_predict ? (double)g_imu_t : 0.0, r) && memcmp(&r, &last, sizeof r)) {
             last = r;
             PoseSample s{qpc_now(), mat_q(r), {r(0, 3), r(1, 3), r(2, 3)}};
             std::lock_guard<std::mutex> l(g_pose_mu);
@@ -471,7 +475,8 @@ int main(int argc, char** argv) {
     // Statistics: pose read time per present, matched to the vblank it was shown at.
     struct Pending { UINT present; int64_t pose_qpc; };
     std::vector<Pending> pending;
-    std::vector<double> latencies, cpu_ms, jerk;
+    std::vector<double> latencies, cpu_ms, jerk, gain;
+    long status_counts[10] = {};
     UINT last_refresh = 0, last_present_seen = 0;
     long missed = 0, shown = 0, last_updates = 0;
     int64_t stats_t0 = qpc_now(), frame_t0 = qpc_now();
@@ -491,7 +496,20 @@ int main(int argc, char** argv) {
         if (g_engine_predict) {
             // The engine's own prediction (IMU-rate), for when this frame is on screen.
             M4 r;
-            if (engine_pose(device_now() + g_predict_ms / 1000.0, r)) { q = mat_q(r); p = {r(0, 3), r(1, 3), r(2, 3)}; have = true; }
+            // From the newest IMU sample: its age plus the lead to the screen.
+            double base = g_imu_t, target = device_now() + g_predict_ms / 1000.0;
+            M4 b;
+            bool got_base = engine_pose(base, b);
+            if (engine_pose(target, r)) {
+                q = mat_q(r); p = {r(0, 3), r(1, 3), r(2, 3)}; have = true;
+                status_counts[(int)std::clamp(g_last_status, -1.0f, 8.0f) + 1]++;
+                // How far the engine moved the pose ahead, against the head's speed.
+                if (got_base && rate_dps > 30) {
+                    Q d = qmul(q, qconj(mat_q(b)));
+                    float ang = 2 * atan2f(sqrtf(d.x * d.x + d.y * d.y + d.z * d.z), fabsf(d.w)) * 57.2958f;
+                    gain.push_back(ang / (rate_dps * (target - base)));
+                }
+            }
         }
         int64_t pose_qpc = qpc_now();
         // Shake seen by the eye: change of the per-frame rotation step (deg), RMS.
@@ -581,6 +599,13 @@ int main(int argc, char** argv) {
                 printf("%5.1f fps  pose %4.0f Hz  pose->vblank p50 %4.1f p99 %4.1f ms  CPU %4.2f ms  missed %ld  head max %4.0f deg/s  shake p50 %.3f p99 %.3f deg  %s %.0f ms\n",
                        shown * 1000.0 / since, updates * 1000.0 / since, pct(latencies, 0.5), pct(latencies, 0.99), pct(cpu_ms, 0.5), missed, max_rate,
                        pct(jerk, 0.5), pct(jerk, 0.99), g_engine_predict ? "engine" : "ours", g_predict_ms);
+            if (g_engine_predict && !g_stats_paused) {
+                printf("      engine lead used: %.2f of the head's motion (n %zu)  status:", pct(gain, 0.5), gain.size());
+                for (int k = 0; k < 10; k++) if (status_counts[k]) printf(" [%d]=%ld", k - 1, status_counts[k]);
+                printf("\n");
+            }
+            gain.clear();
+            for (long& c : status_counts) c = 0;
             latencies.clear(); cpu_ms.clear(); jerk.clear(); shown = 0; missed = 0; max_rate = 0; last_updates = g_pose_updates;
             stats_t0 = qpc_now();
         }
