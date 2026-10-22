@@ -1,0 +1,10 @@
+node_modules
+dist
+*.bin
+*.pgm
+public/mediapipe
+.env.local
+bridge/*.exe
+bridge/*.obj
+.claude/
+.wrangler/

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <title>myViture · lunettes</title>
+    <!-- Dedicated window placed on the glasses' screen. The dashboard renders the
+         immersive scene into #view; a click anywhere (or F11) goes fullscreen, a double
+         click closes the scene (Escape too, once out of fullscreen). -->
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+      #view { width: 100%; height: 100%; display: block; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <script>
+      document.addEventListener('click', () => {
+        if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+      });
+      document.addEventListener('dblclick', () => window.close());
+    </script>
+  </body>
+</html>

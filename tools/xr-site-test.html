@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Test site WebXR</title>
+  <style>body { margin: 0; background: #223; color: #ccd; font: 14px system-ui; } p { padding: 12px; }</style>
+  <!-- What the extension injects (MAIN world, document_start). -->
+  <script src="/extension/xr-runtime.js"></script>
+  <script>
+    // Stands in for relay.js + background.js: feed from the dashboard's channel (same
+    // origin here), and the placement answered at once instead of moving the tab.
+    const TAG = '__myvitureXr';
+    let relaying = false;
+    window.xrTest = { hello: 0, sessions: [] };
+    addEventListener('message', e => {
+      const t = e.data?.[TAG];
+      if (t === 'hello') { relaying = true; xrTest.hello++; }
+      if (t === 'session') {
+        xrTest.sessions.push(e.data.active);
+        if (e.data.active) postMessage({ [TAG]: 'placed', ok: true }, '*');
+      }
+    });
+    new BroadcastChannel('myviture-xr').onmessage = e => { if (relaying) postMessage({ [TAG]: 'feed', feed: e.data }, '*'); };
+  </script>
+</head>
+<body>
+  <p>Un site WebXR ordinaire (three.js + ARButton). Échap quitte la session.</p>
+  <script type="module">
+    // The site's own code, unchanged from a three.js AR example.
+    import * as THREE from 'three';
+    import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(ARButton.createButton(renderer));
+
+    const scene = new THREE.Scene();
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x445066, 3));
+    const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 20);
+    const cube = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.2), new THREE.MeshStandardMaterial({ color: 0x44aaff }));
+    cube.position.set(0, 0, -1);
+    scene.add(cube);
+    let frames = 0;
+    renderer.setAnimationLoop(() => {
+      cube.rotation.y += 0.02;
+      if (renderer.xr.isPresenting) frames++;
+      renderer.render(scene, camera);
+    });
+    window.xrTest.state = () => ({ presenting: renderer.xr.isPresenting, frames, button: document.getElementById('ARButton')?.textContent, size: [renderer.domElement.width, renderer.domElement.height] });
+  </script>
+</body>
+</html>

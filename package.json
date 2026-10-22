@@ -1,0 +1,28 @@
+{
+  "name": "myviture",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "probe": "tsx tools/probe.ts",
+    "postinstall": "node -e \"require('fs').cpSync('node_modules/@mediapipe/tasks-vision/wasm','public/mediapipe/wasm',{recursive:true})\"",
+    "build:extension": "vite build -c vite.extension.config.ts",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^1.1.1",
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/three": "^0.186.0",
+    "@types/w3c-web-usb": "^1.0.14",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "usb": "^3.2.1",
+    "vite": "^8.3.5"
+  }
+}

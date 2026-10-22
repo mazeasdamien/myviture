@@ -1,0 +1,14 @@
+{
+  // viture.agentxr.app: dist/ (npm run build) behind a password, plus the /orange proxy.
+  // Secrets: wrangler secret put SITE_PASSWORD / ORANGE_PROXY_SECRET.
+  "name": "myviture",
+  "main": "worker/index.js",
+  "account_id": "965379cd15db66ae26b2f741a101c50b",
+  "compatibility_date": "2026-10-01",
+  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": true },
+  "routes": [{ "pattern": "viture.agentxr.app", "custom_domain": true }],
+  // Only the custom domain: a workers.dev URL would be one more door to watch.
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": { "ORANGE_GATEWAY": "https://robots-gateway.maori-innov.app" }
+}

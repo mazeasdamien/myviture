@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "myViture WebXR",
+  "version": "0.1.0",
+  "description": "Gives any WebXR site the VITURE Luma Ultra glasses as an immersive-ar device, fed by the myViture dashboard.",
+  "permissions": ["system.display"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["xr-runtime.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["relay.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://viture.agentxr.app/*"],
+      "js": ["app.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

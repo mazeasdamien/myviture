@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>myViture</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='11' width='11' height='9' rx='3' fill='%233d6bff'/%3E%3Crect x='18' y='11' width='11' height='9' rx='3' fill='%233d6bff'/%3E%3Crect x='13' y='13' width='6' height='2' fill='%23ff7a45'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <h1>myViture</h1>
+        <span class="sub">VITURE Luma Ultra · WebUSB, sans SDK</span>
+      </div>
+      <p id="banner" class="banner" hidden></p>
+      <div class="actions">
+        <span class="chip" id="chip-usb" data-state="off">Lunettes</span>
+        <span class="chip" id="chip-rgb" data-state="off">RGB</span>
+        <span class="chip" id="chip-6dof" data-state="off">6DoF</span>
+        <select id="sel-source" aria-label="Suivi" title="Suivi de la tête : moteur VITURE (SDK, via le pont) ou le nôtre (sans SDK)">
+          <option value="viture">Suivi VITURE</option>
+          <option value="usb">Suivi maison</option>
+        </select>
+        <button id="btn-connect" class="primary">Connecter les lunettes</button>
+        <button id="btn-rgb">Caméra RGB</button>
+        <button id="btn-immersive" class="accent">Scène 3D</button>
+        <button id="btn-webxr" title="Ouvre une page WebXR standard (three.js) sur les lunettes">WebXR</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card area-orient">
+        <header>
+          <h2>Tête</h2>
+          <div class="tools">
+            <label class="toggle"><input type="checkbox" id="chk-6dof" checked /> 6DoF</label>
+            <button id="btn-recenter" title="Raccourci : R">Recentrer</button>
+            <button id="btn-level" title="Regarder droit devant puis cliquer">Niveau</button>
+            <button id="btn-clear-trail" title="Effacer la trace">⌫</button>
+          </div>
+        </header>
+        <div class="fill split">
+          <canvas id="preview" class="preview"></canvas>
+          <dl class="readout">
+            <dt>Lacet</dt><dd id="v-yaw">-</dd>
+            <dt>Tangage</dt><dd id="v-pitch">-</dd>
+            <dt>Roulis</dt><dd id="v-roll">-</dd>
+            <dt>Position</dt><dd id="v-pos">3DoF</dd>
+            <dt>Suivi</dt><dd id="v-track">-</dd>
+            <dt>Immobile</dt><dd id="v-still">-</dd>
+            <dt title="Tremblement : écart à la moyenne sur ±60 ms, sur les 2 dernières secondes (le mouvement régulier de la tête ne compte pas)">VITURE</dt><dd id="v-cmp-v">-</dd>
+            <dt title="Notre suivi, calculé en parallèle sur les mêmes données">Nous</dt><dd id="v-cmp-o">-</dd>
+          </dl>
+        </div>
+      </section>
+
+      <section class="card area-stereo">
+        <header>
+          <h2>Caméras de suivi <small>640×480 stéréo</small></h2>
+          <div class="tools">
+            <label class="toggle"><input type="checkbox" id="chk-ae" checked /> Expo auto</label>
+            <label class="slider">Expo <input type="range" id="rng-exp" min="64" max="12288" step="16" value="2048" /><output id="o-exp">2048</output></label>
+            <label class="slider">Gain <input type="range" id="rng-gain" min="16" max="255" value="64" /><output id="o-gain">64</output></label>
+            <button id="btn-stereo-snap" title="Capturer les deux images">📷</button>
+          </div>
+        </header>
+        <div class="fill stereo">
+          <div class="cam-wrap"><canvas id="cam-left" width="640" height="480"></canvas><canvas id="overlay-left" class="overlay"></canvas><canvas id="obj-overlay-left" class="overlay"></canvas><span class="badge">Gauche</span></div>
+          <div class="cam-wrap"><canvas id="cam-right" width="640" height="480"></canvas><canvas id="overlay-right" class="overlay"></canvas><span class="badge">Droite</span></div>
+        </div>
+      </section>
+
+      <section class="card area-rgb">
+        <header>
+          <h2>Caméra RGB</h2>
+          <div class="tools">
+            <select id="sel-rgb" aria-label="Caméra"></select>
+            <button id="btn-rgb-calib" title="Calibrer la caméra RGB avec tes mains (20 s)">Calibrer</button>
+            <button id="btn-snap" title="Photo">📷</button>
+            <label class="toggle" title="Superposer la scène 3D au flux RGB (vue à la première personne)"><input type="checkbox" id="chk-mr" checked /> MR</label>
+            <button id="btn-rec" title="Enregistrer la vidéo (avec la scène si MR)">⏺</button>
+          </div>
+        </header>
+        <div class="fill video-wrap">
+          <video id="rgb" autoplay playsinline muted></video>
+          <canvas id="mr-overlay" class="overlay"></canvas>
+          <canvas id="hand-overlay" class="overlay"></canvas>
+          <canvas id="obj-overlay" class="overlay"></canvas>
+          <span class="badge" id="rgb-info">inactive</span>
+        </div>
+      </section>
+
+      <section class="card area-imu">
+        <header>
+          <h2>IMU <small>1000 Hz, repère tête</small></h2>
+          <div class="tools">
+            <button id="btn-imu-rec">CSV</button>
+            <label class="toggle"><input type="checkbox" id="chk-pause" /> Pause</label>
+          </div>
+        </header>
+        <div class="fill charts">
+          <div class="chart">
+            <div class="legend"><b>Gyro</b> rad/s <i class="x">x</i><i class="y">y</i><i class="z">z</i> <span id="v-gyro" class="mono"></span></div>
+            <canvas id="chart-gyro"></canvas>
+          </div>
+          <div class="chart">
+            <div class="legend"><b>Accél</b> m/s² <i class="x">x</i><i class="y">y</i><i class="z">z</i> <span id="v-accel" class="mono"></span></div>
+            <canvas id="chart-accel"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <section class="card area-depth">
+        <header>
+          <h2>Profondeur</h2>
+          <div class="tools">
+            <label class="toggle"><input type="checkbox" id="chk-depth" checked /> Calcul</label>
+            <label class="toggle"><input type="checkbox" id="chk-occlusion" /> Occlusion</label>
+            <label class="toggle"><input type="checkbox" id="chk-show-depth" /> Maillage</label>
+          </div>
+        </header>
+        <div class="assist-row">
+          <label class="toggle" title="Afficher les points mémorisés de la pièce dans la scène 3D"><input type="checkbox" id="chk-map" /> Carte</label>
+          <button id="btn-anchor" title="Pose une ancre là où tu regardes (elle restera à cet endroit, même après redémarrage)">Ancrer ici</button>
+          <button id="btn-map-clear" title="Oublie la pièce et ses ancres">Oublier</button>
+          <span class="note mono" id="map-info">mémoire : -</span>
+        </div>
+        <div class="fill depth-wrap"><canvas id="depth-map" width="320" height="240"></canvas></div>
+        <p class="note mono" id="depth-info">-</p>
+      </section>
+
+      <section class="card area-ctrl">
+        <header>
+          <h2>Mains</h2>
+          <div class="tools">
+            <label class="toggle"><input type="checkbox" id="chk-hands" checked /> Suivi</label>
+            <select id="sel-hand-source" aria-label="Source">
+              <option value="stereo">Stéréo</option>
+              <option value="rgb">RGB</option>
+            </select>
+          </div>
+        </header>
+        <p class="note mono" id="hands-info">-</p>
+        <label class="slider" id="hfov-wrap" hidden>Champ RGB <input type="range" id="rng-hfov" min="50" max="110" value="78" /><output id="o-hfov">78°</output></label>
+        <header class="sub-header">
+          <h2>Affichage</h2>
+          <div class="tools"><button id="btn-display-reset">Réinit.</button></div>
+        </header>
+        <div class="form">
+          <label class="slider">Champ vert. <input type="range" id="rng-vfov" min="20" max="40" step="0.05" /><output id="o-vfov"></output></label>
+          <label class="slider">Écart yeux <input type="range" id="rng-ipd" min="50" max="76" step="0.5" /><output id="o-ipd"></output></label>
+          <label class="slider">Hauteur <input type="range" id="rng-eye-y" min="-60" max="60" step="1" /><output id="o-eye-y"></output></label>
+          <label class="slider">Recul <input type="range" id="rng-eye-z" min="-60" max="60" step="1" /><output id="o-eye-z"></output></label>
+          <label class="slider">Inclinaison <input type="range" id="rng-pitch" min="-20" max="20" step="0.1" /><output id="o-pitch"></output></label>
+          <label class="slider" title="Extrapolation de la tête par le gyroscope pour compenser la latence d'affichage">Prédiction <input type="range" id="rng-predict" min="0" max="80" step="1" value="30" /><output id="o-predict">30 ms</output></label>
+          <label class="toggle" title="Poteaux verts tous les 15° à 2 m : ils doivent rester collés au monde réel quand tu tournes la tête"><input type="checkbox" id="chk-anchor" /> Test d'ancrage</label>
+        </div>
+      </section>
+
+      <section class="card area-device">
+        <header>
+          <h2>Assistant</h2>
+          <div class="tools">
+            <button id="btn-talk" title="Maintenir pour parler (ou barre d'espace)">🎤</button>
+            <label class="toggle" title="Écoute mains libres : commence ta phrase par « lunettes »"><input type="checkbox" id="chk-listen" /> Écoute</label>
+            <select id="sel-voice" aria-label="Voix">
+              <option value="orange">Voix Orange</option>
+              <option value="browser">Voix navigateur</option>
+              <option value="off">Muet</option>
+            </select>
+          </div>
+        </header>
+        <div class="assist-row">
+          <select id="sel-see-cam" aria-label="Caméra de l’assistant" title="Caméra regardée par l’assistant. Gauche : calibrée d’usine, alignée avec la profondeur, sans calibration RGB.">
+            <option value="stereo">Caméra gauche</option>
+            <option value="rgb">Caméra RGB</option>
+          </select>
+          <button id="btn-see" title="Décrit ce que voit la caméra">Que vois-tu ?</button>
+          <button id="btn-objects" title="Repère les objets et les étiquette dans la scène 3D">Objets</button>
+          <button id="btn-labels-clear" title="Efface les étiquettes">⌫</button>
+          <span class="meter"><i id="mic-level"></i></span>
+        </div>
+        <div class="assist-row">
+          <select id="sel-vision-model" aria-label="Modèle de vision" title="Modèle pour « Que vois-tu ? », « Objets » et les questions. Prix en $ par million de jetons (entrée / sortie), puis coût et durée mesurés par appel."></select>
+        </div>
+        <p class="note assist-log" id="assistant-log">Pose une question (🎤 ou espace), ou « Objets ».</p>
+        <p class="note mono" id="ai-cost" title="Coûts rapportés par la passerelle Orange (LiteLLM), en dollars US">Coût IA : -</p>
+        <header class="sub-header"><h2>Lunettes</h2></header>
+        <dl class="kv">
+          <dt>Modèle</dt><dd id="d-product">-</dd>
+          <dt>Série</dt><dd id="d-serial">-</dd>
+          <dt>Firmware</dt><dd id="d-fw">-</dd>
+          <dt>Temp. IMU</dt><dd id="d-temp">-</dd>
+          <dt>IMU</dt><dd id="d-imu-rate">-</dd>
+          <dt>Caméras</dt><dd id="d-cam-rate">-</dd>
+          <dt>Vsync</dt><dd id="d-vsync">-</dd>
+          <dt>Biais gyro</dt><dd id="d-gbias">-</dd>
+          <dt>Cam. G</dt><dd id="d-cam0">-</dd>
+          <dt>Cam. D</dt><dd id="d-cam1">-</dd>
+        </dl>
+      </section>
+    </main>
+
+    <div id="immersive" class="immersive" hidden>
+      <canvas id="immersive-canvas"></canvas>
+      <div class="hud">
+        <button id="btn-fs">Plein écran sur les lunettes</button>
+        <button id="btn-sbs">SBS 3D : non</button>
+        <button id="btn-im-recenter">Recentrer</button>
+        <button id="btn-exit">Quitter</button>
+        <span>R recentrer · S stéréo · F plein écran · Échap quitter</span>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
