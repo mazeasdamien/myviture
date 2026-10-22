@@ -209,7 +209,7 @@ inline std::vector<Palm> detect_palms(Models& M, const uint8_t* img, int w, int 
     std::vector<Palm> cand;
     for (size_t i = 0; i < M.anchors.size(); i++) {
         double s = 1 / (1 + std::exp(-sc[i]));
-        if (s < 0.5) continue;
+        if (s < 0.4) continue;
         const float* r = reg + i * 18;
         double ax = M.anchors[i][0], ay = M.anchors[i][1];
         double cx = r[0] / N + ax, cy = r[1] / N + ay, bw = r[2] / N, bh = r[3] / N;
@@ -260,7 +260,7 @@ constexpr float PRESENCE_MIN = 0.3f;
  * Landmarks of the hand in `roi`; false if the model says there is no hand. presence and
  * hand (handedness, 1 = the wearer's right) are returned for the diagnostics.
  */
-inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand) {
+inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand, float world[N_JOINTS][3] = nullptr) {
     const int N = 224;
     static std::vector<float> in(N * N * 3);
     crop(img, w, h, roi, N, in.data());
@@ -273,13 +273,14 @@ inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& ro
     auto o = M.lm.Run(Ort::RunOptions{nullptr}, in_names, &t, 1, out_names.data(), out_names.size());
     // Outputs: landmarks (63, in 224 px), presence, handedness, world landmarks (63); the
     // two scalars told apart by name when the export names them, else by order.
-    const float* lmk = nullptr; int scalars = 0;
+    const float* lmk = nullptr; const float* wld = nullptr; int scalars = 0;
     presence = hand = 0;
     for (size_t i = 0; i < o.size(); i++) {
         size_t n = o[i].GetTensorTypeAndShapeInfo().GetElementCount();
         const std::string& name = M.lm_out[i];
         float v = n == 1 ? o[i].GetTensorData<float>()[0] : 0;
         if (n == 63 && !lmk) lmk = o[i].GetTensorData<float>();
+        else if (n == 63) wld = o[i].GetTensorData<float>();
         else if (n == 1 && name.find("hand") != std::string::npos) hand = v;
         else if (n == 1 && (name.find("conf") != std::string::npos || name.find("pres") != std::string::npos || name.find("flag") != std::string::npos)) presence = v;
         else if (n == 1) { (scalars++ == 0 ? presence : hand) = v; }
@@ -290,6 +291,46 @@ inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& ro
         from_roi(roi, lmk[k * 3] / N, lmk[k * 3 + 1] / N, x, y);
         out[k][0] = (float)x; out[k][1] = (float)y;
     }
+    if (world && wld) {
+        // Metres, hand-centred, in the crop's orientation: turn back like the image points.
+        double c = std::cos(roi.angle), sn = std::sin(roi.angle);
+        for (int k = 0; k < N_JOINTS; k++) {
+            float wx = wld[k * 3], wy = wld[k * 3 + 1];
+            world[k][0] = (float)(wx * c - wy * sn); world[k][1] = (float)(wx * sn + wy * c); world[k][2] = wld[k * 3 + 2];
+        }
+    }
+    return true;
+}
+
+/**
+ * Where a hand seen by camera `from` should be in the other camera: its depth from the
+ * ratio of the metric hand (world landmarks) to the hand in the image, then the 3D
+ * joints projected into the other camera. The region covers the projected joints.
+ */
+inline bool predict_roi(const calib::Rig& rig, int from, const float lm[N_JOINTS][2], const float world[N_JOINTS][3], Roi& out, double& depth) {
+    const calib::Camera& A = rig.cam[from];
+    const calib::Camera& B = rig.cam[1 - from];
+    double n[N_JOINTS][2];
+    for (int k = 0; k < N_JOINTS; k++) A.undistort(lm[k][0], lm[k][1], n[k][0], n[k][1]);
+    // Scale: metric distances over normalised-image distances, summed over all joint pairs.
+    double num = 0, den = 0;
+    for (int i = 0; i < N_JOINTS; i++) for (int j = i + 1; j < N_JOINTS; j++) {
+        double dn = std::hypot(n[i][0] - n[j][0], n[i][1] - n[j][1]);
+        double dw = std::hypot(world[i][0] - world[j][0], world[i][1] - world[j][1]);
+        num += dw; den += dn;
+    }
+    if (den < 1e-6) return false;
+    depth = num / den;
+    if (depth < 0.12 || depth > 1.5) return false;
+    float proj[N_JOINTS][2];
+    for (int k = 0; k < N_JOINTS; k++) {
+        double c[3] = {n[k][0] * depth, n[k][1] * depth, depth}, p[3], u, v;
+        A.to_head(c, p);
+        if (!B.project(p, u, v)) return false;
+        proj[k][0] = (float)u; proj[k][1] = (float)v;
+    }
+    out = roi_from_landmarks(proj);
+    out.size *= 1.25;  // the depth is rough: a little margin
     return true;
 }
 
@@ -304,9 +345,11 @@ struct Track {
     Roi roi;
     float side = 0.5f;  // 1 = right
     float lm[N_JOINTS][2];
+    float world[N_JOINTS][3];
     int misses = 0;
     float presence = 0;
     bool fresh = false;  // landmarks from this frame
+    bool assisted = false;  // started from the other camera's hand
     bool right() const { return side > 0.5f; }
 };
 constexpr int MAX_MISSES = 4;  // frames a hand may be missed before it is dropped
@@ -346,7 +389,7 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                 if (!tr.on) continue;
                 float pres, hand;
                 float lm[N_JOINTS][2];
-                if (landmarks(M, img[c].data(), w, h, tr.roi, lm, pres, hand)) {
+                if (landmarks(M, img[c].data(), w, h, tr.roi, lm, pres, hand, tr.world)) {
                     memcpy(tr.lm, lm, sizeof lm);
                     tr.side = 0.85f * tr.side + 0.15f * hand;
                     tr.roi = roi_from_landmarks(tr.lm);
@@ -366,19 +409,54 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                     Roi r = roi_from_palm(p);
                     // Skip palms inside a hand already followed.
                     bool known = false;
-                    for (auto& tr : tracks[c]) if (tr.on && std::hypot(tr.roi.cx - r.cx, tr.roi.cy - r.cy) < tr.roi.size * 0.4) known = true;
+                    for (auto& tr : tracks[c]) if (tr.on && std::hypot(tr.roi.cx - r.cx, tr.roi.cy - r.cy) < tr.roi.size * 0.3) known = true;
                     if (known) continue;
                     for (int k = 0; k < 2; k++) {
                         auto& tr = tracks[c][k];
                         if (tr.on) continue;
                         float pres, hand;
-                        if (landmarks(M, img[c].data(), w, h, r, tr.lm, pres, hand)) {
-                            tr.on = true; tr.side = hand; tr.roi = roi_from_landmarks(tr.lm); tr.misses = 0; tr.presence = pres; tr.fresh = true;
-                            logf("hands: cam %d slot %d found (presence %.2f, handedness %.2f)\n", c, k, pres, hand);
+                        if (landmarks(M, img[c].data(), w, h, r, tr.lm, pres, hand, tr.world)) {
+                            tr.on = true; tr.side = hand; tr.roi = roi_from_landmarks(tr.lm); tr.misses = 0; tr.presence = pres; tr.fresh = true; tr.assisted = false;
+                            logf("hands: cam %d slot %d found (presence %.2f, handedness %.2f, palm %.2f)\n", c, k, pres, hand, p.score);
                         }
                         break;
                     }
                 }
+            }
+        }
+
+        // Stereo assistance: a hand fresh in one camera and absent from the other is
+        // looked for in the other at its predicted place, without the palm detector.
+        for (int c = 0; c < 2; c++) {
+            int o = 1 - c;
+            for (auto& src : tracks[c]) {
+                if (!src.on || !src.fresh) continue;
+                // Already matched by a fresh track in the other camera?
+                bool have = false;
+                for (auto& tr : tracks[o]) if (tr.on && tr.fresh) {
+                    double sum = 0; int n = 0;
+                    for (int k : {0, 5, 9, 13, 17}) {
+                        double d1[3], d2[3], p[3], gap;
+                        rig.cam[c].ray(src.lm[k][0], src.lm[k][1], d1);
+                        rig.cam[o].ray(tr.lm[k][0], tr.lm[k][1], d2);
+                        if (calib::triangulate(rig.cam[c].origin, d1, rig.cam[o].origin, d2, p, gap)) { sum += gap; n++; }
+                    }
+                    if (n && sum / n < 0.04) have = true;
+                }
+                if (have) continue;
+                Roi r; double depth;
+                if (!predict_roi(rig, c, src.lm, src.world, r, depth)) continue;
+                Track* slot = nullptr;
+                for (auto& tr : tracks[o]) if (!tr.on) { slot = &tr; break; }
+                if (!slot) for (auto& tr : tracks[o]) if (!tr.fresh) { slot = &tr; break; }  // a stale track: replace it
+                if (!slot) continue;
+                float pres, hand;
+                float lm[N_JOINTS][2], wd[N_JOINTS][3];
+                if (landmarks(M, img[o].data(), w, h, r, lm, pres, hand, wd)) {
+                    memcpy(slot->lm, lm, sizeof lm); memcpy(slot->world, wd, sizeof wd);
+                    slot->on = true; slot->side = src.side; slot->roi = roi_from_landmarks(lm); slot->misses = 0; slot->presence = pres; slot->fresh = true; slot->assisted = true;
+                    logf("hands: cam %d found from cam %d (depth %.2f m, presence %.2f)\n", o, c, depth, pres);
+                } else if (frames % 25 == 0) logf("hands: cam %d assist from cam %d failed (depth %.2f m, presence %.2f)\n", o, c, depth, pres);
             }
         }
 

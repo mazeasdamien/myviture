@@ -25,6 +25,24 @@ struct Camera {
         double s = std::tan(ang) / (2 * std::tan(w / 2)) / rd;
         x = xd * s; y = yd * s;
     }
+    /** Undistorted normalised coordinates -> pixel (FOV model). */
+    void distort(double x, double y, double& u, double& v) const {
+        double ru = std::hypot(x, y);
+        double s = w < 1e-6 || ru < 1e-9 ? 1 : std::atan(ru * 2 * std::tan(w / 2)) / w / ru;
+        u = fx * x * s + cx; v = fy * y * s + cy;
+    }
+    /** Head-frame point -> pixel; false if behind the camera. */
+    bool project(const double p[3], double& u, double& v) const {
+        double d[3] = {p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]}, c[3];
+        for (int i = 0; i < 3; i++) c[i] = R[i] * d[0] + R[3 + i] * d[1] + R[6 + i] * d[2];  // R^T
+        if (c[2] < 0.05) return false;
+        distort(c[0] / c[2], c[1] / c[2], u, v);
+        return true;
+    }
+    /** Camera-frame point (x right, y down, z forward) -> head frame. */
+    void to_head(const double c[3], double p[3]) const {
+        for (int i = 0; i < 3; i++) p[i] = R[i * 3] * c[0] + R[i * 3 + 1] * c[1] + R[i * 3 + 2] * c[2] + origin[i];
+    }
     /** Unit ray in the head frame through pixel (u, v). */
     void ray(double u, double v, double d[3]) const {
         double x, y;

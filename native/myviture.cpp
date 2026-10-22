@@ -917,6 +917,8 @@ int main(int argc, char** argv) {
     }
 
     printf("stopping...\n");
+    // Whatever hangs on the way out (engine, camera, GPU), the process ends.
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD { Sleep(6000); fflush(stdout); TerminateProcess(GetCurrentProcess(), 0); return 0; }, nullptr, 0, nullptr);
     hands::stop();
     rgbcam::stop();
     dash::shutdown();
