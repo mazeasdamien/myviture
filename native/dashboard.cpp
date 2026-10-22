@@ -259,6 +259,20 @@ static void build(AppState& s) {
     ImGui::SameLine();
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
     if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; }
+    ImGui::SeparatorText("Calage sur les mains");
+    if (s.align_active) {
+        ImGui::TextColored(ImVec4(0.4f, 1, 0.6f, 1), "Cible %d / %d : pince la cible verte là où tu la vois", s.align_index + 1, s.align_total);
+        ImGui::TextDisabled("pouce + index, garde la pince une demi-seconde, relâche");
+        if (ImGui::Button("Annuler")) s.align_cancel = true;
+    } else {
+        if (ImGui::Button("Calibrer avec les mains")) s.align_start = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Sans correction")) s.align_reset = true;
+        bool corrected = s.align[0] != 1 || s.align[3] != 0 || s.align[7] != 0 || s.align[11] != 0;
+        ImGui::TextDisabled(corrected ? "correction appliquée" : "aucune correction");
+    }
+    if (!s.align_status.empty()) ImGui::TextWrapped("%s", s.align_status.c_str());
+    ImGui::Checkbox("Prédire le mouvement des mains", &s.hand_predict);
     ImGui::EndChild();
 
     // ---- IMU

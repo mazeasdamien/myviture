@@ -23,7 +23,14 @@ struct AppState {
     float floor_m = 1.6f;   // floor below the eyes
     bool scene = true;
     bool floor_grid = false;
-    bool hands = true;  // the floor grid shows height errors and the optics' edges most
+    bool hands = true;
+    bool hand_predict = true;  // extrapolate the hands' motion to the display time
+
+    // display calibration with the hands (align.hpp): D, drawn points -> real points
+    double align[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    bool align_start = false, align_cancel = false, align_reset = false, align_active = false;
+    int align_index = 0, align_total = 0;
+    std::string align_status;  // the floor grid shows height errors and the optics' edges most
     bool recenter = true;
     bool quit = false;
     int display_request = 0;  // 2 or 3: switch the glasses to that mode
