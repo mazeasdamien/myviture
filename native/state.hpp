@@ -38,6 +38,7 @@ struct AppState {
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;
+    bool panel = true;         // the test text panel in front of the wearer
     bool hand_predict = false;  // extrapolate the hands' motion to the display time (felt worse: off)
     bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
     bool rgb_reset = false;    // forget the RGB camera fit

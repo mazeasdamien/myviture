@@ -322,6 +322,8 @@ static void build(AppState& s) {
         ImGui::BulletText("en avançant/reculant la tête, ça bouge : recul des yeux");
         ImGui::TextDisabled("Puis, tête tournée vite : s'ils traînent, monte « latence de l'écran ».");
     }
+    ImGui::Checkbox("Panneau de test", &s.panel);
+    ImGui::SameLine();
     ImGui::Checkbox("Scène de test (cubes)", &s.scene);
     ImGui::SameLine();
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
@@ -396,8 +398,8 @@ static void build(AppState& s) {
     for (int side = 0; side < 2; side++) {
         const hands::Hand* h = nullptr;
         for (auto& x : hr.hands) if (x.right == (side == 1)) h = &x;
-        if (h) ImGui::TextDisabled("%s : pince %.1f cm%s · stéréo %.1f mm · échelle %.2f%s · poignet %.2f %.2f %.2f m", side ? "droite" : "gauche", h->pinch_m * 100,
-                                   h->pinching ? " ✓" : "", h->gap_mm, h->scale_ratio, h->held ? " · tenue" : "", h->joints[0][0], h->joints[0][1], h->joints[0][2]);
+        if (h) ImGui::TextDisabled("%s : %s · pince %.1f cm · doigts %.1f %.1f %.1f %.1f %.1f · stéréo %.1f mm · échelle %.2f%s", side ? "droite" : "gauche",
+                                   hands::GESTURES[h->gesture], h->pinch_m * 100, h->ext[0], h->ext[1], h->ext[2], h->ext[3], h->ext[4], h->gap_mm, h->scale_ratio, h->held ? " · tenue" : "");
         else ImGui::TextDisabled("%s : —", side ? "droite" : "gauche");
     }
     ImGui::EndChild();

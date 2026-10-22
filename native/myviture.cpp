@@ -19,6 +19,7 @@
 #include "hands.hpp"
 #include "rgbcal.hpp"
 #include "roommap.hpp"
+#include "textpanel.hpp"
 #include "state.hpp"
 
 #include <d3d11.h>
@@ -342,6 +343,12 @@ float4 ps(VSOut i) : SV_Target {
   float k = lit.x > 0.5 ? 0.45 + 0.55 * saturate(dot(normalize(i.n), normalize(float3(0.4, 1.0, 0.6)))) : 1.0;
   return float4(color.rgb * k, 1);
 }
+// Textured quad (the uv rides in the normal slot).
+Texture2D tex0 : register(t0);
+SamplerState samp0 : register(s0);
+struct VSOutT { float4 pos : SV_Position; float2 uv : TEXCOORD; };
+VSOutT vs_tex(float3 p : POSITION, float3 n : NORMAL) { VSOutT o; o.pos = mul(mvp, float4(p, 1)); o.uv = n.xy; return o; }
+float4 ps_tex(VSOutT i) : SV_Target { return float4(tex0.Sample(samp0, i.uv).rgb, 1); }
 // Instanced: one small cube per scanned voxel (position and colour per instance, size in lit.y).
 struct VSOutC { float4 pos : SV_Position; float3 n : NORMAL; float3 col : COLOR; };
 VSOutC vs_inst(float3 p : POSITION, float3 n : NORMAL, float3 ip : INSTPOS, float3 ic : INSTCOL) {
@@ -615,6 +622,32 @@ int main(int argc, char** argv) {
                                       {"INSTPOS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
                                       {"INSTCOL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 12, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
     Com<ID3D11InputLayout> layout_inst; CHECK(dev->CreateInputLayout(ili, 4, vsib->GetBufferPointer(), vsib->GetBufferSize(), &layout_inst));
+    // Textured pipeline and the test panel.
+    Com<ID3DBlob> vstb, pstb;
+    if (FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "vs_tex", "vs_5_0", 0, 0, &vstb, &err)) ||
+        FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "ps_tex", "ps_5_0", 0, 0, &pstb, &err))) {
+        fprintf(stderr, "shader: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
+        return 1;
+    }
+    Com<ID3D11VertexShader> vs_tex; CHECK(dev->CreateVertexShader(vstb->GetBufferPointer(), vstb->GetBufferSize(), nullptr, &vs_tex));
+    Com<ID3D11PixelShader> ps_tex; CHECK(dev->CreatePixelShader(pstb->GetBufferPointer(), pstb->GetBufferSize(), nullptr, &ps_tex));
+    Com<ID3D11SamplerState> samp;
+    { D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; CHECK(dev->CreateSamplerState(&sd, &samp)); }
+    Com<ID3D11Buffer> quad_vb;
+    {
+        using namespace panel;
+        std::vector<Vertex> q = {{-PW / 2, -PH / 2, 0, 0, 1, 0}, {PW / 2, -PH / 2, 0, 1, 1, 0}, {PW / 2, PH / 2, 0, 1, 0, 0},
+                                 {-PW / 2, -PH / 2, 0, 0, 1, 0}, {PW / 2, PH / 2, 0, 1, 0, 0}, {-PW / 2, PH / 2, 0, 0, 0, 0}};
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = (UINT)(q.size() * sizeof(Vertex)); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_IMMUTABLE;
+        D3D11_SUBRESOURCE_DATA init{q.data()};
+        CHECK(dev->CreateBuffer(&bd, &init, &quad_vb));
+    }
+    panel::Panel test_panel;
+    bool panel_ok = test_panel.init(dev);
+    const V3 PANEL_AT = {0, -0.08f, -0.6f};  // scene: in front of the recentred head, a little low
+    int pokes = 0;
+    bool poke_inside = false, lit = false;
+    double lit_until = 0;
     const UINT MAX_INST = 120000;
     Com<ID3D11Buffer> inst_vb;
     {
@@ -848,7 +881,7 @@ int main(int argc, char** argv) {
 
         // Hands from the tracking thread: head frame at the image's time -> scene, with the
         // engine's pose at that same time (no extrapolation yet).
-        struct SceneHand { bool right, pinching; V3 j[hands::N_JOINTS]; };
+        struct SceneHand { bool right, pinching; int gesture; V3 j[hands::N_JOINTS]; };
         std::vector<SceneHand> scene_hands;
         hands::Result hr;
         { std::lock_guard<std::mutex> l(hands::g_mu); if (qpc_now() / qpc_freq() - hands::g_result.t < 0.25) hr.hands = hands::g_result.hands; hr.t = hands::g_result.t; hr.seq = hands::g_result.seq; }
@@ -865,7 +898,7 @@ int main(int argc, char** argv) {
                 prev_seq = hr.seq;
                 double lead = std::clamp(qpc_now() / qpc_freq() + g_predict_ms / 1000.0 - hr.t, 0.0, 0.12);
                 for (auto& h : hr.hands) {
-                    SceneHand sh{h.right, h.pinching, {}};
+                    SceneHand sh{h.right, h.pinching, h.gesture, {}};
                     int s = h.right ? 1 : 0;
                     double dt = hr.t - prev_t[s];
                     for (int k = 0; k < hands::N_JOINTS; k++) {
@@ -925,6 +958,31 @@ int main(int argc, char** argv) {
             return std::isnan(best) ? best : best + y_shift;
         };
 
+        // Test panel: gestures per hand, poke on its button with the index tip.
+        if (panel_ok && g_app.panel) {
+            using namespace panel;
+            bool inside_now = false;
+            for (auto& h : scene_hands) {
+                V3 t = h.j[8];
+                float lx = t.x - PANEL_AT.x, ly = t.y - PANEL_AT.y, lz = t.z - PANEL_AT.z;
+                if (lx > BX0 && lx < BX1 && ly > BY0 && ly < BY1 && lz < 0.01f && lz > -0.05f) inside_now = true;
+            }
+            double now_s = qpc_now() / qpc_freq();
+            if (inside_now && !poke_inside) { pokes++; lit_until = now_s + 0.6; }
+            poke_inside = inside_now;
+            lit = now_s < lit_until;
+            std::vector<std::string> lines;
+            for (int side = 0; side < 2; side++) {
+                const SceneHand* h = nullptr;
+                for (auto& x : scene_hands) if (x.right == (side == 1)) h = &x;
+                lines.push_back(std::string(side ? "Main droite : " : "Main gauche : ") + (h ? hands::GESTURES[h->gesture] : "pas vue"));
+            }
+            char buf[96];
+            snprintf(buf, sizeof buf, "Bouton touché %d fois (index dans le carré)", pokes);
+            lines.push_back(buf);
+            test_panel.draw(ctx, "myViture · test des mains", lines, lit ? "touché !" : "touche-moi", lit);
+        }
+
         UINT bone_count = 0;
         if (!scene_hands.empty()) {
             D3D11_MAPPED_SUBRESOURCE m;
@@ -981,6 +1039,24 @@ int main(int argc, char** argv) {
                 ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
                 ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
                 ctx->Draw(bone_count, 0);
+            }
+            if (panel_ok && g_app.panel) {
+                Constants c{mul(vpm, translate(PANEL_AT)), translate(PANEL_AT), {1, 1, 1, 1}, {0, 0, 0, 0}};
+                ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                ID3D11Buffer* vbs[] = {quad_vb};
+                ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->VSSetShader(vs_tex, nullptr, 0);
+                ctx->PSSetShader(ps_tex, nullptr, 0);
+                ID3D11ShaderResourceView* srvs[] = {test_panel.srv};
+                ctx->PSSetShaderResources(0, 1, srvs);
+                ID3D11SamplerState* ss[] = {samp};
+                ctx->PSSetSamplers(0, 1, ss);
+                ctx->Draw(6, 0);
+                ID3D11ShaderResourceView* none[] = {nullptr};
+                ctx->PSSetShaderResources(0, 1, none);
+                ctx->VSSetShader(vs, nullptr, 0);
+                ctx->PSSetShader(ps, nullptr, 0);
             }
             // Anchors: small cyan cubes on the real surfaces (tracking frame -> scene).
             for (auto& a : anchors) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate({a.p[0], a.p[1], a.p[2]})), scale(0.03f)), 0.3f, 1.0f, 1.0f, true);

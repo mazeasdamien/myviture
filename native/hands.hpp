@@ -40,6 +40,30 @@ constexpr int N_JOINTS = 21;
 inline const int BONES[][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 4}, {0, 5}, {5, 6}, {6, 7}, {7, 8}, {5, 9}, {9, 10}, {10, 11}, {11, 12},
                                {9, 13}, {13, 14}, {14, 15}, {15, 16}, {13, 17}, {17, 18}, {18, 19}, {19, 20}, {0, 17}};
 constexpr int N_BONES = sizeof(BONES) / sizeof(BONES[0]);
+inline const char* GESTURES[] = {"—", "pince", "poing (grab)", "pointe (poke)", "main ouverte"};
+
+/**
+ * Hand pose from the 3D joints (metres): each finger's extension is its tip's distance
+ * from the palm centre over the hand's size (wrist to middle knuckle): ~1.5 straight,
+ * ~0.5 folded. Thumb: tip to the index knuckle.
+ */
+inline int classify(const float j[21][3], bool pinching, float ext[5]) {
+    auto d = [&](int a, const float* b) { return std::sqrt((j[a][0] - b[0]) * (j[a][0] - b[0]) + (j[a][1] - b[1]) * (j[a][1] - b[1]) + (j[a][2] - b[2]) * (j[a][2] - b[2])); };
+    float palm[3] = {0, 0, 0};
+    for (int k : {0, 5, 9, 13, 17}) for (int a = 0; a < 3; a++) palm[a] += j[k][a] / 5;
+    float size = d(0, j[9]);
+    if (size < 0.03f) return 0;
+    ext[0] = d(4, j[5]) / size;
+    const int tips[4] = {8, 12, 16, 20};
+    for (int f = 0; f < 4; f++) ext[f + 1] = d(tips[f], palm) / size;
+    auto straight = [&](int f) { return ext[f] > 1.15f; };
+    auto folded = [&](int f) { return ext[f] < 0.8f; };
+    if (pinching) return 1;
+    if (folded(1) && folded(2) && folded(3)) return 2;
+    if (straight(1) && folded(2) && folded(3)) return 3;
+    if (straight(1) && straight(2) && straight(3) && straight(4)) return 4;
+    return 0;
+}
 
 struct Hand {
     bool right = false;           // from the wearer's point of view
@@ -49,6 +73,8 @@ struct Hand {
     float pinch_m = 1;
     float gap_mm = 0;             // mean distance between the two cameras' rays
     bool held = false;            // not measured this frame: the last measurement, kept briefly
+    int gesture = 0;              // GESTURES[]: none, pinch, fist (grab), point (poke), open
+    float ext[5] = {};            // extension per finger (thumb..pinky): tip distance / hand size
     float scale_ratio = 0;        // stereo hand size / the model's metric hand size (1 = consistent depth)
     bool rgb_seen = false;        // the hand model found this hand in the RGB image too
     float rgb[N_JOINTS][2];       // where it is in the RGB image (pixels)
@@ -545,6 +571,14 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
             hd.pinch_m = std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
             pinch_state[side] = pinch_state[side] ? hd.pinch_m < 0.04f : hd.pinch_m < 0.025f;
             hd.pinching = pinch_state[side];
+            // Gesture, switched only after 3 frames agree (no flicker between two).
+            {
+                static int shown[2] = {0, 0}, cand[2] = {0, 0}, count[2] = {0, 0};
+                int g = classify(hd.joints, hd.pinching, hd.ext);
+                if (g == cand[side]) count[side]++; else { cand[side] = g; count[side] = 1; }
+                if (count[side] >= 3 || g == 1) shown[side] = g;  // the pinch shows at once
+                hd.gesture = shown[side];
+            }
             out.push_back(hd);
         }
         // A hand missed for a few frames stays where it was, instead of blinking.
