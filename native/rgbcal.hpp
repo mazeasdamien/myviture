@@ -181,6 +181,9 @@ inline int g_frames = 0;      // frames of pairs collected
 inline double g_lo[3] = {1e9, 1e9, 1e9}, g_hi[3] = {-1e9, -1e9, -1e9};  // wrist positions' extent (m)
 inline std::string g_path;
 
+/** The current model as it is (w = 0 before any RGB frame). */
+inline Cam get() { std::lock_guard<std::mutex> l(g_mu); return g_cam; }
+
 /** The current model for an image of this size (default when none yet). */
 inline Cam current(int w, int h) {
     std::lock_guard<std::mutex> l(g_mu);
@@ -200,7 +203,8 @@ inline void add(const std::vector<Pair>& pairs, const double wrist[3]) {
     g_frames++; g_since_fit++;
     for (int i = 0; i < 3; i++) { g_lo[i] = std::min(g_lo[i], wrist[i]); g_hi[i] = std::max(g_hi[i], wrist[i]); }
     double spread = std::max(g_hi[0] - g_lo[0], std::max(g_hi[1] - g_lo[1], g_hi[2] - g_lo[2]));
-    if (g_frames >= 8 && spread >= 0.25 && g_since_fit >= 4) {
+    // Enough spread to separate the focal from the position; with many frames, a little less.
+    if (((g_frames >= 8 && spread >= 0.12) || (g_frames >= 30 && spread >= 0.06)) && g_since_fit >= 4) {
         g_since_fit = 0;
         Fit info;
         Cam trial = g_cam;

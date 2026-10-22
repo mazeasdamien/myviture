@@ -17,3 +17,5 @@ native/third_party/onnxruntime/lib/
 native/third_party/directml/*.dll
 native/models/*.onnx
 native/*.dll
+native/*.err
+native/*.png

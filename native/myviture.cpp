@@ -498,6 +498,24 @@ int main(int argc, char** argv) {
     };
     CHECK(make_targets());
 
+    // The virtual scene as the RGB camera sees it, drawn over the RGB video on the dashboard.
+    const UINT MR_W = 960, MR_H = 540;
+    Com<ID3D11Texture2D> mr_tex, mr_depth;
+    Com<ID3D11RenderTargetView> mr_rtv;
+    Com<ID3D11ShaderResourceView> mr_srv;
+    Com<ID3D11DepthStencilView> mr_dsv;
+    {
+        D3D11_TEXTURE2D_DESC td{}; td.Width = MR_W; td.Height = MR_H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        CHECK(dev->CreateTexture2D(&td, nullptr, &mr_tex));
+        CHECK(dev->CreateRenderTargetView(mr_tex, nullptr, &mr_rtv));
+        CHECK(dev->CreateShaderResourceView(mr_tex, nullptr, &mr_srv));
+        D3D11_TEXTURE2D_DESC dd{}; dd.Width = MR_W; dd.Height = MR_H; dd.MipLevels = 1; dd.ArraySize = 1; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.SampleDesc.Count = 1; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        CHECK(dev->CreateTexture2D(&dd, nullptr, &mr_depth));
+        CHECK(dev->CreateDepthStencilView(mr_depth, nullptr, &mr_dsv));
+        g_app.mr_srv = mr_srv.p; g_app.mr_w = MR_W; g_app.mr_h = MR_H;
+    }
+
     Com<ID3DBlob> vsb, psb, err;
     if (FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsb, &err)) ||
         FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &psb, &err))) {
@@ -772,13 +790,8 @@ int main(int argc, char** argv) {
         const bool sbs = W >= 3000;
         const int views = sbs ? 2 : 1;
         const float ipd = g_app.ipd_mm / 1000.0f;
-        if (have) for (int eye = 0; eye < views; eye++) {
-            float vw = (float)W / views;
-            D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
-            ctx->RSSetViewports(1, &vp);
-            float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
-            M4 eye_world = mul(head_scene, translate({off, 0, 0}));
-            M4 vpm = mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world));
+        // One view of the scene: hands (joints and bones) and, if on, the test objects.
+        auto render_view = [&](const M4& vpm) {
             auto draw = [&](ID3D11Buffer* vb, UINT n, D3D11_PRIMITIVE_TOPOLOGY topo, const M4& model, float r, float g, float b, bool lit) {
                 Constants c{mul(vpm, model), model, {r, g, b, 1}, {lit ? 1.0f : 0.0f, 0, 0, 0}};
                 ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
@@ -801,7 +814,7 @@ int main(int argc, char** argv) {
                 ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
                 ctx->Draw(bone_count, 0);
             }
-            if (!g_app.scene) continue;
+            if (!g_app.scene) return;
             // Eight cubes around the head at arm's length, one ahead at 1 m, floor 1.6 m down.
             for (int i = 0; i < 8; i++) {
                 float a = i * 3.14159265f / 4;
@@ -811,9 +824,41 @@ int main(int argc, char** argv) {
             }
             draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({0, -0.1f, -1.0f}), scale(0.05f)), 1, 1, 1, true);
             if (g_app.floor_grid) draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, -g_app.floor_m, 0}), 0.3f, 0.7f, 1.0f, false);
+        };
+        if (have) for (int eye = 0; eye < views; eye++) {
+            float vw = (float)W / views;
+            D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
+            ctx->RSSetViewports(1, &vp);
+            float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
+            M4 eye_world = mul(head_scene, translate({off, 0, 0}));
+            render_view(mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world)));
         }
 
         sc->Present(1, 0);
+
+        // The same scene from the RGB camera (its fitted model), into the dashboard's texture.
+        if (have && g_app.rgb_overlay) {
+            rgbcal::Cam cam = rgbcal::get();
+            if (cam.w > 0) {
+                double R[9];
+                rgbcal::rotation(cam.rv, R);
+                // Camera -> head: R(rv)^T and the camera centre (the renderer's camera looks
+                // down -z with y up, which is what R(rv) maps the head to).
+                M4 cam_head = identity();
+                for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) cam_head(i, j) = (float)R[j * 3 + i]; cam_head(i, 3) = (float)cam.c[i]; }
+                M4 cam_world = mul(head_scene, cam_head);
+                float vfov = 2 * atanf((float)(cam.h / 2.0 / cam.f)) * 57.2958f;
+                ID3D11RenderTargetView* t[] = {mr_rtv};
+                ctx->OMSetRenderTargets(1, t, mr_dsv);
+                float clear0[4] = {0, 0, 0, 0};
+                ctx->ClearRenderTargetView(mr_rtv, clear0);
+                ctx->ClearDepthStencilView(mr_dsv, D3D11_CLEAR_DEPTH, 1, 0);
+                D3D11_VIEWPORT vp{0, 0, (float)MR_W, (float)MR_H, 0, 1};
+                ctx->RSSetViewports(1, &vp);
+                render_view(mul(perspective(vfov, (float)cam.w / cam.h, 0.05f, 50), rigid_inverse(cam_world)));
+                ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            }
+        }
         UINT present_id = 0;
         sc->GetLastPresentCount(&present_id);
         pending.push_back({present_id, pose_qpc});

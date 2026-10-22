@@ -33,6 +33,8 @@ struct AppState {
     bool recenter = true;
     bool quit = false;
     bool snapshot = false;  // save the dashboard as dashboard.png
+    std::string notice;     // shown in the top bar for a few seconds
+    double notice_until = 0;
     int display_request = 0;  // 2 or 3: switch the glasses to that mode
 
     // ---- written by the renderer
@@ -41,6 +43,9 @@ struct AppState {
     Stats stats;
     float yaw = 0, pitch = 0, roll = 0, pos[3] = {}, rate_dps = 0;
     float head_scene[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // row-major
+    /** the virtual scene rendered from the RGB camera (BGRA, alpha 0 where empty), for the dashboard */
+    void* mr_srv = nullptr;
+    int mr_w = 0, mr_h = 0;
     std::vector<float> shake_history;    // deg per frame, newest last
     std::vector<float> latency_history;  // pose -> vblank, ms
 };

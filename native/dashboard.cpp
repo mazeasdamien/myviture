@@ -6,6 +6,8 @@
 
 #include <dxgi1_2.h>
 #include <wincodec.h>
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 
 #include <algorithm>
@@ -230,6 +232,10 @@ static void build(AppState& s) {
     if (ImGui::Button(buttons[2])) s.snapshot = true;
     ImGui::SameLine();
     if (ImGui::Button(buttons[3])) s.quit = true;
+    if (!s.notice.empty() && ImGui::GetTime() < s.notice_until) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1, 0.6f, 1), "%s", s.notice.c_str());
+    }
     ImGui::Separator();
 
     const float col = ImGui::GetContentRegionAvail().x / 3 - ImGui::GetStyle().ItemSpacing.x;
@@ -362,43 +368,15 @@ static void build(AppState& s) {
         float k = std::min(a.x / rgb.w, a.y / rgb.h);
         ImVec2 o = ImGui::GetCursorScreenPos();
         ImGui::Image((ImTextureID)(intptr_t)rgb.srv, ImVec2(rgb.w * k, rgb.h * k));
-        if (s.rgb_overlay) {
-            // The virtual world as the RGB camera should see it: hands (stereo, through the
-            // fitted camera) and the test cubes; in green, where the hand model sees the
-            // hand in the RGB image itself. The gap between the two is the misalignment.
-            rgbcal::Cam cam = rgbcal::current(rgb.w, rgb.h);
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            auto px = [&](const double p[3], ImVec2& out) { double u, v; if (!rgbcal::project(cam, p, u, v)) return false; out = ImVec2(o.x + (float)u * k, o.y + (float)v * k); return true; };
-            for (auto& h : hr.hands) {
-                ImU32 col = h.right ? IM_COL32(255, 122, 69, 230) : IM_COL32(76, 141, 255, 230);
-                for (auto& b : hands::BONES) {
-                    double p0[3] = {h.joints[b[0]][0], h.joints[b[0]][1], h.joints[b[0]][2]}, p1[3] = {h.joints[b[1]][0], h.joints[b[1]][1], h.joints[b[1]][2]};
-                    ImVec2 a0, a1;
-                    if (px(p0, a0) && px(p1, a1)) dl->AddLine(a0, a1, col, 2.5f);
-                }
-                if (h.rgb_seen) for (auto& b : hands::BONES)
-                    dl->AddLine(ImVec2(o.x + h.rgb[b[0]][0] * k, o.y + h.rgb[b[0]][1] * k), ImVec2(o.x + h.rgb[b[1]][0] * k, o.y + h.rgb[b[1]][1] * k), IM_COL32(80, 255, 120, 200), 1.5f);
-            }
-            if (s.scene) {
-                // scene -> head: rigid inverse of head -> scene
-                const float* m = s.head_scene;
-                auto to_head = [&](float x, float y, float z, double out[3]) {
-                    float dx = x - m[3], dy = y - m[7], dz = z - m[11];
-                    out[0] = m[0] * dx + m[4] * dy + m[8] * dz; out[1] = m[1] * dx + m[5] * dy + m[9] * dz; out[2] = m[2] * dx + m[6] * dy + m[10] * dz;
-                };
-                auto cube_at = [&](float x, float y, float z, float half, ImU32 col) {
-                    // the cube's 8 corners -> 12 edges
-                    ImVec2 c[8]; bool ok = true;
-                    for (int i = 0; i < 8 && ok; i++) { double p[3]; to_head(x + (i & 1 ? half : -half), y + (i & 2 ? half : -half), z + (i & 4 ? half : -half), p); ok = px(p, c[i]); }
-                    if (!ok) return;
-                    for (int i = 0; i < 8; i++) for (int b = 1; b < 8; b <<= 1) if (!(i & b)) dl->AddLine(c[i], c[i | b], col, 1.5f);
-                };
-                for (int i = 0; i < 8; i++) {
-                    float a = i * 3.14159265f / 4, hue = i / 8.0f;
-                    ImU32 col = IM_COL32((int)(255 * (0.5f + 0.5f * cosf(6.2832f * hue))), (int)(255 * (0.5f + 0.5f * cosf(6.2832f * (hue - 0.333f)))), (int)(255 * (0.5f + 0.5f * cosf(6.2832f * (hue - 0.667f)))), 220);
-                    cube_at(sinf(a) * 0.9f, 0, -cosf(a) * 0.9f, 0.06f, col);
-                }
-                cube_at(0, -0.1f, -1.0f, 0.025f, IM_COL32(255, 255, 255, 220));
+        if (s.rgb_overlay && s.mr_srv) {
+            // The virtual scene rendered from the fitted RGB camera, blended over the video.
+            ImGui::SetCursorScreenPos(o);
+            ImGui::Image((ImTextureID)(intptr_t)s.mr_srv, ImVec2(rgb.w * k, rgb.h * k));
+            // Until the camera is fitted: where the hand model sees the hand in the RGB image.
+            bool fitted; { std::lock_guard<std::mutex> l(rgbcal::g_mu); fitted = rgbcal::g_cam.fitted; }
+            if (!fitted) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                for (auto& h : hr.hands) if (h.rgb_seen) for (int j2 = 0; j2 < hands::N_JOINTS; j2++) dl->AddCircleFilled(ImVec2(o.x + h.rgb[j2][0] * k, o.y + h.rgb[j2][1] * k), 3, IM_COL32(80, 255, 120, 220));
             }
         }
     }
@@ -455,7 +433,11 @@ void frame(AppState& s) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         std::wstring png = exe;
         png = png.substr(0, png.find_last_of(L'\\') + 1) + L"dashboard.png";
-        save_png(png);
+        bool ok = save_png(png);
+        char path[MAX_PATH]; WideCharToMultiByte(CP_UTF8, 0, png.c_str(), -1, path, sizeof path, nullptr, nullptr);
+        s.notice = ok ? std::string("capture enregistrée : ") + path : "capture : échec";
+        s.notice_until = ImGui::GetTime() + 6;
+        if (ok) ShellExecuteA(nullptr, "open", "explorer.exe", ("/select,\"" + std::string(path) + "\"").c_str(), nullptr, SW_SHOWNORMAL);
     }
     sc->Present(0, 0);
 }
