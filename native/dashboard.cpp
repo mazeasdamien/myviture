@@ -41,14 +41,14 @@ static std::string ini_path;
 // Camera images as RGBA textures (ImGui draws a single-channel texture in red).
 struct CamTex { ID3D11Texture2D* tex = nullptr; ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
 static CamTex cams[2], rgb, depth_tex;
-static void ensure_tex(CamTex& t, int w, int h);
+static void ensure_tex(CamTex& t, int w, int h, DXGI_FORMAT fmt);
 
 /** The last depth map as a colour image: near warm, far cold, black where unknown. */
 static void update_depth() {
     std::vector<float> d;
     { std::lock_guard<std::mutex> l(room::g.mu); d = room::g.depth; }
     if (d.size() != (size_t)depth::W * depth::H) return;
-    ensure_tex(depth_tex, depth::W, depth::H);
+    ensure_tex(depth_tex, depth::W, depth::H, DXGI_FORMAT_B8G8R8A8_UNORM);
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ctx->Map(depth_tex.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
     for (int y = 0; y < depth::H; y++) {
@@ -152,12 +152,12 @@ static void update_cameras() {
     }
 }
 
-static void ensure_tex(CamTex& t, int w, int h) {
+static void ensure_tex(CamTex& t, int w, int h, DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM) {
     if (t.w == w && t.h == h && t.tex) return;
     if (t.srv) t.srv->Release();
     if (t.tex) t.tex->Release();
     D3D11_TEXTURE2D_DESC td{};
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = fmt;
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE; td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     dev->CreateTexture2D(&td, nullptr, &t.tex);
     dev->CreateShaderResourceView(t.tex, nullptr, &t.srv);
@@ -169,14 +169,11 @@ static void update_rgb() {
     auto& f = rgbcam::g_frame;
     if (f.seq == rgb_seq || !f.w) return;
     rgb_seq = f.seq;
-    ensure_tex(rgb, f.w, f.h);
+    // X8 format: the camera's undefined alpha byte is ignored, rows copy as they are.
+    ensure_tex(rgb, f.w, f.h, DXGI_FORMAT_B8G8R8X8_UNORM);
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ctx->Map(rgb.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
-    for (int y = 0; y < f.h; y++) {
-        uint32_t* row = (uint32_t*)((uint8_t*)m.pData + y * m.RowPitch);
-        const uint32_t* src = f.bgra.data() + (size_t)y * f.w;
-        for (int x = 0; x < f.w; x++) row[x] = src[x] | 0xff000000u;  // RGB32 leaves alpha undefined
-    }
+    for (int y = 0; y < f.h; y++) memcpy((uint8_t*)m.pData + y * m.RowPitch, f.bgra.data() + (size_t)y * f.w, (size_t)f.w * 4);
     ctx->Unmap(rgb.tex, 0);
 }
 
@@ -278,7 +275,9 @@ static void build(AppState& s) {
     plot("##shake", tail(s.shake_history, 300), 0, 1.0f, 4 * em, "tremblement par image (0–1°)");
     plot("##lat", tail(s.latency_history, 300), 0, 40, 3 * em, "pose → écran (0–40 ms)");
     ImGui::SeparatorText("Prédiction");
-    ImGui::SliderFloat("avance (ms)", &s.predict_ms, 0, 60, "%.0f");
+    ImGui::Checkbox("Rendu au dernier moment avant l'affichage", &s.late_latch);
+    ImGui::TextDisabled("pose lue %.1f ms avant le vblank (marge auto) · prédiction totale %.1f ms", s.late_latch ? s.latch_margin_ms : 16.6f, s.stats.lead_ms);
+    ImGui::SliderFloat("latence de l'écran (ms)", &s.predict_ms, 0, 40, "%.0f");
     ImGui::TextDisabled("Les objets traînent : +   ·   ils partent en avance : −");
     ImGui::TextDisabled("Prédiction du moteur VITURE (IMU, ~520 Hz)");
     ImGui::EndChild();

@@ -14,11 +14,14 @@ struct Stats {
     long missed = 0;
     int corrections = 0;          // visual corrections of the engine in the last 2 s
     float corr_deg = 0, corr_mm = 0;  // their mean size
+    float lead_ms = 0;          // prediction used: pose read -> vblank -> screen
 };
 
 struct AppState {
     // ---- written by the dashboard (or the glasses window's keys)
-    float predict_ms = 20;
+    float predict_ms = 12;      // the screen's own latency after the vblank (prediction goes to vblank + this)
+    bool late_latch = false;    // read the pose and draw just before the vblank (off: GPU sharing made it miss vblanks)
+    float latch_margin_ms = 5;  // how long before the vblank (adapts: more when a vblank is missed)
     bool engine_predict = true;
     float vfov = 28.147f;   // per-eye vertical field, degrees
     float ipd_mm = 63.0f;

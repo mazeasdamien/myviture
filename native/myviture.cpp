@@ -370,7 +370,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) g_quit = true;
         else if (wp == 'R') g_app.recenter = true;
-        else if (wp == VK_OEM_PLUS || wp == VK_ADD) g_app.predict_ms = std::min(60.0f, g_app.predict_ms + 2);
+        else if (wp == VK_OEM_PLUS || wp == VK_ADD) g_app.predict_ms = std::min(40.0f, g_app.predict_ms + 2);
         else if (wp == VK_OEM_MINUS || wp == VK_SUBTRACT) g_app.predict_ms = std::max(0.0f, g_app.predict_ms - 2);
         else if (wp == 'P') g_stats_paused = !g_stats_paused;
         else if (wp == 'A') g_app.room_request = 1;
@@ -650,12 +650,36 @@ int main(int argc, char** argv) {
     bool dash_on = true;
 
     printf("rendering on the glasses: Esc quit, R recenter, +/- prediction (%.0f ms)\n", g_app.predict_ms);
+    // vblank timing from the frame statistics, for late latching
+    int64_t vblank_qpc = 0;
+    double period_ms = 1000.0 / 60;
+    int64_t prev_sync_qpc = 0; UINT prev_sync_count = 0;
+    double margin_ms = g_app.latch_margin_ms;
+    long missed_window = 0; int64_t quiet_since = qpc_now();
+    std::vector<double> lead_hist;
     while (!g_quit && !g_app.quit) {
         g_engine_predict = g_app.engine_predict;
-        const double g_predict_ms = g_app.predict_ms;
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
         WaitForSingleObjectEx(frame_wait, 100, TRUE);
+        // Late latching: the waitable returns right after a vblank; rendering then would
+        // show a pose ~17 ms old at the next one. Sleep until just before it instead.
+        double to_vblank_ms = period_ms;
+        if (vblank_qpc) {
+            int64_t now = qpc_now();
+            double next = qpc_ms(vblank_qpc - now);
+            while (next < 0.5) next += period_ms;
+            if (g_app.late_latch) {
+                double wake = next - margin_ms;
+                if (wake > 1.5) Sleep((DWORD)(wake - 1.0));
+                while (qpc_ms(qpc_now() - now) < wake) {}
+            }
+            to_vblank_ms = qpc_ms(vblank_qpc - qpc_now());
+            while (to_vblank_ms < 0.3) to_vblank_ms += period_ms;
+        }
+        // Predict to the vblank this frame should catch, plus the screen's own latency.
+        double g_predict_ms = to_vblank_ms + g_app.predict_ms;
+        lead_hist.push_back(g_predict_ms);
         int64_t t_start = qpc_now();
 
         // Pose now, rotation extrapolated to when this frame reaches the screen.
@@ -998,6 +1022,13 @@ int main(int argc, char** argv) {
             shown += st.PresentCount - last_present_seen;
             last_present_seen = st.PresentCount;
             last_refresh = st.PresentRefreshCount;
+            if (last_present_seen && extra > 0 && extra < 600) missed_window += (long)extra;
+            vblank_qpc = st.SyncQPCTime.QuadPart;
+            if (prev_sync_qpc && st.SyncRefreshCount > prev_sync_count) {
+                double p = qpc_ms(st.SyncQPCTime.QuadPart - prev_sync_qpc) / (st.SyncRefreshCount - prev_sync_count);
+                if (p > 5 && p < 40) period_ms = 0.95 * period_ms + 0.05 * p;
+            }
+            prev_sync_qpc = st.SyncQPCTime.QuadPart; prev_sync_count = st.SyncRefreshCount;
             for (auto& pd : pending) if (pd.present == st.PresentCount) {
                 double l = qpc_ms(st.SyncQPCTime.QuadPart - pd.pose_qpc);
                 latencies.push_back(l);
@@ -1016,14 +1047,27 @@ int main(int argc, char** argv) {
 
         double since = qpc_ms(qpc_now() - stats_t0);
         if (since > 2000) {
+            // Margin: a missed vblank means the frame was not ready in time: give it more.
+            // Shown frames below the refresh rate also mean missed vblanks (the counter can miss them).
+            double expected = since / period_ms;
+            if (missed_window > 0 || shown < 0.97 * expected) { margin_ms = std::min(14.0, margin_ms + 1.5); quiet_since = qpc_now(); }
+            else if (qpc_ms(qpc_now() - quiet_since) > 10000 && margin_ms > 3) { margin_ms -= 0.5; quiet_since = qpc_now(); }
+            missed_window = 0;
+            g_app.latch_margin_ms = (float)margin_ms;
+            {
+                std::vector<double> lh = lead_hist; std::sort(lh.begin(), lh.end());
+                g_app.stats.lead_ms = lh.empty() ? 0 : (float)lh[lh.size() / 2];
+                lead_hist.clear();
+            }
             static float saved[5] = {-1, -1, -1, -1, -1};
             float cur[5] = {g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm};
             if (memcmp(saved, cur, sizeof cur)) { memcpy(saved, cur, sizeof cur); save_settings(); }
             auto pct = [](std::vector<double> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, (size_t)(p * v.size()))]; };
             long updates = g_pose_updates - last_updates;
+            float keep_lead = g_app.stats.lead_ms;
             g_app.stats = {(float)(shown * 1000.0 / since), (float)pct(latencies, 0.5), (float)pct(latencies, 0.99), (float)pct(cpu_ms, 0.5), (float)(updates * 1000.0 / since),
                            (float)pct(jerk, 0.5), (float)pct(jerk, 0.99), (float)pct(gain, 0.5), missed,
-                           corr_n, corr_n ? corr_deg / corr_n : 0, corr_n ? corr_mm / corr_n : 0};
+                           corr_n, corr_n ? corr_deg / corr_n : 0, corr_n ? corr_mm / corr_n : 0, keep_lead};
             if (!g_stats_paused) printf("      engine corrections: %d (mean %.2f deg, %.1f mm) %s\n", corr_n, corr_n ? corr_deg / corr_n : 0, corr_n ? corr_mm / corr_n : 0, g_app.smooth_corrections ? "blended" : "raw");
             corr_n = 0; corr_deg = corr_mm = 0;
             if (!g_stats_paused)
