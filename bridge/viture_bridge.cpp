@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
     std::vector<unsigned char> imu, vs, posemsg, bin;
     Frame frames[2];
     long n_pose = 0;
-    float pose[16] = {0};
+    float pose[32] = {0};  // get_gl_pose fills 32 floats: the 4x4 matrix, then more (see native/myviture.cpp)
     int pose_rc = 0;
 
     while (!g_quit) {

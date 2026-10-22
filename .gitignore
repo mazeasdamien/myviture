@@ -8,3 +8,5 @@ bridge/*.exe
 bridge/*.obj
 .claude/
 .wrangler/
+native/*.exe
+native/*.obj
