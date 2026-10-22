@@ -257,8 +257,26 @@ function sendRays(rays: XrRay[]) {
 
 let feed: XrFeed | null = null;
 let feedAt = -Infinity;
-function onFeed(f: XrFeed) { feed = f; feedAt = performance.now(); }
 const fresh = () => performance.now() - feedAt < 1000;
+function onFeed(f: XrFeed) {
+  const was = fresh();
+  feed = f;
+  feedAt = performance.now();
+  if (!was) deviceChanged();
+}
+
+/**
+ * Sites check isSessionSupported once and listen for 'devicechange': tell them when
+ * the glasses come (dashboard tracking) and go (no feed for 1 s).
+ */
+let system: EventTarget | null = null;
+let present = false;
+function deviceChanged() {
+  if (present === fresh()) return;
+  present = fresh();
+  system?.dispatchEvent(new Event('devicechange'));
+}
+setInterval(deviceChanged, 1000);
 
 /** Set by installRuntime({ external: true }): fed and placed by the extension. */
 let external = false;
@@ -623,7 +641,10 @@ export function installRuntime(opts: { external?: boolean } = {}) {
   external = !!opts.external;
   listen();
   const g = globalThis as Record<string, unknown>;
-  Object.defineProperty(navigator, 'xr', { value: new XrSystem(), configurable: true });
+  system = new XrSystem();
+  // A site's first isSessionSupported connects the relay: if the glasses are not there
+  // yet, it gets 'devicechange' once they are.
+  Object.defineProperty(navigator, 'xr', { value: system, configurable: true });
   g.XRWebGLLayer = GlLayer;
   g.XRRigidTransform = RigidTransform;
   g.XRSession = Session;
