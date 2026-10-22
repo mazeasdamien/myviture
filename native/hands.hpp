@@ -550,10 +550,19 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
         // A hand missed for a few frames stays where it was, instead of blinking.
         static Hand last_hand[2];
         static double last_hand_t[2] = {-1, -1};
+        static float last_speed[2] = {0, 0};  // wrist speed, m/s
         for (int side = 0; side < 2; side++) {
             auto it = std::find_if(out.begin(), out.end(), [&](const Hand& x) { return x.right == (side == 1); });
-            if (it != out.end()) { last_hand[side] = *it; last_hand_t[side] = t_img; continue; }
-            if (last_hand_t[side] >= 0 && t_img - last_hand_t[side] < 0.15) { Hand h = last_hand[side]; h.held = true; h.rgb_seen = false; out.push_back(h); }
+            if (it != out.end()) {
+                double dt = t_img - last_hand_t[side];
+                if (last_hand_t[side] >= 0 && dt > 0.01 && dt < 0.2) {
+                    const float* a = it->joints[0]; const float* b = last_hand[side].joints[0];
+                    last_speed[side] = (float)(std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2])) / dt);
+                }
+                last_hand[side] = *it; last_hand_t[side] = t_img; continue;
+            }
+            // Only briefly, and not for a hand that was moving: a stale pose then reads as lag.
+            if (last_hand_t[side] >= 0 && t_img - last_hand_t[side] < 0.08 && last_speed[side] < 0.4) { Hand h = last_hand[side]; h.held = true; h.rgb_seen = false; out.push_back(h); }
             else pinch_state[side] = false;
         }
 

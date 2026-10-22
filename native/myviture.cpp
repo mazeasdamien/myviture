@@ -715,7 +715,7 @@ int main(int argc, char** argv) {
                 if (engine_pose(target, now_at)) { prev_target = target; prev_q_at = mat_q(now_at); prev_p_at = {now_at(0, 3), now_at(1, 3), now_at(2, 3)}; }
                 // Fade: fast while the head turns (errors are hidden), slow when still.
                 double dt = last_qpc ? qpc_ms(qpc_now() - last_qpc) / 1000.0 : 0.016;
-                double tau = rate_dps > 20 ? 0.08 : 0.25;
+                double tau = rate_dps > 20 ? 0.06 : 0.15;
                 float k = (float)std::exp(-dt / tau);
                 // oq^k by shrinking its angle
                 float s = sqrtf(oq.x * oq.x + oq.y * oq.y + oq.z * oq.z);
