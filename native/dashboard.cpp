@@ -20,6 +20,7 @@
 #include "orange.hpp"
 #include "rgbcam.hpp"
 #include "hands.hpp"
+#include "rgbcal.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -268,19 +269,6 @@ static void build(AppState& s) {
     ImGui::SameLine();
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
     if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; }
-    ImGui::SeparatorText("Calage sur les mains");
-    if (s.align_active) {
-        ImGui::TextColored(ImVec4(0.4f, 1, 0.6f, 1), "Cible %d / %d : pince la cible verte là où tu la vois", s.align_index + 1, s.align_total);
-        ImGui::TextDisabled("pouce + index, garde la pince une demi-seconde, relâche");
-        if (ImGui::Button("Annuler")) s.align_cancel = true;
-    } else {
-        if (ImGui::Button("Calibrer avec les mains")) s.align_start = true;
-        ImGui::SameLine();
-        if (ImGui::Button("Sans correction")) s.align_reset = true;
-        bool corrected = s.align[0] != 1 || s.align[3] != 0 || s.align[7] != 0 || s.align[11] != 0;
-        ImGui::TextDisabled(corrected ? "correction appliquée" : "aucune correction");
-    }
-    if (!s.align_status.empty()) ImGui::TextWrapped("%s", s.align_status.c_str());
     ImGui::Checkbox("Prédire le mouvement des mains", &s.hand_predict);
     ImGui::EndChild();
 
@@ -357,10 +345,60 @@ static void build(AppState& s) {
     // One line always, so the image never moves.
     if (!rgb_status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", rgb_status.c_str());
     else ImGui::TextDisabled("%s", rgb_name.c_str());
+    ImGui::SameLine();
+    ImGui::Checkbox("Virtuel", &s.rgb_overlay);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Oublier le calage RGB")) rgbcal::reset();
+    {
+        rgbcal::Fit fi; bool fitted; size_t np;
+        { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; np = rgbcal::g_pairs.size(); }
+        if (fitted) ImGui::TextDisabled("calage RGB : écart %.1f px sur %d points · rotation %.1f° · décalage %.1f %.1f %.1f cm · focale ×%.2f", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
+        else ImGui::TextDisabled("calage RGB : caméra par défaut · %zu points (montre tes mains, immobiles, à plusieurs endroits)%s", np, fi.n && !fi.ok ? " · dernier essai refusé" : "");
+    }
     if (rgb.srv) {
         ImVec2 a = ImGui::GetContentRegionAvail();
         float k = std::min(a.x / rgb.w, a.y / rgb.h);
+        ImVec2 o = ImGui::GetCursorScreenPos();
         ImGui::Image((ImTextureID)(intptr_t)rgb.srv, ImVec2(rgb.w * k, rgb.h * k));
+        if (s.rgb_overlay) {
+            // The virtual world as the RGB camera should see it: hands (stereo, through the
+            // fitted camera) and the test cubes; in green, where the hand model sees the
+            // hand in the RGB image itself. The gap between the two is the misalignment.
+            rgbcal::Cam cam = rgbcal::current(rgb.w, rgb.h);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            auto px = [&](const double p[3], ImVec2& out) { double u, v; if (!rgbcal::project(cam, p, u, v)) return false; out = ImVec2(o.x + (float)u * k, o.y + (float)v * k); return true; };
+            for (auto& h : hr.hands) {
+                ImU32 col = h.right ? IM_COL32(255, 122, 69, 230) : IM_COL32(76, 141, 255, 230);
+                for (auto& b : hands::BONES) {
+                    double p0[3] = {h.joints[b[0]][0], h.joints[b[0]][1], h.joints[b[0]][2]}, p1[3] = {h.joints[b[1]][0], h.joints[b[1]][1], h.joints[b[1]][2]};
+                    ImVec2 a0, a1;
+                    if (px(p0, a0) && px(p1, a1)) dl->AddLine(a0, a1, col, 2.5f);
+                }
+                if (h.rgb_seen) for (auto& b : hands::BONES)
+                    dl->AddLine(ImVec2(o.x + h.rgb[b[0]][0] * k, o.y + h.rgb[b[0]][1] * k), ImVec2(o.x + h.rgb[b[1]][0] * k, o.y + h.rgb[b[1]][1] * k), IM_COL32(80, 255, 120, 200), 1.5f);
+            }
+            if (s.scene) {
+                // scene -> head: rigid inverse of head -> scene
+                const float* m = s.head_scene;
+                auto to_head = [&](float x, float y, float z, double out[3]) {
+                    float dx = x - m[3], dy = y - m[7], dz = z - m[11];
+                    out[0] = m[0] * dx + m[4] * dy + m[8] * dz; out[1] = m[1] * dx + m[5] * dy + m[9] * dz; out[2] = m[2] * dx + m[6] * dy + m[10] * dz;
+                };
+                auto cube_at = [&](float x, float y, float z, float half, ImU32 col) {
+                    // the cube's 8 corners -> 12 edges
+                    ImVec2 c[8]; bool ok = true;
+                    for (int i = 0; i < 8 && ok; i++) { double p[3]; to_head(x + (i & 1 ? half : -half), y + (i & 2 ? half : -half), z + (i & 4 ? half : -half), p); ok = px(p, c[i]); }
+                    if (!ok) return;
+                    for (int i = 0; i < 8; i++) for (int b = 1; b < 8; b <<= 1) if (!(i & b)) dl->AddLine(c[i], c[i | b], col, 1.5f);
+                };
+                for (int i = 0; i < 8; i++) {
+                    float a = i * 3.14159265f / 4, hue = i / 8.0f;
+                    ImU32 col = IM_COL32((int)(255 * (0.5f + 0.5f * cosf(6.2832f * hue))), (int)(255 * (0.5f + 0.5f * cosf(6.2832f * (hue - 0.333f)))), (int)(255 * (0.5f + 0.5f * cosf(6.2832f * (hue - 0.667f)))), 220);
+                    cube_at(sinf(a) * 0.9f, 0, -cosf(a) * 0.9f, 0.06f, col);
+                }
+                cube_at(0, -0.1f, -1.0f, 0.025f, IM_COL32(255, 255, 255, 220));
+            }
+        }
     }
     ImGui::EndChild();
 

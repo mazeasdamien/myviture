@@ -26,6 +26,8 @@
 
 #include "calib.hpp"
 #include "state.hpp"
+#include "rgbcam.hpp"
+#include "rgbcal.hpp"
 #include "third_party/onnxruntime/include/onnxruntime_cxx_api.h"
 #include "third_party/onnxruntime/include/dml_provider_factory.h"
 
@@ -46,6 +48,8 @@ struct Hand {
     bool pinching = false;
     float pinch_m = 1;
     float gap_mm = 0;             // mean distance between the two cameras' rays
+    bool rgb_seen = false;        // the hand model found this hand in the RGB image too
+    float rgb[N_JOINTS][2];       // where it is in the RGB image (pixels)
 };
 
 struct Result {
@@ -57,6 +61,7 @@ struct Result {
     int palm_runs = 0;            // palm detections in the last second
     std::string status = "chargement…";
     std::string device;
+    int rgb_w = 0, rgb_h = 0;
 };
 
 inline std::mutex g_mu;
@@ -97,22 +102,32 @@ struct OneEuro {
 /** Square, rotated region of interest in an image (pixels). */
 struct Roi { double cx = 0, cy = 0, size = 0, angle = 0; };
 
-/** Samples `roi` into an n x n RGB float image in [0, 1] (gray replicated, bilinear, black outside). */
-inline void crop(const uint8_t* img, int w, int h, const Roi& r, int n, float* out) {
+/** Samples `roi` into an n x n RGB float image in [0, 1] (bilinear, black outside). `px(x, y, rgb)` reads one pixel. */
+template <typename Px>
+inline void crop_with(Px px, int w, int h, const Roi& r, int n, float* out) {
     double c = std::cos(r.angle), s = std::sin(r.angle);
     for (int v = 0; v < n; v++) for (int u = 0; u < n; u++) {
         double lx = ((u + 0.5) / n - 0.5) * r.size, ly = ((v + 0.5) / n - 0.5) * r.size;
         double x = r.cx + lx * c - ly * s - 0.5, y = r.cy + lx * s + ly * c - 0.5;
-        float g = 0;
-        int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
-        if (x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h) {
-            double fx = x - x0, fy = y - y0;
-            const uint8_t* p = img + y0 * w + x0;
-            g = (float)(((p[0] * (1 - fx) + p[1] * fx) * (1 - fy) + (p[w] * (1 - fx) + p[w + 1] * fx) * fy) / 255.0);
-        }
         float* o = out + (v * n + u) * 3;
-        o[0] = o[1] = o[2] = g;
+        o[0] = o[1] = o[2] = 0;
+        int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+        if (x0 < 0 || y0 < 0 || x0 + 1 >= w || y0 + 1 >= h) continue;
+        double fx = x - x0, fy = y - y0;
+        float a[3], b[3], cc[3], d[3];
+        px(x0, y0, a); px(x0 + 1, y0, b); px(x0, y0 + 1, cc); px(x0 + 1, y0 + 1, d);
+        for (int k = 0; k < 3; k++) o[k] = (float)((a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (cc[k] * (1 - fx) + d[k] * fx) * fy);
     }
+}
+
+/** Gray image (the tracking cameras), replicated to RGB. */
+inline void crop(const uint8_t* img, int w, int h, const Roi& r, int n, float* out) {
+    crop_with([&](int x, int y, float* rgb) { rgb[0] = rgb[1] = rgb[2] = img[y * w + x] / 255.0f; }, w, h, r, n, out);
+}
+
+/** BGRA image (the RGB camera). */
+inline void crop_bgra(const uint32_t* img, int w, int h, const Roi& r, int n, float* out) {
+    crop_with([&](int x, int y, float* rgb) { uint32_t p = img[y * w + x]; rgb[0] = ((p >> 16) & 255) / 255.0f; rgb[1] = ((p >> 8) & 255) / 255.0f; rgb[2] = (p & 255) / 255.0f; }, w, h, r, n, out);
 }
 
 /** ROI-local normalised point (0..1) -> image pixels. */
@@ -260,10 +275,8 @@ constexpr float PRESENCE_MIN = 0.3f;
  * Landmarks of the hand in `roi`; false if the model says there is no hand. presence and
  * hand (handedness, 1 = the wearer's right) are returned for the diagnostics.
  */
-inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand, float world[N_JOINTS][3] = nullptr) {
+inline bool landmarks_run(Models& M, std::vector<float>& in, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand, float world[N_JOINTS][3]) {
     const int N = 224;
-    static std::vector<float> in(N * N * 3);
-    crop(img, w, h, roi, N, in.data());
     auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     int64_t shape[4] = {1, N, N, 3};
     Ort::Value t = Ort::Value::CreateTensor<float>(mem, in.data(), in.size(), shape, 4);
@@ -300,6 +313,12 @@ inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& ro
         }
     }
     return true;
+}
+
+inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand, float world[N_JOINTS][3] = nullptr) {
+    static std::vector<float> in(224 * 224 * 3);
+    crop(img, w, h, roi, 224, in.data());
+    return landmarks_run(M, in, roi, out, presence, hand, world);
 }
 
 /**
@@ -518,6 +537,70 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
         }
         for (int side = 0; side < 2; side++) if (std::none_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == (side == 1); })) pinch_state[side] = false;
 
+        // RGB camera: each stereo hand is looked for in the newest RGB image where the
+        // current RGB model projects it; found, the joints feed the model's fit (only
+        // while the hand is still, so the two cameras' timings do not matter).
+        int rgb_w = 0, rgb_h = 0;
+        if (!out.empty()) {
+            static uint32_t rgb_seq = 0;
+            static std::vector<float> crops[2];
+            static Roi crop_roi[2];
+            static bool cropped[2];
+            static float last_wrist[2][3];
+            static double last_wrist_t[2] = {0, 0};
+            cropped[0] = cropped[1] = false;
+            rgbcal::Cam cam;
+            {
+                std::lock_guard<std::mutex> l(rgbcam::g_frame.mu);
+                auto& f = rgbcam::g_frame;
+                if (f.w && f.seq != rgb_seq && f.bgra.size() >= (size_t)f.w * f.h) {
+                    rgb_seq = f.seq;
+                    rgb_w = f.w; rgb_h = f.h;
+                    cam = rgbcal::current(f.w, f.h);
+                    for (size_t i = 0; i < out.size() && i < 2; i++) {
+                        float proj[N_JOINTS][2];
+                        bool ok = true;
+                        for (int k = 0; k < N_JOINTS && ok; k++) {
+                            double p[3] = {out[i].joints[k][0], out[i].joints[k][1], out[i].joints[k][2]}, u, v;
+                            ok = rgbcal::project(cam, p, u, v);
+                            proj[k][0] = (float)u; proj[k][1] = (float)v;
+                        }
+                        if (!ok) continue;
+                        crop_roi[i] = roi_from_landmarks(proj);
+                        crop_roi[i].size *= cam.fitted ? 1.3 : 1.8;  // more margin before the first fit
+                        crops[i].resize(224 * 224 * 3);
+                        crop_bgra(f.bgra.data(), f.w, f.h, crop_roi[i], 224, crops[i].data());
+                        cropped[i] = true;
+                    }
+                }
+            }
+            std::vector<rgbcal::Pair> pairs;
+            for (size_t i = 0; i < out.size() && i < 2; i++) {
+                if (!cropped[i]) continue;
+                float pres, hand, wd[N_JOINTS][3];
+                if (!landmarks_run(M, crops[i], crop_roi[i], out[i].rgb, pres, hand, wd) || pres < 0.5f) continue;
+                out[i].rgb_seen = true;
+                int sd = out[i].right ? 1 : 0;
+                const float* wr = out[i].joints[0];
+                double dt = t_img - last_wrist_t[sd];
+                double moved = std::sqrt((wr[0] - last_wrist[sd][0]) * (wr[0] - last_wrist[sd][0]) + (wr[1] - last_wrist[sd][1]) * (wr[1] - last_wrist[sd][1]) + (wr[2] - last_wrist[sd][2]) * (wr[2] - last_wrist[sd][2]));
+                bool still = dt > 0 && dt < 0.2 && moved / dt < 0.15;
+                for (int k = 0; k < 3; k++) last_wrist[sd][k] = wr[k];
+                last_wrist_t[sd] = t_img;
+                if (!still || out[i].gap_mm > 15) continue;
+                for (int k = 0; k < N_JOINTS; k++) pairs.push_back({{out[i].joints[k][0], out[i].joints[k][1], out[i].joints[k][2]}, out[i].rgb[k][0], out[i].rgb[k][1]});
+            }
+            if (!pairs.empty()) {
+                size_t before; { std::lock_guard<std::mutex> l(rgbcal::g_mu); before = rgbcal::g_pairs.size(); }
+                rgbcal::add(pairs);
+                rgbcal::Fit fi; bool fitted;
+                { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; }
+                if (fi.n && (before / 40) != ((before + pairs.size()) / 40))
+                    logf("rgb fit: %s rms %.1f px on %d points, rot %.1f deg, shift %.1f %.1f %.1f cm, f x%.2f\n", fi.ok ? "ok" : "rejected", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
+                (void)fitted;
+            }
+        }
+
         double t1 = qpc_s();
         frames++;
         if (t1 - rate_t0 > 1) {
@@ -541,6 +624,7 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
         g_result.ms_total = (float)((t1 - t0) * 1000);
         g_result.ms_landmarks = g_result.ms_total - g_result.ms_palm;
         g_result.latency_ms = (float)((t1 - t_img) * 1000);
+        if (rgb_w) { g_result.rgb_w = rgb_w; g_result.rgb_h = rgb_h; }
     }
 }
 

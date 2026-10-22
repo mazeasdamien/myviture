@@ -25,12 +25,8 @@ struct AppState {
     bool floor_grid = false;
     bool hands = true;
     bool hand_predict = false;  // extrapolate the hands' motion to the display time (felt worse: off)
-
-    // display calibration with the hands (align.hpp): D, drawn points -> real points
-    double align[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    bool align_start = false, align_cancel = false, align_reset = false, align_active = false;
-    int align_index = 0, align_total = 0;
-    std::string align_status;  // the floor grid shows height errors and the optics' edges most
+    bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
+    bool rgb_reset = false;    // forget the RGB camera fit  // the floor grid shows height errors and the optics' edges most
     bool recenter = true;
     bool quit = false;
     bool snapshot = false;  // save the dashboard as dashboard.png
@@ -41,6 +37,7 @@ struct AppState {
     int screen_w = 0, screen_h = 0;
     Stats stats;
     float yaw = 0, pitch = 0, roll = 0, pos[3] = {}, rate_dps = 0;
+    float head_scene[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // row-major
     std::vector<float> shake_history;    // deg per frame, newest last
     std::vector<float> latency_history;  // pose -> vblank, ms
 };

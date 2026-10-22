@@ -17,7 +17,7 @@
 #include "rgbcam.hpp"
 #include "calib.hpp"
 #include "hands.hpp"
-#include "align.hpp"
+#include "rgbcal.hpp"
 #include "state.hpp"
 
 #include <d3d11.h>
@@ -347,7 +347,6 @@ static std::vector<Vertex> grid_vertices() {
 // ------------------------------------------------------------------ window
 
 static AppState g_app;
-static std::string g_align_path;
 static bool g_stats_paused = false;
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -556,8 +555,8 @@ int main(int argc, char** argv) {
         std::wstring dir = exe;
         dir = dir.substr(0, dir.find_last_of(L'\\') + 1);
         calib::Rig rig = calib::load(std::string(dir.begin(), dir.end()) + "..\\calibration.bin");
-        g_align_path = std::string(dir.begin(), dir.end()) + "myviture_display.txt";
-        if (align::load(g_align_path, g_app.align)) printf("display correction loaded (%s)\n", g_align_path.c_str());
+        rgbcal::g_path = std::string(dir.begin(), dir.end()) + "myviture_rgb.txt";
+        { std::lock_guard<std::mutex> l(rgbcal::g_mu); if (rgbcal::load(rgbcal::g_path, rgbcal::g_cam)) printf("RGB camera fit loaded\n"); }
         if (rig.ok) hands::start(dir + L"models\\", rig);
         else { std::lock_guard<std::mutex> l(hands::g_mu); hands::g_result.status = "calibration.bin introuvable (dossier du projet)"; }
     }
@@ -647,6 +646,7 @@ int main(int argc, char** argv) {
             g_app.pitch = asinf(std::clamp(fy, -1.0f, 1.0f)) * 57.2958f;
             g_app.roll = atan2f(-head_scene(1, 0), head_scene(1, 1)) * 57.2958f;
             for (int i = 0; i < 3; i++) g_app.pos[i] = head_scene(i, 3);
+            for (int i = 0; i < 16; i++) g_app.head_scene[i] = head_scene.m[i];
             g_app.rate_dps = rate_dps;
         }
 
@@ -693,56 +693,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Display calibration: a target fixed to the head, pinched where it is seen.
-        static std::vector<align::Pair> align_pairs;
-        static double acc[3] = {0, 0, 0};
-        static int acc_n = 0;
-        static bool was_pinching = false;
-        static uint32_t align_seq = 0;
-        static const auto targets = align::targets();
-        if (g_app.align_reset) {
-            g_app.align_reset = false;
-            M4 id = identity();
-            for (int i = 0; i < 16; i++) g_app.align[i] = id.m[i];
-            align::save(g_align_path, g_app.align);
-            g_app.align_status = "correction remise à zéro";
-        }
-        if (g_app.align_start) {
-            g_app.align_start = false;
-            g_app.align_active = true; g_app.align_index = 0; g_app.align_total = (int)targets.size();
-            align_pairs.clear(); acc_n = 0; was_pinching = false;
-            g_app.align_status = "";
-        }
-        if (g_app.align_cancel) { g_app.align_cancel = false; g_app.align_active = false; g_app.align_status = "calibration annulée"; }
-        if (g_app.align_active && hr.seq != align_seq) {
-            align_seq = hr.seq;
-            const hands::Hand* ph = nullptr;
-            for (auto& h : hr.hands) if (h.pinching) ph = &h;
-            if (ph) {
-                for (int i = 0; i < 3; i++) acc[i] += (ph->joints[4][i] + ph->joints[8][i]) / 2;
-                acc_n++;
-                was_pinching = true;
-            } else if (was_pinching) {
-                was_pinching = false;
-                if (acc_n >= 3) {
-                    align::Pair pr;
-                    for (int i = 0; i < 3; i++) { pr.t[i] = targets[g_app.align_index][i]; pr.r[i] = acc[i] / acc_n; }
-                    align_pairs.push_back(pr);
-                    printf("align target %d: drawn %.3f %.3f %.3f  pinched %.3f %.3f %.3f\n", g_app.align_index, pr.t[0], pr.t[1], pr.t[2], pr.r[0], pr.r[1], pr.r[2]);
-                    if (++g_app.align_index == g_app.align_total) {
-                        g_app.align_active = false;
-                        align::Result res = align::solve(align_pairs);
-                        char msg[256];
-                        snprintf(msg, sizeof msg, "écart %.0f mm · décalage %.0f %.0f %.0f mm · rotation %.1f° · échelle %.3f%s", res.rms_mm,
-                                 res.shift_mm[0], res.shift_mm[1], res.shift_mm[2], res.rot_deg, res.scale, res.ok ? "" : " → refusée, recommence");
-                        g_app.align_status = msg;
-                        printf("align: %s\n", msg);
-                        if (res.ok) { for (int i = 0; i < 16; i++) g_app.align[i] = res.M[i]; align::save(g_align_path, g_app.align); }
-                    }
-                }
-                acc[0] = acc[1] = acc[2] = 0; acc_n = 0;
-            }
-        }
         UINT bone_count = 0;
         if (!scene_hands.empty()) {
             D3D11_MAPPED_SUBRESOURCE m;
@@ -781,10 +731,8 @@ int main(int argc, char** argv) {
             D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
             ctx->RSSetViewports(1, &vp);
             float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
-            M4 D = identity();
-            if (!g_app.align_active) for (int i = 0; i < 16; i++) D.m[i] = (float)g_app.align[i];
-            M4 eye_world = mul(mul(head_scene, D), translate({off, 0, 0}));
-            M4 vpm = mul(perspective(g_app.vfov, vw / H, 0.05f, 50), invert(eye_world));
+            M4 eye_world = mul(head_scene, translate({off, 0, 0}));
+            M4 vpm = mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world));
             auto draw = [&](ID3D11Buffer* vb, UINT n, D3D11_PRIMITIVE_TOPOLOGY topo, const M4& model, float r, float g, float b, bool lit) {
                 Constants c{mul(vpm, model), model, {r, g, b, 1}, {lit ? 1.0f : 0.0f, 0, 0, 0}};
                 ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
@@ -793,11 +741,6 @@ int main(int argc, char** argv) {
                 ctx->IASetPrimitiveTopology(topo);
                 ctx->Draw(n, 0);
             };
-            if (g_app.align_active) {
-                auto& t = targets[g_app.align_index];
-                M4 at = mul(head_scene, translate({(float)t[0], (float)t[1], (float)t[2]}));
-                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(at, scale(0.012f)), 0.2f, 1.0f, 0.4f, false);
-            }
             // Hands: joints as small cubes, bones as lines (left blue, right orange; white when pinching).
             for (size_t hi = 0; hi < scene_hands.size(); hi++) {
                 auto& h = scene_hands[hi];
