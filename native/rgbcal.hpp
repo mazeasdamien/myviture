@@ -156,7 +156,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     info.rot_deg = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]) * 180 / 3.14159265;
     for (int i = 0; i < 3; i++) info.shift_cm[i] = x[3 + i] * 100;
     info.f_rel = t.f / f0;
-    info.ok = n >= 100 && info.rms_px < 60 && info.rot_deg < 25 && std::fabs(x[3]) < 0.12 && std::fabs(x[4]) < 0.12 && std::fabs(x[5]) < 0.12 && info.f_rel > 0.6 && info.f_rel < 1.6;
+    info.ok = n >= 100 && info.rms_px < 30 && info.rot_deg < 18 && std::fabs(x[3]) < 0.12 && std::fabs(x[4]) < 0.12 && std::fabs(x[5]) < 0.12 && info.f_rel > 0.6 && info.f_rel < 1.6;
     if (info.ok) { cam = t; cam.fitted = true; }
     return info.ok;
 }
@@ -219,13 +219,14 @@ inline void add(const std::vector<Pair>& pairs, const double wrist[3]) {
     static std::atomic<bool> busy{false};
     static double last_fit = -1e9;
     double now = GetTickCount64() / 1000.0;
-    double every = g_cam.fitted && g_fit.ok && g_fit.rms_px < 20 ? 15 : 2;
+    double every = g_cam.fitted ? 20 : 5;
     if (((g_frames >= 8 && spread >= 0.12) || (g_frames >= 30 && spread >= 0.06)) && now - last_fit >= every && !busy.exchange(true)) {
         last_fit = now;
         g_since_fit = 0;
         std::vector<Pair> P = g_pairs;
         Cam trial = g_cam;
         std::thread([P = std::move(P), trial]() mutable {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);  // never take CPU from the hands
             Fit info;
             bool ok = fit(P, trial, info);
             {

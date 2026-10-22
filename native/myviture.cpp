@@ -961,15 +961,20 @@ int main(int argc, char** argv) {
         // Test panel: gestures per hand, poke on its button with the index tip.
         if (panel_ok && g_app.panel) {
             using namespace panel;
-            bool inside_now = false;
+            // Hysteresis: pressed under 1 cm from the surface, released only beyond 3 cm or
+            // 1.5 cm outside the button, so the fingertip's jitter does not toggle it.
+            bool pressed = false, released = true;
             for (auto& h : scene_hands) {
                 V3 t = h.j[8];
                 float lx = t.x - PANEL_AT.x, ly = t.y - PANEL_AT.y, lz = t.z - PANEL_AT.z;
-                if (lx > BX0 && lx < BX1 && ly > BY0 && ly < BY1 && lz < 0.01f && lz > -0.05f) inside_now = true;
+                if (lx > BX0 && lx < BX1 && ly > BY0 && ly < BY1 && lz < 0.01f && lz > -0.06f) pressed = true;
+                const float m = 0.015f;
+                if (lx > BX0 - m && lx < BX1 + m && ly > BY0 - m && ly < BY1 + m && lz < 0.03f && lz > -0.08f) released = false;
             }
             double now_s = qpc_now() / qpc_freq();
-            if (inside_now && !poke_inside) { pokes++; lit_until = now_s + 0.6; }
-            poke_inside = inside_now;
+            if (!poke_inside && pressed) { poke_inside = true; pokes++; }
+            else if (poke_inside && released) poke_inside = false;
+            if (poke_inside) lit_until = now_s + 0.3;
             lit = now_s < lit_until;
             std::vector<std::string> lines;
             for (int side = 0; side < 2; side++) {

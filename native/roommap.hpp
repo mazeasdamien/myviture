@@ -126,6 +126,7 @@ inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>&
 }
 
 inline void run(calib::Rig rig, PoseFn pose_at) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     depth::Stereo stereo(rig);
     if (!stereo.ok) { std::lock_guard<std::mutex> l(g.mu); g.status = "profondeur GPU : " + stereo.error; return; }
     { std::lock_guard<std::mutex> l(g.mu); g.status = ""; }

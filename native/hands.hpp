@@ -402,6 +402,7 @@ struct Track {
 constexpr int MAX_MISSES = 4;  // frames a hand may be missed before it is dropped
 
 inline void run(std::wstring model_dir, calib::Rig rig) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     Models M;
     if (!M.load(model_dir)) { std::lock_guard<std::mutex> l(g_mu); g_result.status = "modèles de mains introuvables (native\\models)"; return; }
     { std::lock_guard<std::mutex> l(g_mu); g_result.status = ""; g_result.device = M.device; }
