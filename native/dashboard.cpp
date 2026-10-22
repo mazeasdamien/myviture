@@ -296,10 +296,13 @@ static void build(AppState& s) {
     ImGui::SliderFloat("champ vertical (°)", &s.vfov, 20, 40, "%.2f");
     ImGui::SliderFloat("écart des yeux (mm)", &s.ipd_mm, 50, 75, "%.1f");
     ImGui::SliderFloat("sol sous les yeux (m)", &s.floor_m, 0.5f, 2.2f, "%.2f");
+    ImGui::SliderFloat("inclinaison (°)", &s.pitch_deg, -20, 20, "%.1f");
+    ImGui::SliderFloat("hauteur des yeux (cm)", &s.eye_dy_cm, -10, 10, "%.1f");
+    ImGui::TextDisabled("Les objets (et tes mains virtuelles) sont trop hauts : baisse l'inclinaison jusqu'à ce que la main virtuelle couvre la vraie.");
     ImGui::Checkbox("Scène de test (cubes)", &s.scene);
     ImGui::SameLine();
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
-    if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; }
+    if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; s.pitch_deg = 0; s.eye_dy_cm = 0; }
     ImGui::Checkbox("Prédire le mouvement des mains", &s.hand_predict);
     ImGui::SeparatorText("Pièce (scan)");
     {
@@ -363,8 +366,8 @@ static void build(AppState& s) {
     for (int side = 0; side < 2; side++) {
         const hands::Hand* h = nullptr;
         for (auto& x : hr.hands) if (x.right == (side == 1)) h = &x;
-        if (h) ImGui::TextDisabled("%s : pince %.1f cm%s · stéréo %.1f mm · poignet %.2f %.2f %.2f m", side ? "droite" : "gauche", h->pinch_m * 100,
-                                   h->pinching ? " ✓" : "", h->gap_mm, h->joints[0][0], h->joints[0][1], h->joints[0][2]);
+        if (h) ImGui::TextDisabled("%s : pince %.1f cm%s · stéréo %.1f mm · échelle %.2f%s · poignet %.2f %.2f %.2f m", side ? "droite" : "gauche", h->pinch_m * 100,
+                                   h->pinching ? " ✓" : "", h->gap_mm, h->scale_ratio, h->held ? " · tenue" : "", h->joints[0][0], h->joints[0][1], h->joints[0][2]);
         else ImGui::TextDisabled("%s : —", side ? "droite" : "gauche");
     }
     ImGui::EndChild();

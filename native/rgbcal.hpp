@@ -21,6 +21,7 @@ struct Cam {
     double f = 0;
     double rv[3] = {0, 0, 0};  // rotation vector (radians)
     double c[3] = {0, 0, 0};   // camera centre in the head frame (m)
+    double k1 = 0;             // radial distortion
     bool fitted = false;
 };
 
@@ -46,8 +47,9 @@ inline bool project(const Cam& cam, const double p[3], double& u, double& v) {
     for (int i = 0; i < 3; i++) r[i] = R[i * 3] * d[0] + R[i * 3 + 1] * d[1] + R[i * 3 + 2] * d[2];
     double x = r[0], y = -r[1], z = -r[2];  // B
     if (z < 0.05) return false;
-    u = cam.f * x / z + cam.w / 2.0;
-    v = cam.f * y / z + cam.h / 2.0;
+    double xn = x / z, yn = y / z, r2 = xn * xn + yn * yn, k = 1 + cam.k1 * r2;
+    u = cam.f * xn * k + cam.w / 2.0;
+    v = cam.f * yn * k + cam.h / 2.0;
     return true;
 }
 
@@ -65,12 +67,12 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     const double f0 = default_focal(cam.w);
     const double sig_px = 3, sig_rot = 6 * 3.14159265 / 180, sig_t = 0.04, sig_f = 0.15;
     const double k = 8 * std::sqrt(P.size() / 20.0);  // prior weight grows with the data, as the web fit
-    double x[7] = {0, 0, 0, 0, 0, 0, std::log(f0)};  // start from the default, not the current fit
+    double x[8] = {0, 0, 0, 0, 0, 0, std::log(f0), 0};  // start from the default, not the current fit
     std::vector<char> use(P.size(), 1);
     auto residuals = [&](const double* q, std::vector<double>& r) {
         Cam t = cam;
         for (int i = 0; i < 3; i++) { t.rv[i] = q[i]; t.c[i] = q[3 + i]; }
-        t.f = std::exp(q[6]);
+        t.f = std::exp(q[6]); t.k1 = q[7];
         r.clear();
         for (size_t i = 0; i < P.size(); i++) {
             if (!use[i]) continue;
@@ -82,50 +84,51 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
         for (int i = 0; i < 3; i++) r.push_back(k * q[i] / sig_rot);
         for (int i = 0; i < 3; i++) r.push_back(k * q[3 + i] / sig_t);
         r.push_back(k * (q[6] - std::log(f0)) / sig_f);
+        r.push_back(k * q[7] / 0.15);
     };
     auto cost = [&](const std::vector<double>& r) { double s = 0; for (double v : r) s += v * v; return s; };
     for (int pass = 0; pass < 2; pass++) {
-        std::vector<double> r, r2, J[7];
+        std::vector<double> r, r2, J[8];
         residuals(x, r);
         double lambda = 1e-2, c0 = cost(r);
         for (int it = 0; it < 30; it++) {
-            for (int j = 0; j < 7; j++) {
-                double q[7]; for (int i = 0; i < 7; i++) q[i] = x[i];
+            for (int j = 0; j < 8; j++) {
+                double q[8]; for (int i = 0; i < 8; i++) q[i] = x[i];
                 double h = j < 3 ? 1e-4 : j < 6 ? 1e-4 : 1e-3;
                 q[j] += h;
                 residuals(q, J[j]);
                 for (size_t i = 0; i < r.size(); i++) J[j][i] = (J[j][i] - r[i]) / h;
             }
-            double A[7][7] = {}, b[7] = {};
-            for (int a = 0; a < 7; a++) {
+            double A[8][8] = {}, b[8] = {};
+            for (int a = 0; a < 8; a++) {
                 for (size_t i = 0; i < r.size(); i++) b[a] -= J[a][i] * r[i];
-                for (int c = 0; c < 7; c++) for (size_t i = 0; i < r.size(); i++) A[a][c] += J[a][i] * J[c][i];
+                for (int c = 0; c < 8; c++) for (size_t i = 0; i < r.size(); i++) A[a][c] += J[a][i] * J[c][i];
             }
-            for (int a = 0; a < 7; a++) A[a][a] *= 1 + lambda;
+            for (int a = 0; a < 8; a++) A[a][a] *= 1 + lambda;
             // Solve A dx = b (Gauss with pivoting).
-            double M[7][8];
-            for (int a = 0; a < 7; a++) { for (int c = 0; c < 7; c++) M[a][c] = A[a][c]; M[a][7] = b[a]; }
+            double M[8][9];
+            for (int a = 0; a < 8; a++) { for (int c = 0; c < 8; c++) M[a][c] = A[a][c]; M[a][8] = b[a]; }
             bool singular = false;
-            for (int c = 0; c < 7 && !singular; c++) {
+            for (int c = 0; c < 8 && !singular; c++) {
                 int piv = c;
-                for (int a = c + 1; a < 7; a++) if (std::fabs(M[a][c]) > std::fabs(M[piv][c])) piv = a;
-                for (int j = 0; j < 8; j++) std::swap(M[c][j], M[piv][j]);
+                for (int a = c + 1; a < 8; a++) if (std::fabs(M[a][c]) > std::fabs(M[piv][c])) piv = a;
+                for (int j = 0; j < 9; j++) std::swap(M[c][j], M[piv][j]);
                 if (std::fabs(M[c][c]) < 1e-12) { singular = true; break; }
-                for (int a = 0; a < 7; a++) if (a != c) { double f = M[a][c] / M[c][c]; for (int j = 0; j < 8; j++) M[a][j] -= f * M[c][j]; }
+                for (int a = 0; a < 8; a++) if (a != c) { double f = M[a][c] / M[c][c]; for (int j = 0; j < 9; j++) M[a][j] -= f * M[c][j]; }
             }
             if (singular) break;
-            double q[7];
-            for (int a = 0; a < 7; a++) q[a] = x[a] + M[a][7] / M[a][a];
+            double q[8];
+            for (int a = 0; a < 8; a++) q[a] = x[a] + M[a][8] / M[a][a];
             residuals(q, r2);
             double c1 = cost(r2);
-            if (c1 < c0) { for (int a = 0; a < 7; a++) x[a] = q[a]; r = r2; lambda = std::max(1e-6, lambda / 3); if (c0 - c1 < 1e-6 * c0) break; c0 = c1; }
+            if (c1 < c0) { for (int a = 0; a < 8; a++) x[a] = q[a]; r = r2; lambda = std::max(1e-6, lambda / 3); if (c0 - c1 < 1e-6 * c0) break; c0 = c1; }
             else lambda = std::min(1e6, lambda * 4);
         }
         if (pass == 0) {
             // Drop the pairs far off (a hand mismatched between the stereo and RGB), refit.
             Cam t = cam;
             for (int i = 0; i < 3; i++) { t.rv[i] = x[i]; t.c[i] = x[3 + i]; }
-            t.f = std::exp(x[6]);
+            t.f = std::exp(x[6]); t.k1 = x[7];
             std::vector<double> e;
             for (size_t i = 0; i < P.size(); i++) { double u, v; e.push_back(project(t, P[i].p, u, v) ? std::hypot(u - P[i].u, v - P[i].v) : 1e9); }
             std::vector<double> s = e;
@@ -136,7 +139,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     }
     Cam t = cam;
     for (int i = 0; i < 3; i++) { t.rv[i] = x[i]; t.c[i] = x[3 + i]; }
-    t.f = std::exp(x[6]);
+    t.f = std::exp(x[6]); t.k1 = x[7];
     double e2 = 0; int n = 0;
     for (size_t i = 0; i < P.size(); i++) {
         if (!use[i]) continue;
@@ -148,7 +151,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     info.rot_deg = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]) * 180 / 3.14159265;
     for (int i = 0; i < 3; i++) info.shift_cm[i] = x[3 + i] * 100;
     info.f_rel = t.f / f0;
-    info.ok = n >= 100 && info.rms_px < 20 && info.rot_deg < 25 && std::fabs(x[3]) < 0.12 && std::fabs(x[4]) < 0.12 && std::fabs(x[5]) < 0.12 && info.f_rel > 0.6 && info.f_rel < 1.6;
+    info.ok = n >= 100 && info.rms_px < 60 && info.rot_deg < 25 && std::fabs(x[3]) < 0.12 && std::fabs(x[4]) < 0.12 && std::fabs(x[5]) < 0.12 && info.f_rel > 0.6 && info.f_rel < 1.6;
     if (info.ok) { cam = t; cam.fitted = true; }
     return info.ok;
 }
@@ -156,7 +159,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
 inline bool save(const std::string& path, const Cam& c) {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) return false;
-    fprintf(f, "%d %d %.6f %.9f %.9f %.9f %.9f %.9f %.9f\n", c.w, c.h, c.f, c.rv[0], c.rv[1], c.rv[2], c.c[0], c.c[1], c.c[2]);
+    fprintf(f, "%d %d %.6f %.9f %.9f %.9f %.9f %.9f %.9f %.9f\n", c.w, c.h, c.f, c.rv[0], c.rv[1], c.rv[2], c.c[0], c.c[1], c.c[2], c.k1);
     fclose(f);
     return true;
 }
@@ -164,9 +167,10 @@ inline bool save(const std::string& path, const Cam& c) {
 inline bool load(const std::string& path, Cam& c) {
     FILE* f = fopen(path.c_str(), "r");
     if (!f) return false;
-    int n = fscanf(f, "%d %d %lf %lf %lf %lf %lf %lf %lf", &c.w, &c.h, &c.f, &c.rv[0], &c.rv[1], &c.rv[2], &c.c[0], &c.c[1], &c.c[2]);
+    int n = fscanf(f, "%d %d %lf %lf %lf %lf %lf %lf %lf %lf", &c.w, &c.h, &c.f, &c.rv[0], &c.rv[1], &c.rv[2], &c.c[0], &c.c[1], &c.c[2], &c.k1);
     fclose(f);
-    c.fitted = n == 9;
+    if (n == 9) c.k1 = 0;
+    c.fitted = n >= 9;
     return c.fitted;
 }
 

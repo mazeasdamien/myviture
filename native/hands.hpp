@@ -48,6 +48,8 @@ struct Hand {
     bool pinching = false;
     float pinch_m = 1;
     float gap_mm = 0;             // mean distance between the two cameras' rays
+    bool held = false;            // not measured this frame: the last measurement, kept briefly
+    float scale_ratio = 0;        // stereo hand size / the model's metric hand size (1 = consistent depth)
     bool rgb_seen = false;        // the hand model found this hand in the RGB image too
     float rgb[N_JOINTS][2];       // where it is in the RGB image (pixels)
 };
@@ -496,8 +498,9 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
         std::vector<Match> matches;
         {
             Track* Ls[2]; Track* Rs[2]; int nl = 0, nr = 0;
-            for (auto& tr : tracks[0]) if (tr.on && tr.fresh) Ls[nl++] = &tr;
-            for (auto& tr : tracks[1]) if (tr.on && tr.fresh) Rs[nr++] = &tr;
+            // A camera that missed this frame still has last frame's landmarks: close enough.
+            for (auto& tr : tracks[0]) if (tr.on && tr.misses <= 2) Ls[nl++] = &tr;
+            for (auto& tr : tracks[1]) if (tr.on && tr.misses <= 2) Rs[nr++] = &tr;
             if (nl == 2 && nr == 2) {
                 double a = pair_gap(*Ls[0], *Rs[0]) + pair_gap(*Ls[1], *Rs[1]), b = pair_gap(*Ls[0], *Rs[1]) + pair_gap(*Ls[1], *Rs[0]);
                 if (a <= b) { matches.push_back({Ls[0], Rs[0], pair_gap(*Ls[0], *Rs[0])}); matches.push_back({Ls[1], Rs[1], pair_gap(*Ls[1], *Rs[1])}); }
@@ -529,13 +532,30 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
             }
             hd.gap_mm = (float)(gap_sum / N_JOINTS * 1000);
             if (!ok) continue;
+            // Depth check: the stereo hand's size against the model's metric hand (pairwise distances).
+            {
+                double ds = 0, dw = 0;
+                for (int i = 0; i < N_JOINTS; i++) for (int j = i + 1; j < N_JOINTS; j++) {
+                    ds += std::sqrt((hd.joints[i][0] - hd.joints[j][0]) * (hd.joints[i][0] - hd.joints[j][0]) + (hd.joints[i][1] - hd.joints[j][1]) * (hd.joints[i][1] - hd.joints[j][1]) + (hd.joints[i][2] - hd.joints[j][2]) * (hd.joints[i][2] - hd.joints[j][2]));
+                    dw += std::sqrt((L->world[i][0] - L->world[j][0]) * (L->world[i][0] - L->world[j][0]) + (L->world[i][1] - L->world[j][1]) * (L->world[i][1] - L->world[j][1]) + (L->world[i][2] - L->world[j][2]) * (L->world[i][2] - L->world[j][2]));
+                }
+                hd.scale_ratio = dw > 0 ? (float)(ds / dw) : 0;
+            }
             float* a = hd.joints[4]; float* b = hd.joints[8];
             hd.pinch_m = std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
             pinch_state[side] = pinch_state[side] ? hd.pinch_m < 0.04f : hd.pinch_m < 0.025f;
             hd.pinching = pinch_state[side];
             out.push_back(hd);
         }
-        for (int side = 0; side < 2; side++) if (std::none_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == (side == 1); })) pinch_state[side] = false;
+        // A hand missed for a few frames stays where it was, instead of blinking.
+        static Hand last_hand[2];
+        static double last_hand_t[2] = {-1, -1};
+        for (int side = 0; side < 2; side++) {
+            auto it = std::find_if(out.begin(), out.end(), [&](const Hand& x) { return x.right == (side == 1); });
+            if (it != out.end()) { last_hand[side] = *it; last_hand_t[side] = t_img; continue; }
+            if (last_hand_t[side] >= 0 && t_img - last_hand_t[side] < 0.15) { Hand h = last_hand[side]; h.held = true; h.rgb_seen = false; out.push_back(h); }
+            else pinch_state[side] = false;
+        }
 
         // RGB camera: each stereo hand is looked for in the newest RGB image where the
         // current RGB model projects it; found, the joints feed the model's fit (only
@@ -577,7 +597,7 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
             std::vector<rgbcal::Pair> pairs;
             double wrist_of_pairs[3] = {0, 0, 0};
             for (size_t i = 0; i < out.size() && i < 2; i++) {
-                if (!cropped[i]) continue;
+                if (!cropped[i] || out[i].held) continue;
                 float pres, hand, wd[N_JOINTS][3];
                 if (!landmarks_run(M, crops[i], crop_roi[i], out[i].rgb, pres, hand, wd) || pres < 0.5f) continue;
                 out[i].rgb_seen = true;
@@ -612,7 +632,7 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                 auto& tr = tracks[c][k];
                 if (tr.on) n += snprintf(line + n, sizeof line - n, " cam%d.%d[%s p%.2f m%d]", c, k, tr.right() ? "R" : "L", tr.presence, tr.misses);
             }
-            for (auto& hd : out) n += snprintf(line + n, sizeof line - n, " stereo[%s gap %.0fmm pinch %.1fcm%s]", hd.right ? "R" : "L", hd.gap_mm, hd.pinch_m * 100, hd.pinching ? " P" : "");
+            for (auto& hd : out) n += snprintf(line + n, sizeof line - n, " stereo[%s gap %.0fmm scale %.2f pinch %.1fcm%s%s]", hd.right ? "R" : "L", hd.gap_mm, hd.scale_ratio, hd.pinch_m * 100, hd.pinching ? " P" : "", hd.held ? " held" : "");
             logf("hands: %.0f/s%s\n", rate, n ? line : " (none)");
         }
         std::lock_guard<std::mutex> l(g_mu);

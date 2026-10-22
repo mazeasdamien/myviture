@@ -23,6 +23,8 @@ struct AppState {
     float vfov = 28.147f;   // per-eye vertical field, degrees
     float ipd_mm = 63.0f;
     float floor_m = 1.6f;   // floor below the eyes
+    float pitch_deg = 0;    // display tilt about x: objects too high -> lower it
+    float eye_dy_cm = 0;    // eyes above (+) / below (-) the tracking origin
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;

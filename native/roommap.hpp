@@ -75,7 +75,7 @@ inline void save_anchors() {
 }
 
 /** Floor and horizontal surfaces from a height histogram of the confirmed voxels. */
-inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>& map) {
+inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>& map, float head_min_y) {
     std::vector<Plane> out;
     std::vector<std::array<float, 3>> pts;
     for (auto& [k, v] : map) if (confirmed(v)) pts.push_back({v.sum[0] / v.n, v.sum[1] / v.n, v.sum[2] / v.n});
@@ -106,19 +106,21 @@ inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>&
         if (c < l || c < r) continue;
         float frac = (float)(c + l + r) / pts.size();
         if (floor_bin < 0) {
+            // The floor: wide, and well below the lowest the head has been (a bed or desk is not).
             if (frac < 0.01f || c < 300) continue;
-            floor_bin = b;
             Plane pl{0, 0, 0, 0, 0, 0, 0};
             extent(b, pl);
+            if (pl.y > head_min_y - 0.5f || pl.maxx - pl.minx < 1.2f || pl.maxz - pl.minz < 1.2f) continue;
+            floor_bin = b;
             out.push_back(pl);
             continue;
         }
-        if (b - floor_bin < 8 || frac < 0.03f || c < 600) continue;
+        if ((floor_bin >= 0 && b - floor_bin < 8) || frac < 0.03f || c < 600) continue;
         if (!out.empty() && out.back().kind == 1 && (b * BIN + ymin) - out.back().y < 0.08f) continue;  // same surface
         Plane pl{1, 0, 0, 0, 0, 0, 0};
         extent(b, pl);
         // A surface, not a wall's band: wide in both directions.
-        if (pl.maxx - pl.minx > 0.3f && pl.maxz - pl.minz > 0.3f) out.push_back(pl);
+        if (pl.maxx - pl.minx > 0.4f && pl.maxz - pl.minz > 0.4f) out.push_back(pl);
     }
     return out;
 }
@@ -133,6 +135,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
     std::vector<uint8_t> img[2];
     int w = 0, h = 0;
     double last_planes = 0, rate_t0 = hands::qpc_s(); int frames = 0;
+    float head_min_y = 1e9;
     depth::Frame df;
 
     while (!g_stop) {
@@ -154,6 +157,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         if (!t_img || w != 640 || h != 480) { Sleep(3); continue; }
         float head[16];
         if (!pose_at(t_img, head)) continue;
+        head_min_y = std::min(head_min_y, head[7]);
 
         double t0 = hands::qpc_s();
         if (!stereo.compute(img[0].data(), img[1].data(), df)) continue;
@@ -234,7 +238,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         std::vector<float> pts;
         if (refresh) {
             last_planes = now;
-            planes = find_planes(map);
+            planes = find_planes(map, head_min_y);
             // Drawing snapshot: confirmed voxels, coloured by height, at most 120k.
             size_t n_conf = 0;
             for (auto& [k, v] : map) if (confirmed(v)) n_conf++;

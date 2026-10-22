@@ -65,6 +65,7 @@ static M4 mul(const M4& a, const M4& b) {
 }
 static M4 translate(V3 t) { M4 r = identity(); r(0, 3) = t.x; r(1, 3) = t.y; r(2, 3) = t.z; return r; }
 static M4 scale(float s) { M4 r = identity(); r(0, 0) = r(1, 1) = r(2, 2) = s; return r; }
+static M4 rot_x(float a) { M4 r = identity(); float c = cosf(a), s = sinf(a); r(1, 1) = c; r(1, 2) = -s; r(2, 1) = s; r(2, 2) = c; return r; }
 static M4 rot_y(float a) { M4 r = identity(); float c = cosf(a), s = sinf(a); r(0, 0) = c; r(0, 2) = s; r(2, 0) = -s; r(2, 2) = c; return r; }
 static Q qmul(Q a, Q b) {
     return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
@@ -357,6 +358,11 @@ static std::vector<Vertex> grid_vertices() {
 // ------------------------------------------------------------------ window
 
 static AppState g_app;
+static std::string g_settings_path;
+static void save_settings() {
+    if (g_settings_path.empty()) return;
+    if (FILE* f = fopen(g_settings_path.c_str(), "w")) { fprintf(f, "%.3f %.2f %.3f %.2f %.2f\n", g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm); fclose(f); }
+}
 static bool g_stats_paused = false;
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -607,6 +613,12 @@ int main(int argc, char** argv) {
         dir = dir.substr(0, dir.find_last_of(L'\\') + 1);
         calib::Rig rig = calib::load(std::string(dir.begin(), dir.end()) + "..\\calibration.bin");
         rgbcal::g_path = std::string(dir.begin(), dir.end()) + "myviture_rgb.txt";
+        g_settings_path = std::string(dir.begin(), dir.end()) + "myviture_settings.txt";
+        if (FILE* f = fopen(g_settings_path.c_str(), "r")) {
+            float v[5];
+            if (fscanf(f, "%f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4]) == 5) { g_app.vfov = v[0]; g_app.ipd_mm = v[1]; g_app.floor_m = v[2]; g_app.pitch_deg = v[3]; g_app.eye_dy_cm = v[4]; }
+            fclose(f);
+        }
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); if (rgbcal::load(rgbcal::g_path, rgbcal::g_cam)) printf("RGB camera fit loaded\n"); }
         if (rig.ok) {
             hands::start(dir + L"models\\", rig);
@@ -930,7 +942,7 @@ int main(int argc, char** argv) {
             D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
             ctx->RSSetViewports(1, &vp);
             float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
-            M4 eye_world = mul(head_scene, translate({off, 0, 0}));
+            M4 eye_world = mul(mul(head_scene, rot_x(g_app.pitch_deg * 3.14159265f / 180)), translate({off, g_app.eye_dy_cm / 100, 0}));
             render_view(mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world)));
         }
 
@@ -991,6 +1003,9 @@ int main(int argc, char** argv) {
 
         double since = qpc_ms(qpc_now() - stats_t0);
         if (since > 2000) {
+            static float saved[5] = {-1, -1, -1, -1, -1};
+            float cur[5] = {g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm};
+            if (memcmp(saved, cur, sizeof cur)) { memcpy(saved, cur, sizeof cur); save_settings(); }
             auto pct = [](std::vector<double> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, (size_t)(p * v.size()))]; };
             long updates = g_pose_updates - last_updates;
             g_app.stats = {(float)(shown * 1000.0 / since), (float)pct(latencies, 0.5), (float)pct(latencies, 0.99), (float)pct(cpu_ms, 0.5), (float)(updates * 1000.0 / since),
