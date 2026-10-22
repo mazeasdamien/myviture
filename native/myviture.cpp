@@ -7,10 +7,15 @@
 // shown, and draws a world-locked test scene. DXGI frame statistics give, for every
 // displayed frame, the time from the pose read to the vblank, and the missed vblanks.
 //
-//   myviture.exe [--sdk "C:\Program Files\VITURE\SpaceWalker"] [--seconds N]
+//   myviture.exe [--sdk DIR] [--seconds N] [--probe]
+//   A dashboard window (Dear ImGui, dashboard.cpp) opens on the PC's screen.
 //   Keys (glasses window focused): Esc quit, R recenter, + / - prediction, P pause stats.
 
 #include "vio.hpp"
+#include "dashboard.hpp"
+#include "orange.hpp"
+#include "rgbcam.hpp"
+#include "state.hpp"
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -318,20 +323,17 @@ static std::vector<Vertex> grid_vertices() {
 
 // ------------------------------------------------------------------ window
 
-static bool g_recenter = true;
-static double g_predict_ms = 20;
+static AppState g_app;
 static bool g_stats_paused = false;
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) g_quit = true;
-        else if (wp == 'R') g_recenter = true;
-        else if (wp == VK_OEM_PLUS || wp == VK_ADD) g_predict_ms = std::min(80.0, g_predict_ms + 2);
-        else if (wp == VK_OEM_MINUS || wp == VK_SUBTRACT) g_predict_ms = std::max(0.0, g_predict_ms - 2);
+        else if (wp == 'R') g_app.recenter = true;
+        else if (wp == VK_OEM_PLUS || wp == VK_ADD) g_app.predict_ms = std::min(60.0f, g_app.predict_ms + 2);
+        else if (wp == VK_OEM_MINUS || wp == VK_SUBTRACT) g_app.predict_ms = std::max(0.0f, g_app.predict_ms - 2);
         else if (wp == 'P') g_stats_paused = !g_stats_paused;
-        else if (wp == 'E') { g_engine_predict = !g_engine_predict; printf("prediction: %s\n", g_engine_predict ? "VITURE engine" : "ours (pose differences)"); }
-        if (wp == VK_OEM_PLUS || wp == VK_ADD || wp == VK_OEM_MINUS || wp == VK_SUBTRACT) printf("prediction %.0f ms\n", g_predict_ms);
         return 0;
     case WM_CLOSE: g_quit = true; return 0;
     case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
@@ -344,8 +346,25 @@ static BOOL WINAPI on_ctrl(DWORD) { g_quit = true; return TRUE; }
 // Engine callbacks: only the pose is used for now (polled), the rest comes later.
 static void on_pose(float*, double) {}
 static void on_vsync(double) {}
-static void on_imu(float*, double t) { g_imu_qpc = qpc_now(); g_imu_t = t; }
-static void on_cam(unsigned char*, unsigned char*, unsigned char*, unsigned char*, double, int, int) {}
+static void on_imu(float* d, double t) {
+    g_imu_qpc = qpc_now();
+    g_imu_t = t;
+    std::lock_guard<std::mutex> l(g_imu.mu);
+    for (int i = 0; i < 6; i++) {
+        auto& a = g_imu.axis[i];
+        a.push_back(d[i]);
+        if (a.size() > 4000) a.erase(a.begin(), a.begin() + 2000);
+    }
+    g_imu.count++;
+}
+static void on_cam(unsigned char* l, unsigned char* r, unsigned char*, unsigned char*, double, int w, int h) {
+    std::lock_guard<std::mutex> lk(g_cams.mu);
+    if (l) g_cams.px[0].assign(l, l + (size_t)w * h);
+    if (r) g_cams.px[1].assign(r, r + (size_t)w * h);
+    g_cams.w = w; g_cams.h = h;
+    g_cams.seq++;
+    g_cams.count++;
+}
 static void on_points(void*, double) {}
 static void on_event(unsigned char e) { printf("[vio] event %d\n", e); }
 
@@ -364,13 +383,13 @@ template <typename T> struct Com {
 int main(int argc, char** argv) {
     std::string sdk = "C:\\Program Files\\VITURE\\SpaceWalker";
     double run_seconds = 0;  // 0: until Esc
-    bool probe_only = false, ab = false;
+    bool probe_only = false;
+    double snapshot_s = 0;  // > 0: save the dashboard as dashboard.png after that many seconds
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sdk") && i + 1 < argc) sdk = argv[++i];
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) run_seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--probe")) probe_only = true;
-        else if (!strcmp(argv[i], "--ours")) g_engine_predict = false;
-        else if (!strcmp(argv[i], "--ab")) ab = true;
+        else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) snapshot_s = atof(argv[++i]);
     }
     setvbuf(stdout, nullptr, _IONBF, 0);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -379,7 +398,8 @@ int main(int argc, char** argv) {
 
     printf("myViture native: starting the VITURE engine...\n");
     if (!vio::start(sdk, on_pose, on_vsync, on_imu, on_cam, on_points, on_event)) return 2;
-    printf("engine running, glasses %s\n", vio::api.get_sn ? vio::api.get_sn() : "?");
+    g_app.serial = vio::api.get_sn ? vio::api.get_sn() : "?";
+    printf("engine running, glasses %s\n", g_app.serial.c_str());
     for (int i = 0; i < 300 && device_now() == 0; i++) Sleep(10);
     if (probe_only) { probe_clocks(); vio::stop(); return 0; }
     // Asked for a timestamp before its tracking has started, the engine ends the process
@@ -415,7 +435,7 @@ int main(int argc, char** argv) {
     RegisterClassW(&wc);
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"myViture", WS_POPUP | WS_VISIBLE, mon.rect.left, mon.rect.top, width(mon.rect), height(mon.rect), nullptr, nullptr, wc.hInstance, nullptr);
     SetForegroundWindow(hwnd);
-    const UINT W = width(mon.rect), H = height(mon.rect);
+    UINT W = width(mon.rect), H = height(mon.rect);
 
     // Device and a flip-model swap chain, one frame of latency at most.
     Com<ID3D11Device> dev; Com<ID3D11DeviceContext> ctx;
@@ -431,14 +451,29 @@ int main(int argc, char** argv) {
     Com<IDXGISwapChain1> sc1; CHECK(factory->CreateSwapChainForHwnd(dev, hwnd, &sd, nullptr, nullptr, &sc1));
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     Com<IDXGISwapChain2> sc; CHECK(sc1->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc));
+    Com<IDXGISwapChainMedia> media;
+    sc1->QueryInterface(__uuidof(IDXGISwapChainMedia), (void**)&media);
+    long comp_counts[4] = {};
     sc->SetMaximumFrameLatency(1);
     HANDLE frame_wait = sc->GetFrameLatencyWaitableObject();
 
-    Com<ID3D11Texture2D> back; CHECK(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back));
-    Com<ID3D11RenderTargetView> rtv; CHECK(dev->CreateRenderTargetView(back, nullptr, &rtv));
-    D3D11_TEXTURE2D_DESC dd{}; dd.Width = W; dd.Height = H; dd.MipLevels = 1; dd.ArraySize = 1; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.SampleDesc.Count = 1; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    Com<ID3D11Texture2D> depth; CHECK(dev->CreateTexture2D(&dd, nullptr, &depth));
-    Com<ID3D11DepthStencilView> dsv; CHECK(dev->CreateDepthStencilView(depth, nullptr, &dsv));
+    // Back buffer and depth, rebuilt when the glasses switch between 2D and 3D.
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    auto make_targets = [&]() -> HRESULT {
+        if (rtv) { rtv->Release(); rtv = nullptr; }
+        if (dsv) { dsv->Release(); dsv = nullptr; }
+        HRESULT hr = sc->ResizeBuffers(0, W, H, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+        if (FAILED(hr)) return hr;
+        Com<ID3D11Texture2D> back;
+        if (FAILED(hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back))) return hr;
+        if (FAILED(hr = dev->CreateRenderTargetView(back, nullptr, &rtv))) return hr;
+        D3D11_TEXTURE2D_DESC dd{}; dd.Width = W; dd.Height = H; dd.MipLevels = 1; dd.ArraySize = 1; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.SampleDesc.Count = 1; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        Com<ID3D11Texture2D> depth;
+        if (FAILED(hr = dev->CreateTexture2D(&dd, nullptr, &depth))) return hr;
+        return dev->CreateDepthStencilView(depth, nullptr, &dsv);
+    };
+    CHECK(make_targets());
 
     Com<ID3DBlob> vsb, psb, err;
     if (FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsb, &err)) ||
@@ -468,9 +503,28 @@ int main(int argc, char** argv) {
     D3D11_DEPTH_STENCIL_DESC dsd{}; dsd.DepthEnable = TRUE; dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dsd.DepthFunc = D3D11_COMPARISON_LESS;
     Com<ID3D11DepthStencilState> dss; CHECK(dev->CreateDepthStencilState(&dsd, &dss));
 
-    // Display: per-eye vertical field and eye spacing, as the dashboard's defaults.
-    const float VFOV = 28.147f, IPD = 0.063f;
-    const float aspect = (W / 2.0f) / H;
+    // Dashboard on the PC's screen (primary monitor, or any that is not the glasses').
+    {
+        HMONITOR pc = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        for (auto& m : monitors()) if (m.h != mon.h) { pc = m.h; if (m.primary) break; }
+        MONITORINFO mi{}; mi.cbSize = sizeof mi;
+        GetMonitorInfoW(pc, &mi);
+        char exe[MAX_PATH];
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string ini = exe;
+        ini = ini.substr(0, ini.find_last_of('\\') + 1) + "myviture_ui.ini";
+        if (!dash::init(dev, ctx, mi.rcWork, ini)) fprintf(stderr, "dashboard window failed\n");
+    }
+    g_app.screen_w = W; g_app.screen_h = H;
+    rgbcam::start();
+    {
+        char exe[MAX_PATH];
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir = exe;
+        dir = dir.substr(0, dir.find_last_of('\\') + 1);
+        if (orange::load_config(dir + "..\\.env.local")) orange::refresh_spend();
+        else { std::lock_guard<std::mutex> l(orange::g_costs.mu); orange::g_costs.status = ".env.local introuvable (à côté du dossier native)"; }
+    }
 
     // Statistics: pose read time per present, matched to the vblank it was shown at.
     struct Pending { UINT present; int64_t pose_qpc; };
@@ -482,18 +536,22 @@ int main(int argc, char** argv) {
     int64_t stats_t0 = qpc_now(), frame_t0 = qpc_now();
     float rate_dps = 0, max_rate = 0;
     M4 recenter = identity();
+    bool dash_on = true;
 
-    printf("rendering on the glasses: Esc quit, R recenter, +/- prediction (%.0f ms)\n", g_predict_ms);
-    while (!g_quit) {
+    printf("rendering on the glasses: Esc quit, R recenter, +/- prediction (%.0f ms)\n", g_app.predict_ms);
+    while (!g_quit && !g_app.quit) {
+        g_engine_predict = g_app.engine_predict;
+        const double g_predict_ms = g_app.predict_ms;
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
         WaitForSingleObjectEx(frame_wait, 100, TRUE);
         int64_t t_start = qpc_now();
 
         // Pose now, rotation extrapolated to when this frame reaches the screen.
+        // The engine's prediction; the newest polled pose only if it fails.
         Q q; V3 p;
-        bool have = predicted_pose(g_predict_ms, q, p, rate_dps);
-        if (g_engine_predict) {
+        bool have = predicted_pose(g_predict_ms, q, p, rate_dps);  // extrapolated, from the ~520 Hz polled poses
+        {
             // The engine's own prediction (IMU-rate), for when this frame is on screen.
             M4 r;
             // From the newest IMU sample: its age plus the lead to the screen.
@@ -520,19 +578,33 @@ int main(int argc, char** argv) {
             Q d = qmul(q, qconj(prev_q));
             if (d.w < 0) d = {-d.x, -d.y, -d.z, -d.w};
             V3 step = {2 * d.x * 57.2958f, 2 * d.y * 57.2958f, 2 * d.z * 57.2958f};
-            if (primed) jerk.push_back(sqrt((step.x - prev_step.x) * (step.x - prev_step.x) + (step.y - prev_step.y) * (step.y - prev_step.y) + (step.z - prev_step.z) * (step.z - prev_step.z)));
+            if (primed) {
+                float j = sqrtf((step.x - prev_step.x) * (step.x - prev_step.x) + (step.y - prev_step.y) * (step.y - prev_step.y) + (step.z - prev_step.z) * (step.z - prev_step.z));
+                jerk.push_back(j);
+                g_app.shake_history.push_back(j);
+                if (g_app.shake_history.size() > 1200) g_app.shake_history.erase(g_app.shake_history.begin(), g_app.shake_history.begin() + 600);
+            }
             prev_q = q; prev_step = step; primed = true;
         }
         max_rate = std::max(max_rate, rate_dps);
         M4 head = mul(translate(p), qmat(q));  // head -> world
-        if (have && g_recenter) {
+        if (have && g_app.recenter) {
             // Scene frame: the head's position and heading at recenter, gravity kept.
             float fx = -head(0, 2), fz = -head(2, 2);
             float yaw = atan2f(-fx, -fz);
             recenter = mul(rot_y(-yaw), translate({-p.x, -p.y, -p.z}));
-            g_recenter = false;
+            g_app.recenter = false;
         }
         M4 head_scene = mul(recenter, head);
+        {
+            // For the dashboard: heading, elevation, roll and position in the scene frame.
+            float fx = -head_scene(0, 2), fy = -head_scene(1, 2), fz = -head_scene(2, 2);
+            g_app.yaw = atan2f(-fx, -fz) * 57.2958f;
+            g_app.pitch = asinf(std::clamp(fy, -1.0f, 1.0f)) * 57.2958f;
+            g_app.roll = atan2f(-head_scene(1, 0), head_scene(1, 1)) * 57.2958f;
+            for (int i = 0; i < 3; i++) g_app.pos[i] = head_scene(i, 3);
+            g_app.rate_dps = rate_dps;
+        }
 
         float clear[4] = {0, 0, 0, 1};
         ctx->ClearRenderTargetView(rtv, clear);
@@ -549,11 +621,17 @@ int main(int argc, char** argv) {
         ctx->PSSetConstantBuffers(0, 1, cbs);
         UINT stride = sizeof(Vertex), offset = 0;
 
-        if (have) for (int eye = 0; eye < 2; eye++) {
-            D3D11_VIEWPORT vp{eye * W / 2.0f, 0, W / 2.0f, (float)H, 0, 1};
+        // Side by side in 3D; in 2D both eyes see the same image: one view, centred.
+        const bool sbs = W >= 3000;
+        const int views = sbs ? 2 : 1;
+        const float ipd = g_app.ipd_mm / 1000.0f;
+        if (have && g_app.scene) for (int eye = 0; eye < views; eye++) {
+            float vw = (float)W / views;
+            D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
             ctx->RSSetViewports(1, &vp);
-            M4 eye_world = mul(head_scene, translate({eye ? IPD / 2 : -IPD / 2, 0, 0}));
-            M4 vpm = mul(perspective(VFOV, aspect, 0.05f, 50), rigid_inverse(eye_world));
+            float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
+            M4 eye_world = mul(head_scene, translate({off, 0, 0}));
+            M4 vpm = mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world));
             auto draw = [&](ID3D11Buffer* vb, UINT n, D3D11_PRIMITIVE_TOPOLOGY topo, const M4& model, float r, float g, float b, bool lit) {
                 Constants c{mul(vpm, model), model, {r, g, b, 1}, {lit ? 1.0f : 0.0f, 0, 0, 0}};
                 ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
@@ -570,7 +648,7 @@ int main(int argc, char** argv) {
                 draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({sinf(a) * 0.9f, 0, -cosf(a) * 0.9f}), scale(0.12f)), r, g, b, true);
             }
             draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({0, -0.1f, -1.0f}), scale(0.05f)), 1, 1, 1, true);
-            draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, -1.6f, 0}), 0.3f, 0.7f, 1.0f, false);
+            draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, -g_app.floor_m, 0}), 0.3f, 0.7f, 1.0f, false);
         }
 
         sc->Present(1, 0);
@@ -582,23 +660,40 @@ int main(int argc, char** argv) {
         // Which present reached the screen, and at which vblank.
         DXGI_FRAME_STATISTICS st{};
         if (SUCCEEDED(sc->GetFrameStatistics(&st)) && st.PresentCount != last_present_seen) {
-            if (last_present_seen && st.PresentRefreshCount - last_refresh > st.PresentCount - last_present_seen) missed += (st.PresentRefreshCount - last_refresh) - (st.PresentCount - last_present_seen);
+            // Vblanks that passed without a new frame (signed: the counters can restart).
+            int64_t extra = ((int64_t)st.PresentRefreshCount - last_refresh) - ((int64_t)st.PresentCount - last_present_seen);
+            if (last_present_seen && extra > 0 && extra < 600) missed += (long)extra;
             shown += st.PresentCount - last_present_seen;
             last_present_seen = st.PresentCount;
             last_refresh = st.PresentRefreshCount;
-            for (auto& pd : pending) if (pd.present == st.PresentCount) latencies.push_back(qpc_ms(st.SyncQPCTime.QuadPart - pd.pose_qpc));
+            for (auto& pd : pending) if (pd.present == st.PresentCount) {
+                double l = qpc_ms(st.SyncQPCTime.QuadPart - pd.pose_qpc);
+                latencies.push_back(l);
+                g_app.latency_history.push_back((float)l);
+                if (g_app.latency_history.size() > 1200) g_app.latency_history.erase(g_app.latency_history.begin(), g_app.latency_history.begin() + 600);
+            }
             pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const Pending& pd) { return pd.present <= st.PresentCount; }), pending.end());
         }
         if (pending.size() > 120) pending.erase(pending.begin(), pending.begin() + 60);
+        // How Windows shows this window: straight to the screen (overlay / independent
+        // flip, no added frame) or composed by DWM (one more frame).
+        if (media) {
+            DXGI_FRAME_STATISTICS_MEDIA sm{};
+            if (SUCCEEDED(media->GetFrameStatisticsMedia(&sm))) comp_counts[std::min((int)sm.CompositionMode, 3)]++;
+        }
 
         double since = qpc_ms(qpc_now() - stats_t0);
         if (since > 2000) {
             auto pct = [](std::vector<double> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, (size_t)(p * v.size()))]; };
             long updates = g_pose_updates - last_updates;
+            g_app.stats = {(float)(shown * 1000.0 / since), (float)pct(latencies, 0.5), (float)pct(latencies, 0.99), (float)pct(cpu_ms, 0.5), (float)(updates * 1000.0 / since),
+                           (float)pct(jerk, 0.5), (float)pct(jerk, 0.99), (float)pct(gain, 0.5), missed};
             if (!g_stats_paused)
                 printf("%5.1f fps  pose %4.0f Hz  pose->vblank p50 %4.1f p99 %4.1f ms  CPU %4.2f ms  missed %ld  head max %4.0f deg/s  shake p50 %.3f p99 %.3f deg  %s %.0f ms\n",
                        shown * 1000.0 / since, updates * 1000.0 / since, pct(latencies, 0.5), pct(latencies, 0.99), pct(cpu_ms, 0.5), missed, max_rate,
                        pct(jerk, 0.5), pct(jerk, 0.99), g_engine_predict ? "engine" : "ours", g_predict_ms);
+            if (!g_stats_paused) printf("      presentation: composed %ld  overlay %ld  direct %ld  failed %ld\n", comp_counts[0], comp_counts[1], comp_counts[2], comp_counts[3]);
+            for (long& c : comp_counts) c = 0;
             if (g_engine_predict && !g_stats_paused) {
                 printf("      engine lead used: %.2f of the head's motion (n %zu)  status:", pct(gain, 0.5), gain.size());
                 for (int k = 0; k < 10; k++) if (status_counts[k]) printf(" [%d]=%ld", k - 1, status_counts[k]);
@@ -609,15 +704,41 @@ int main(int argc, char** argv) {
             latencies.clear(); cpu_ms.clear(); jerk.clear(); shown = 0; missed = 0; max_rate = 0; last_updates = g_pose_updates;
             stats_t0 = qpc_now();
         }
-        if (run_seconds > 0 && qpc_ms(qpc_now() - frame_t0) > run_seconds * 1000) g_quit = true;
-        if (ab) {
-            // A/B: VITURE engine's prediction and ours, 10 s each, in turn.
-            bool engine = (int)(qpc_ms(qpc_now() - frame_t0) / 10000) % 2 == 0;
-            if (engine != g_engine_predict) { g_engine_predict = engine; printf("--- now: %s prediction\n", engine ? "VITURE engine" : "our"); }
+        if (dash_on) dash::frame(g_app);
+        if (snapshot_s > 0 && qpc_ms(qpc_now() - frame_t0) > snapshot_s * 1000) {
+            snapshot_s = 0;
+            wchar_t exe[MAX_PATH];
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            std::wstring png = exe;
+            png = png.substr(0, png.find_last_of(L'\\') + 1) + L"dashboard.png";
+            printf("dashboard snapshot: %s\n", dash::save_png(png) ? "saved" : "failed");
         }
+
+        if (g_app.display_request) {
+            // The glasses change resolution: wait for Windows, then follow with the window.
+            int want = g_app.display_request;
+            g_app.display_request = 0;
+            int rc = vio::set_display_mode(want == 3 ? vio::MODE_3D : vio::MODE_2D);
+            printf("display %dD -> %d\n", want, rc);
+            if (rc == 0) {
+                for (int i = 0; i < 40; i++) { Sleep(150); glasses_monitor(mon); if ((width(mon.rect) >= 3000) == (want == 3)) break; }
+                W = width(mon.rect); H = height(mon.rect);
+                SetWindowPos(hwnd, nullptr, mon.rect.left, mon.rect.top, W, H, SWP_NOZORDER | SWP_NOACTIVATE);
+                ctx->OMSetRenderTargets(0, nullptr, nullptr);
+                if (FAILED(make_targets())) { fprintf(stderr, "resize failed\n"); break; }
+                g_app.screen_w = W; g_app.screen_h = H;
+                switched = want == 3;
+            }
+        }
+
+        if (run_seconds > 0 && qpc_ms(qpc_now() - frame_t0) > run_seconds * 1000) g_quit = true;
     }
 
     printf("stopping...\n");
+    rgbcam::stop();
+    dash::shutdown();
+    if (rtv) rtv->Release();
+    if (dsv) dsv->Release();
     DestroyWindow(hwnd);
     if (switched) vio::set_display_mode(vio::MODE_2D);
     poses.join();

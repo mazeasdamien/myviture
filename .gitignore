@@ -10,3 +10,6 @@ bridge/*.obj
 .wrangler/
 native/*.exe
 native/*.obj
+native/obj/
+native/*.ini
+native/*.log
