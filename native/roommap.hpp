@@ -26,10 +26,13 @@
 namespace room {
 
 constexpr float VOX = 0.025f;
-constexpr int CONFIRM = 3;          // frames a voxel must be seen in
+constexpr int CONFIRM = 5;          // observations a voxel needs, from VIEWS different viewpoints
+constexpr int VIEWS = 3;
 constexpr size_t MAX_VOXELS = 400000;
 
-struct Voxel { float sum[3] = {0, 0, 0}; uint16_t n = 0; uint32_t last_frame = 0; };
+/** A voxel: mean of the points seen in it, how often, from how many viewpoints; misses when a ray passed through it. */
+struct Voxel { float sum[3] = {0, 0, 0}; uint16_t n = 0; uint8_t misses = 0; uint32_t last_frame = 0; uint32_t views[4] = {}; uint8_t nviews = 0; };
+inline bool confirmed(const Voxel& v) { return v.n >= CONFIRM && v.nviews >= VIEWS; }
 
 struct Plane {
     int kind;                       // 0 floor, 1 horizontal surface
@@ -75,7 +78,7 @@ inline void save_anchors() {
 inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>& map) {
     std::vector<Plane> out;
     std::vector<std::array<float, 3>> pts;
-    for (auto& [k, v] : map) if (v.n >= CONFIRM) pts.push_back({v.sum[0] / v.n, v.sum[1] / v.n, v.sum[2] / v.n});
+    for (auto& [k, v] : map) if (confirmed(v)) pts.push_back({v.sum[0] / v.n, v.sum[1] / v.n, v.sum[2] / v.n});
     if (pts.size() < 2000) return out;
     float ymin = 1e9, ymax = -1e9;
     for (auto& p : pts) { ymin = std::min(ymin, p[1]); ymax = std::max(ymax, p[1]); }
@@ -103,14 +106,15 @@ inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>&
         if (c < l || c < r) continue;
         float frac = (float)(c + l + r) / pts.size();
         if (floor_bin < 0) {
-            if (frac < 0.008f || c < 150) continue;
+            if (frac < 0.01f || c < 300) continue;
             floor_bin = b;
             Plane pl{0, 0, 0, 0, 0, 0, 0};
             extent(b, pl);
             out.push_back(pl);
             continue;
         }
-        if (b - floor_bin < 8 || frac < 0.015f || c < 250) continue;
+        if (b - floor_bin < 8 || frac < 0.03f || c < 600) continue;
+        if (!out.empty() && out.back().kind == 1 && (b * BIN + ymin) - out.back().y < 0.08f) continue;  // same surface
         Plane pl{1, 0, 0, 0, 0, 0, 0};
         extent(b, pl);
         // A surface, not a wall's band: wide in both directions.
@@ -169,13 +173,26 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
 
         if (g_scan) {
             frame_id++;
+            // Viewpoint: head position to 10 cm and heading to 15 deg; a voxel counts as
+            // confirmed only when seen from several, so one viewpoint's noise does not stay.
+            double hx = head[3], hy = head[7], hz = head[11], hyaw = std::atan2(-head[2], -head[10]);
+            uint32_t view = (uint32_t)(((int)std::floor(hx / 0.1) & 1023) | (((int)std::floor(hy / 0.1) & 1023) << 10) | (((int)std::floor(hz / 0.1) & 1023) << 20)) ^ ((uint32_t)((int)std::floor(hyaw / 0.26) & 31) << 27);
+            double o[3] = {hx, hy, hz};
             for (int v = 0; v < depth::H; v += 2) for (int u = 0; u < depth::W; u += 2) {
                 float z = df.depth[v * depth::W + u];
-                if (!(z > 0.3f && z < 4.0f)) continue;
+                if (!(z > 0.3f && z < 3.0f)) continue;
                 double ph[3], pw[3];
                 df.point(u, v, z, ph);
                 if (!hand_pts.empty() && near_hand(ph)) continue;
                 for (int i = 0; i < 3; i++) pw[i] = head[i * 4] * ph[0] + head[i * 4 + 1] * ph[1] + head[i * 4 + 2] * ph[2] + head[i * 4 + 3];
+                // Free space: voxels on the ray before the surface were seen through.
+                double dx = pw[0] - o[0], dy = pw[1] - o[1], dz = pw[2] - o[2];
+                double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+                for (double s = 0.3; s < len - 0.06; s += 0.05) {
+                    auto it = map.find(key((int)std::floor((o[0] + dx * s / len) / VOX), (int)std::floor((o[1] + dy * s / len) / VOX), (int)std::floor((o[2] + dz * s / len) / VOX)));
+                    if (it == map.end() || it->second.last_frame == frame_id) continue;
+                    if (++it->second.misses >= 4 && it->second.misses > it->second.n) map.erase(it);
+                }
                 uint64_t k = key((int)std::floor(pw[0] / VOX), (int)std::floor(pw[1] / VOX), (int)std::floor(pw[2] / VOX));
                 auto it = map.find(k);
                 if (it == map.end()) {
@@ -186,6 +203,10 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
                 if (vx.last_frame == frame_id) continue;  // once per frame
                 vx.last_frame = frame_id;
                 if (vx.n < 60000) { for (int i = 0; i < 3; i++) vx.sum[i] += (float)pw[i]; vx.n++; }
+                if (vx.misses) vx.misses--;
+                bool known = false;
+                for (int i = 0; i < vx.nviews; i++) if (vx.views[i] == view) known = true;
+                if (!known && vx.nviews < 4) vx.views[vx.nviews++] = view;
             }
         }
 
@@ -198,7 +219,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
                 int cx = (int)std::floor(hp[0] / VOX), cy = (int)std::floor(hp[1] / VOX), cz = (int)std::floor(hp[2] / VOX);
                 for (int dx = -1; dx <= 1 && !hit; dx++) for (int dy = -1; dy <= 1 && !hit; dy++) for (int dz = -1; dz <= 1 && !hit; dz++) {
                     auto it = map.find(key(cx + dx, cy + dy, cz + dz));
-                    if (it != map.end() && it->second.n >= CONFIRM) { hit = true; for (int i = 0; i < 3; i++) hp[i] = it->second.sum[i] / it->second.n; }
+                    if (it != map.end() && confirmed(it->second)) { hit = true; for (int i = 0; i < 3; i++) hp[i] = it->second.sum[i] / it->second.n; }
                 }
             }
             std::lock_guard<std::mutex> l(g.mu);
@@ -215,13 +236,13 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
             last_planes = now;
             planes = find_planes(map);
             // Drawing snapshot: confirmed voxels, coloured by height, at most 120k.
-            size_t confirmed = 0;
-            for (auto& [k, v] : map) if (v.n >= CONFIRM) confirmed++;
-            int step = (int)std::max<size_t>(1, confirmed / 120000);
+            size_t n_conf = 0;
+            for (auto& [k, v] : map) if (confirmed(v)) n_conf++;
+            int step = (int)std::max<size_t>(1, n_conf / 40000);
             int i = 0;
             float floor_y = planes.empty() ? -1.6f : planes[0].y;
             for (auto& [k, v] : map) {
-                if (v.n < CONFIRM || (i++ % step)) continue;
+                if (!confirmed(v) || (i++ % step)) continue;
                 float x = v.sum[0] / v.n, y = v.sum[1] / v.n, z = v.sum[2] / v.n;
                 float t = std::clamp((y - floor_y) / 2.0f, 0.0f, 1.0f);
                 pts.insert(pts.end(), {x, y, z, 0.2f + 0.8f * t, 0.5f + 0.3f * (1 - t), 1.0f - 0.7f * t});
