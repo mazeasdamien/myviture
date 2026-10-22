@@ -361,7 +361,7 @@ static AppState g_app;
 static std::string g_settings_path;
 static void save_settings() {
     if (g_settings_path.empty()) return;
-    if (FILE* f = fopen(g_settings_path.c_str(), "w")) { fprintf(f, "%.3f %.2f %.3f %.2f %.2f\n", g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm); fclose(f); }
+    if (FILE* f = fopen(g_settings_path.c_str(), "w")) { fprintf(f, "%.3f %.2f %.3f %.2f %.2f %.2f %.2f\n", g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm, g_app.eye_dz_cm, g_app.yaw_deg); fclose(f); }
 }
 static bool g_stats_paused = false;
 
@@ -615,8 +615,10 @@ int main(int argc, char** argv) {
         rgbcal::g_path = std::string(dir.begin(), dir.end()) + "myviture_rgb.txt";
         g_settings_path = std::string(dir.begin(), dir.end()) + "myviture_settings.txt";
         if (FILE* f = fopen(g_settings_path.c_str(), "r")) {
-            float v[5];
-            if (fscanf(f, "%f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4]) == 5) { g_app.vfov = v[0]; g_app.ipd_mm = v[1]; g_app.floor_m = v[2]; g_app.pitch_deg = v[3]; g_app.eye_dy_cm = v[4]; }
+            float v[7] = {0, 0, 0, 0, 0, 0, 0};
+            int n = fscanf(f, "%f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]);
+            if (n >= 5) { g_app.vfov = v[0]; g_app.ipd_mm = v[1]; g_app.floor_m = v[2]; g_app.pitch_deg = v[3]; g_app.eye_dy_cm = v[4]; }
+            if (n >= 7) { g_app.eye_dz_cm = v[5]; g_app.yaw_deg = v[6]; }
             fclose(f);
         }
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); if (rgbcal::load(rgbcal::g_path, rgbcal::g_cam)) printf("RGB camera fit loaded\n"); }
@@ -926,8 +928,8 @@ int main(int argc, char** argv) {
             // Anchors: small cyan cubes on the real surfaces (tracking frame -> scene).
             for (auto& a : anchors) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate({a.p[0], a.p[1], a.p[2]})), scale(0.03f)), 0.3f, 1.0f, 1.0f, true);
             // The scanned room, one small cube per voxel.
-            if (g_app.show_map && inst_count) {
-                Constants c{mul(vpm, recenter), recenter, {1, 1, 1, 1}, {1, room::VOX * 0.7f, 0, 0}};
+            if ((g_app.show_map || g_app.calage) && inst_count) {
+                Constants c{mul(vpm, recenter), recenter, {1, 1, 1, 1}, {1, room::VOX * (g_app.calage ? 0.25f : 0.7f), 0, 0}};
                 ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
                 ID3D11Buffer* vbs[] = {cube_vb, inst_vb};
                 UINT strides[] = {sizeof(Vertex), 24}, offsets[] = {0, 0};
@@ -941,7 +943,7 @@ int main(int argc, char** argv) {
                 ctx->VSSetShader(vs, nullptr, 0);
                 ctx->PSSetShader(ps, nullptr, 0);
             }
-            if (!g_app.scene) return;
+            if (!g_app.scene || g_app.calage) return;
             // Eight cubes around the head at arm's length, one ahead at 1 m: resting on the
             // floor or the table found under them when the room is scanned.
             for (int i = 0; i < 8; i++) {
@@ -979,7 +981,8 @@ int main(int argc, char** argv) {
                     eye_rot = mul(cam_head, eye_rot);
                 }
             }
-            M4 eye_world = mul(mul(head_scene, eye_rot), translate({off, g_app.eye_dy_cm / 100, 0}));
+            eye_rot = mul(rot_y(g_app.yaw_deg * 3.14159265f / 180), eye_rot);
+            M4 eye_world = mul(mul(head_scene, translate({0, g_app.eye_dy_cm / 100, g_app.eye_dz_cm / 100})), mul(eye_rot, translate({off, 0, 0})));
             render_view(mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world)));
         }
 
@@ -1059,8 +1062,8 @@ int main(int argc, char** argv) {
                 g_app.stats.lead_ms = lh.empty() ? 0 : (float)lh[lh.size() / 2];
                 lead_hist.clear();
             }
-            static float saved[5] = {-1, -1, -1, -1, -1};
-            float cur[5] = {g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm};
+            static float saved[7] = {-1, -1, -1, -1, -1, -1, -1};
+            float cur[7] = {g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm, g_app.eye_dz_cm, g_app.yaw_deg};
             if (memcmp(saved, cur, sizeof cur)) { memcpy(saved, cur, sizeof cur); save_settings(); }
             auto pct = [](std::vector<double> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, (size_t)(p * v.size()))]; };
             long updates = g_pose_updates - last_updates;

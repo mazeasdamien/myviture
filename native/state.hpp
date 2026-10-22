@@ -29,6 +29,9 @@ struct AppState {
     float pitch_deg = 0;    // display tilt about x: objects too high -> lower it
     bool display_from_rgb = true;  // the display takes the RGB camera's fitted orientation (same frame)
     float eye_dy_cm = 0;    // eyes above (+) / below (-) the tracking origin
+    float eye_dz_cm = 0;    // eyes behind (+) the tracking origin
+    float yaw_deg = 0;      // display turn about the vertical axis
+    bool calage = false;    // calibration view: the scanned room as small points over the real one
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;

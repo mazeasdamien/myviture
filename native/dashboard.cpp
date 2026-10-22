@@ -302,12 +302,22 @@ static void build(AppState& s) {
         ImGui::Checkbox(lbl, &s.display_from_rgb);
     }
     ImGui::SliderFloat("inclinaison (°)", &s.pitch_deg, -20, 20, "%.1f");
+    ImGui::SliderFloat("rotation gauche/droite (°)", &s.yaw_deg, -10, 10, "%.1f");
     ImGui::SliderFloat("hauteur des yeux (cm)", &s.eye_dy_cm, -10, 10, "%.1f");
-    ImGui::TextDisabled("Les objets (et tes mains virtuelles) sont trop hauts : baisse l'inclinaison jusqu'à ce que la main virtuelle couvre la vraie.");
+    ImGui::SliderFloat("recul des yeux (cm)", &s.eye_dz_cm, -5, 10, "%.1f");
+    ImGui::Checkbox("Calage sur la pièce (points du scan)", &s.calage);
+    if (s.calage) {
+        ImGui::TextWrapped("Regarde des objets nets (porte, meuble, écran) : les points doivent tomber dessus. Tourne lentement la tête :");
+        ImGui::BulletText("les points suivent la tête (glissent dans son sens) : champ vertical trop grand, diminue");
+        ImGui::BulletText("ils glissent à l'inverse de la tête : champ trop petit, augmente");
+        ImGui::BulletText("décalage fixe vers le haut/bas : inclinaison ; gauche/droite : rotation");
+        ImGui::BulletText("en avançant/reculant la tête, ça bouge : recul des yeux");
+        ImGui::TextDisabled("Puis, tête tournée vite : s'ils traînent, monte « latence de l'écran ».");
+    }
     ImGui::Checkbox("Scène de test (cubes)", &s.scene);
     ImGui::SameLine();
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
-    if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; s.pitch_deg = 0; s.eye_dy_cm = 0; }
+    if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; s.pitch_deg = 0; s.eye_dy_cm = 0; s.eye_dz_cm = 0; s.yaw_deg = 0; }
     ImGui::Checkbox("Prédire le mouvement des mains", &s.hand_predict);
     ImGui::SeparatorText("Pièce (scan)");
     {
