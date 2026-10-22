@@ -295,7 +295,15 @@ static void build(AppState& s) {
     ImGui::SliderFloat("champ vertical (°)", &s.vfov, 20, 40, "%.2f");
     ImGui::SliderFloat("écart des yeux (mm)", &s.ipd_mm, 50, 75, "%.1f");
     ImGui::SliderFloat("sol sous les yeux (m)", &s.floor_m, 0.5f, 2.2f, "%.2f");
-    {
+    if (s.have_vendor_eyes) {
+        const float* l = s.eye_l; const float* r = s.eye_r;
+        char lbl[200];
+        snprintf(lbl, sizeof lbl, "Yeux du moteur VITURE (usine) : écart %.1f mm, %.1f cm plus bas, %.1f cm en arrière, %.1f° d'inclinaison",
+                 std::hypot(r[3] - l[3], r[7] - l[7]) * 1000, -(l[7] + r[7]) / 2 * 100, (l[11] + r[11]) / 2 * 100, std::atan2(l[9], l[5]) * 57.2958f);
+        ImGui::Checkbox(lbl, &s.vendor_eyes);
+        if (s.vendor_eyes) ImGui::TextDisabled("écart des yeux et yeux par défaut remplacés ; les curseurs ci-dessous ajustent par-dessus");
+    }
+    if (!(s.vendor_eyes && s.have_vendor_eyes)) {
         rgbcal::Cam rc = rgbcal::get();
         char lbl[96];
         snprintf(lbl, sizeof lbl, rc.fitted ? "Orientation de l'écran = caméra RGB calée (%.1f°)" : "Orientation de l'écran = caméra RGB calée (pas encore calée)", rc.fitted ? rc.rv[0] * 57.2958 : 0.0);

@@ -167,6 +167,33 @@ static bool engine_pose(double t, M4& r) {
 }
 
 /** Which clock the engine's timestamp is: try each, see which answers and moves. */
+/** carina_vio_get_eyes_pose(float* left, float* right, double t) behind SEH (undocumented). */
+typedef int (*EyesPoseFn)(float*, float*, double);
+static int safe_eyes_pose(EyesPoseFn fn, float* l, float* r, double t) {
+    __try { return fn(l, r, t); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1000; }
+}
+
+static void probe_eyes() {
+    auto fn = (EyesPoseFn)GetProcAddress(GetModuleHandleA("carina_vio.dll"), "carina_vio_get_eyes_pose");
+    if (!fn) { printf("eyes: no export\n"); return; }
+    float l[64], r[64], head[POSE_FLOATS];
+    for (int i = 0; i < 64; i++) l[i] = r[i] = -12345.0f;
+    double t = g_imu_t;
+    int rc = safe_eyes_pose(fn, l, r, t);
+    safe_get_pose(head, t);
+    int nl = 0, nr = 0;
+    for (int i = 0; i < 64; i++) { if (l[i] != -12345.0f) nl = i + 1; if (r[i] != -12345.0f) nr = i + 1; }
+    printf("eyes: rc %d, wrote %d / %d floats\n", rc, nl, nr);
+    auto dump = [](const char* name, const float* m, int n) {
+        printf("  %s:", name);
+        for (int i = 0; i < n; i++) printf("%s%.5f", i % 4 ? " " : (i ? " | " : " "), m[i]);
+        printf("\n");
+    };
+    dump("left ", l, std::max(nl, 16));
+    dump("right", r, std::max(nr, 16));
+    dump("head ", head, 16);
+}
+
 static void probe_clocks() {
     Sleep(6000);  // let the engine initialise its tracking and predictor
     double imu = g_imu_t, qpc_s = qpc_now() / qpc_freq(), tick_s = GetTickCount64() / 1000.0;
@@ -441,7 +468,7 @@ int main(int argc, char** argv) {
     g_app.serial = vio::api.get_sn ? vio::api.get_sn() : "?";
     printf("engine running, glasses %s\n", g_app.serial.c_str());
     for (int i = 0; i < 300 && device_now() == 0; i++) Sleep(10);
-    if (probe_only) { probe_clocks(); vio::stop(); return 0; }
+    if (probe_only) { probe_clocks(); probe_eyes(); vio::stop(); return 0; }
     // Asked for a timestamp before its tracking has started, the engine ends the process
     // (no exception to catch): wait for a real pose with t = 0 first, then a margin.
     printf("waiting for tracking...\n");
@@ -455,6 +482,36 @@ int main(int argc, char** argv) {
         Sleep(100);
     }
     printf("tracking ready\n");
+    {
+        // The engine's per-eye poses (its factory display calibration), relative to the head
+        // pose at the same time: eye -> head, averaged over a few samples.
+        auto fn = (EyesPoseFn)GetProcAddress(GetModuleHandleA("carina_vio.dll"), "carina_vio_get_eyes_pose");
+        double acc[2][16] = {};
+        int n = 0;
+        for (int i = 0; fn && i < 20; i++, Sleep(5)) {
+            float l[64], r[64], h[POSE_FLOATS];
+            double t = g_imu_t;
+            if (safe_eyes_pose(fn, l, r, t) != 0 || safe_get_pose(h, t) != 0) continue;
+            M4 H, E[2];
+            for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) { H(a, b) = h[b * 4 + a]; E[0](a, b) = l[b * 4 + a]; E[1](a, b) = r[b * 4 + a]; }
+            M4 Hi = rigid_inverse(H);
+            for (int e = 0; e < 2; e++) { M4 D = mul(Hi, E[e]); for (int k = 0; k < 16; k++) acc[e][k] += D.m[k]; }
+            n++;
+        }
+        if (n >= 5) {
+            M4 D[2];
+            for (int e = 0; e < 2; e++) {
+                for (int k = 0; k < 16; k++) D[e].m[k] = (float)(acc[e][k] / n);
+                // Re-orthonormalise the averaged rotation.
+                Q q = mat_q(D[e]); M4 R = qmat(q);
+                for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) D[e](a, b) = R(a, b);
+            }
+            memcpy(g_app.eye_l, D[0].m, sizeof D[0].m); memcpy(g_app.eye_r, D[1].m, sizeof D[1].m);
+            g_app.have_vendor_eyes = true;
+            printf("engine eyes: left %.1f %.1f %.1f cm, right %.1f %.1f %.1f cm (IPD %.1f mm)\n", D[0](0, 3) * 100, D[0](1, 3) * 100, D[0](2, 3) * 100,
+                   D[1](0, 3) * 100, D[1](1, 3) * 100, D[1](2, 3) * 100, std::hypot(D[1](0, 3) - D[0](0, 3), D[1](1, 3) - D[0](1, 3)) * 1000);
+        } else printf("engine eyes: not available, manual display model\n");
+    }
     printf("engine pose changes when polled at 1 kHz: latest %.0f Hz, at device time %.0f Hz\n", unique_rate(false), unique_rate(true));
     std::thread poses(pose_thread);
 
@@ -970,7 +1027,17 @@ int main(int argc, char** argv) {
             float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
             // Eye frame: the RGB camera's fitted orientation when there is one (the optics are
             // on the same frame), then the manual tilt and eye height.
+            // Fine adjustments, on top of the engine's eyes or of the manual model.
             M4 eye_rot = rot_x(g_app.pitch_deg * 3.14159265f / 180);
+            if (g_app.vendor_eyes && g_app.have_vendor_eyes) {
+                M4 D;
+                if (sbs) memcpy(D.m, eye ? g_app.eye_r : g_app.eye_l, sizeof D.m);
+                else for (int k = 0; k < 16; k++) D.m[k] = (g_app.eye_l[k] + g_app.eye_r[k]) / 2;  // 2D: one view, between the eyes
+                M4 fine = mul(translate({0, g_app.eye_dy_cm / 100, g_app.eye_dz_cm / 100}), mul(rot_y(g_app.yaw_deg * 3.14159265f / 180), eye_rot));
+                M4 eye_world = mul(mul(head_scene, fine), D);
+                render_view(mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world)));
+                continue;
+            }
             if (g_app.display_from_rgb) {
                 rgbcal::Cam rc = rgbcal::get();
                 if (rc.fitted) {
