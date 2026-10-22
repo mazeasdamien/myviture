@@ -15,6 +15,8 @@
 #include "dashboard.hpp"
 #include "orange.hpp"
 #include "rgbcam.hpp"
+#include "calib.hpp"
+#include "hands.hpp"
 #include "state.hpp"
 
 #include <d3d11.h>
@@ -357,11 +359,11 @@ static void on_imu(float* d, double t) {
     }
     g_imu.count++;
 }
-static void on_cam(unsigned char* l, unsigned char* r, unsigned char*, unsigned char*, double, int w, int h) {
+static void on_cam(unsigned char* l, unsigned char* r, unsigned char*, unsigned char*, double t, int w, int h) {
     std::lock_guard<std::mutex> lk(g_cams.mu);
     if (l) g_cams.px[0].assign(l, l + (size_t)w * h);
     if (r) g_cams.px[1].assign(r, r + (size_t)w * h);
-    g_cams.w = w; g_cams.h = h;
+    g_cams.w = w; g_cams.h = h; g_cams.t = t;
     g_cams.seq++;
     g_cams.count++;
 }
@@ -496,6 +498,14 @@ int main(int argc, char** argv) {
     Com<ID3D11Buffer> cube_vb, grid_vb, cb;
     CHECK(make_vb(cube, &cube_vb));
     CHECK(make_vb(grid, &grid_vb));
+    // Hand bones: rewritten every frame.
+    const UINT BONE_VERTS = 2 * hands::N_BONES * 2;
+    Com<ID3D11Buffer> bone_vb;
+    {
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = BONE_VERTS * sizeof(Vertex); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        bd.Usage = D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        CHECK(dev->CreateBuffer(&bd, nullptr, &bone_vb));
+    }
     D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth = sizeof(Constants); cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.Usage = D3D11_USAGE_DEFAULT;
     CHECK(dev->CreateBuffer(&cbd, nullptr, &cb));
     D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_BACK; rd.FrontCounterClockwise = TRUE; rd.DepthClipEnable = TRUE;
@@ -517,6 +527,16 @@ int main(int argc, char** argv) {
     }
     g_app.screen_w = W; g_app.screen_h = H;
     rgbcam::start();
+    {
+        // Hands: factory calibration (cached by the web app's dev server) and the models.
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring dir = exe;
+        dir = dir.substr(0, dir.find_last_of(L'\\') + 1);
+        calib::Rig rig = calib::load(std::string(dir.begin(), dir.end()) + "..\\calibration.bin");
+        if (rig.ok) hands::start(dir + L"models\\", rig);
+        else { std::lock_guard<std::mutex> l(hands::g_mu); hands::g_result.status = "calibration.bin introuvable (dossier du projet)"; }
+    }
     {
         char exe[MAX_PATH];
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
@@ -606,6 +626,42 @@ int main(int argc, char** argv) {
             g_app.rate_dps = rate_dps;
         }
 
+        // Hands from the tracking thread: head frame at the image's time -> scene, with the
+        // engine's pose at that same time (no extrapolation yet).
+        struct SceneHand { bool right, pinching; V3 j[hands::N_JOINTS]; };
+        std::vector<SceneHand> scene_hands;
+        if (g_app.hands) {
+            hands::Result hr;
+            { std::lock_guard<std::mutex> l(hands::g_mu); if (qpc_now() / qpc_freq() - hands::g_result.t < 0.25) hr.hands = hands::g_result.hands; hr.t = hands::g_result.t; }
+            M4 at;
+            if (!hr.hands.empty() && engine_pose(hr.t, at)) {
+                M4 to_scene = mul(recenter, at);
+                for (auto& h : hr.hands) {
+                    SceneHand sh{h.right, h.pinching, {}};
+                    for (int k = 0; k < hands::N_JOINTS; k++) {
+                        const float* q = h.joints[k];
+                        sh.j[k] = {to_scene(0, 0) * q[0] + to_scene(0, 1) * q[1] + to_scene(0, 2) * q[2] + to_scene(0, 3),
+                                   to_scene(1, 0) * q[0] + to_scene(1, 1) * q[1] + to_scene(1, 2) * q[2] + to_scene(1, 3),
+                                   to_scene(2, 0) * q[0] + to_scene(2, 1) * q[1] + to_scene(2, 2) * q[2] + to_scene(2, 3)};
+                    }
+                    scene_hands.push_back(sh);
+                }
+            }
+        }
+        UINT bone_count = 0;
+        if (!scene_hands.empty()) {
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (SUCCEEDED(ctx->Map(bone_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                Vertex* v = (Vertex*)m.pData;
+                for (auto& h : scene_hands) for (auto& b : hands::BONES) {
+                    if (bone_count + 2 > BONE_VERTS) break;
+                    v[bone_count++] = {h.j[b[0]].x, h.j[b[0]].y, h.j[b[0]].z, 0, 1, 0};
+                    v[bone_count++] = {h.j[b[1]].x, h.j[b[1]].y, h.j[b[1]].z, 0, 1, 0};
+                }
+                ctx->Unmap(bone_vb, 0);
+            }
+        }
+
         float clear[4] = {0, 0, 0, 1};
         ctx->ClearRenderTargetView(rtv, clear);
         ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1, 0);
@@ -625,7 +681,7 @@ int main(int argc, char** argv) {
         const bool sbs = W >= 3000;
         const int views = sbs ? 2 : 1;
         const float ipd = g_app.ipd_mm / 1000.0f;
-        if (have && g_app.scene) for (int eye = 0; eye < views; eye++) {
+        if (have) for (int eye = 0; eye < views; eye++) {
             float vw = (float)W / views;
             D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
             ctx->RSSetViewports(1, &vp);
@@ -640,6 +696,21 @@ int main(int argc, char** argv) {
                 ctx->IASetPrimitiveTopology(topo);
                 ctx->Draw(n, 0);
             };
+            // Hands: joints as small cubes, bones as lines (left blue, right orange; white when pinching).
+            for (size_t hi = 0; hi < scene_hands.size(); hi++) {
+                auto& h = scene_hands[hi];
+                float r = h.pinching ? 1.0f : h.right ? 1.0f : 0.3f, g = h.pinching ? 1.0f : h.right ? 0.48f : 0.55f, b = h.pinching ? 1.0f : h.right ? 0.27f : 1.0f;
+                for (int k = 0; k < hands::N_JOINTS; k++) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[k]), scale(k % 4 == 0 ? 0.012f : 0.009f)), r, g, b, true);
+            }
+            if (bone_count) {
+                Constants c{vpm, identity(), {0.9f, 0.9f, 0.9f, 1}, {0, 0, 0, 0}};
+                ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                ID3D11Buffer* vbs[] = {bone_vb};
+                ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+                ctx->Draw(bone_count, 0);
+            }
+            if (!g_app.scene) continue;
             // Eight cubes around the head at arm's length, one ahead at 1 m, floor 1.6 m down.
             for (int i = 0; i < 8; i++) {
                 float a = i * 3.14159265f / 4;
@@ -693,6 +764,13 @@ int main(int argc, char** argv) {
                        shown * 1000.0 / since, updates * 1000.0 / since, pct(latencies, 0.5), pct(latencies, 0.99), pct(cpu_ms, 0.5), missed, max_rate,
                        pct(jerk, 0.5), pct(jerk, 0.99), g_engine_predict ? "engine" : "ours", g_predict_ms);
             if (!g_stats_paused) printf("      presentation: composed %ld  overlay %ld  direct %ld  failed %ld\n", comp_counts[0], comp_counts[1], comp_counts[2], comp_counts[3]);
+            if (!g_stats_paused) {
+                std::lock_guard<std::mutex> l(hands::g_mu);
+                auto& r = hands::g_result;
+                printf("      hands: %zu  %.0f/s  %.0f ms/pair (palm %.0f, %d/s)  image->hand %.0f ms", r.hands.size(), r.rate, r.ms_total, r.ms_palm, r.palm_runs, r.latency_ms);
+                for (auto& h : r.hands) printf("  [%s gap %.0f mm pinch %.1f cm wrist %.2f %.2f %.2f]", h.right ? "R" : "L", h.gap_mm, h.pinch_m * 100, h.joints[0][0], h.joints[0][1], h.joints[0][2]);
+                printf("\n");
+            }
             for (long& c : comp_counts) c = 0;
             if (g_engine_predict && !g_stats_paused) {
                 printf("      engine lead used: %.2f of the head's motion (n %zu)  status:", pct(gain, 0.5), gain.size());
@@ -735,6 +813,7 @@ int main(int argc, char** argv) {
     }
 
     printf("stopping...\n");
+    hands::stop();
     rgbcam::stop();
     dash::shutdown();
     if (rtv) rtv->Release();

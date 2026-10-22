@@ -19,6 +19,7 @@
 
 #include "orange.hpp"
 #include "rgbcam.hpp"
+#include "hands.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -288,12 +289,31 @@ static void build(AppState& s) {
     ImGui::SeparatorText("Caméras de suivi");
     ImGui::SameLine();
     ImGui::TextDisabled("%.0f i/s", cam_fps);
+    hands::Result hr;
+    { std::lock_guard<std::mutex> l(hands::g_mu); hr = hands::g_result; }
+    ImGui::Checkbox("Mains", &s.hands);
+    hands::g_enabled = s.hands;
+    ImGui::SameLine();
+    if (!hr.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", hr.status.c_str());
+    else ImGui::TextDisabled("%zu main(s) · %.0f/s · %s · %.0f ms/image (paume %.0f) · %d paumes/s · image → main %.0f ms",
+                             hr.hands.size(), hr.rate, hr.device.c_str(), hr.ms_total, hr.ms_palm, hr.palm_runs, hr.latency_ms);
+    for (auto& h : hr.hands) {
+        ImGui::TextDisabled("  %s : pincement %.1f cm%s · écart stéréo %.1f mm · poignet %.2f %.2f %.2f m", h.right ? "droite" : "gauche", h.pinch_m * 100,
+                            h.pinching ? " (pince)" : "", h.gap_mm, h.joints[0][0], h.joints[0][1], h.joints[0][2]);
+    }
     float avail_w = ImGui::GetContentRegionAvail().x / 2 - ImGui::GetStyle().ItemSpacing.x, avail_h = ImGui::GetContentRegionAvail().y;
     for (int i = 0; i < 2; i++) {
         if (i) ImGui::SameLine();
         if (!cams[i].srv) { ImGui::Dummy(ImVec2(avail_w, avail_h)); continue; }
-        float k = std::min(avail_w / cams[i].w, avail_h / cams[i].h);
+        float k = std::min(avail_w / cams[i].w, (ImGui::GetContentRegionAvail().y) / cams[i].h);
+        ImVec2 o = ImGui::GetCursorScreenPos();
         ImGui::Image((ImTextureID)(intptr_t)cams[i].srv, ImVec2(cams[i].w * k, cams[i].h * k));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (auto& h : hr.hands) {
+            ImU32 col = h.right ? IM_COL32(255, 122, 69, 255) : IM_COL32(76, 141, 255, 255);
+            for (auto& b : hands::BONES)
+                dl->AddLine(ImVec2(o.x + h.image[i][b[0]][0] * k, o.y + h.image[i][b[0]][1] * k), ImVec2(o.x + h.image[i][b[1]][0] * k, o.y + h.image[i][b[1]][1] * k), col, 2);
+        }
     }
     ImGui::EndChild();
 

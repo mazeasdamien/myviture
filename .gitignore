@@ -13,3 +13,7 @@ native/*.obj
 native/obj/
 native/*.ini
 native/*.log
+native/third_party/onnxruntime/lib/
+native/third_party/directml/*.dll
+native/models/*.onnx
+native/*.dll
