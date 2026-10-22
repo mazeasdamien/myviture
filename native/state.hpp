@@ -22,6 +22,7 @@ struct AppState {
     float ipd_mm = 63.0f;
     float floor_m = 1.6f;   // floor below the eyes
     bool scene = true;
+    bool floor_grid = false;  // the floor grid shows height errors and the optics' edges most
     bool recenter = true;
     bool quit = false;
     int display_request = 0;  // 2 or 3: switch the glasses to that mode

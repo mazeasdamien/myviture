@@ -648,7 +648,7 @@ int main(int argc, char** argv) {
                 draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({sinf(a) * 0.9f, 0, -cosf(a) * 0.9f}), scale(0.12f)), r, g, b, true);
             }
             draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({0, -0.1f, -1.0f}), scale(0.05f)), 1, 1, 1, true);
-            draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, -g_app.floor_m, 0}), 0.3f, 0.7f, 1.0f, false);
+            if (g_app.floor_grid) draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, -g_app.floor_m, 0}), 0.3f, 0.7f, 1.0f, false);
         }
 
         sc->Present(1, 0);

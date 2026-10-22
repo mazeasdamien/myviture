@@ -254,7 +254,9 @@ static void build(AppState& s) {
     ImGui::SliderFloat("champ vertical (°)", &s.vfov, 20, 40, "%.2f");
     ImGui::SliderFloat("écart des yeux (mm)", &s.ipd_mm, 50, 75, "%.1f");
     ImGui::SliderFloat("sol sous les yeux (m)", &s.floor_m, 0.5f, 2.2f, "%.2f");
-    ImGui::Checkbox("Scène de test (cubes, sol)", &s.scene);
+    ImGui::Checkbox("Scène de test (cubes)", &s.scene);
+    ImGui::SameLine();
+    ImGui::Checkbox("Grille au sol", &s.floor_grid);
     if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; }
     ImGui::EndChild();
 
