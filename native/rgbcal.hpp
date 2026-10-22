@@ -63,7 +63,7 @@ struct Fit {
 inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     if (P.size() < 40) return false;
     const double f0 = default_focal(cam.w);
-    const double sig_px = 3, sig_rot = 4 * 3.14159265 / 180, sig_t = 0.02, sig_f = 0.15;
+    const double sig_px = 3, sig_rot = 6 * 3.14159265 / 180, sig_t = 0.04, sig_f = 0.15;
     const double k = 8 * std::sqrt(P.size() / 20.0);  // prior weight grows with the data, as the web fit
     double x[7] = {0, 0, 0, 0, 0, 0, std::log(f0)};  // start from the default, not the current fit
     std::vector<char> use(P.size(), 1);
@@ -148,7 +148,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     info.rot_deg = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]) * 180 / 3.14159265;
     for (int i = 0; i < 3; i++) info.shift_cm[i] = x[3 + i] * 100;
     info.f_rel = t.f / f0;
-    info.ok = n >= 40 && info.rms_px < 25 && info.rot_deg < 20 && std::fabs(x[3]) < 0.08 && std::fabs(x[4]) < 0.08 && std::fabs(x[5]) < 0.08 && info.f_rel > 0.6 && info.f_rel < 1.6;
+    info.ok = n >= 100 && info.rms_px < 20 && info.rot_deg < 25 && std::fabs(x[3]) < 0.12 && std::fabs(x[4]) < 0.12 && std::fabs(x[5]) < 0.12 && info.f_rel > 0.6 && info.f_rel < 1.6;
     if (info.ok) { cam = t; cam.fitted = true; }
     return info.ok;
 }
@@ -176,7 +176,9 @@ inline std::mutex g_mu;
 inline Cam g_cam;              // current model (default until fitted)
 inline std::vector<Pair> g_pairs;
 inline Fit g_fit;
-inline int g_since_fit = 0;
+inline int g_since_fit = 0;   // frames since the last fit
+inline int g_frames = 0;      // frames of pairs collected
+inline double g_lo[3] = {1e9, 1e9, 1e9}, g_hi[3] = {-1e9, -1e9, -1e9};  // wrist positions' extent (m)
 inline std::string g_path;
 
 /** The current model for an image of this size (default when none yet). */
@@ -186,13 +188,19 @@ inline Cam current(int w, int h) {
     return g_cam;
 }
 
-/** New stereo <-> RGB pairs; refits every 40 points, keeps the last 600. */
-inline void add(const std::vector<Pair>& pairs) {
+/**
+ * One frame's stereo <-> RGB pairs (wrist: that hand's wrist, head frame). A fit needs
+ * hands seen at several places (8 frames, 25 cm of spread) or focal and position trade
+ * off; then every 4 frames. The last 600 points are kept.
+ */
+inline void add(const std::vector<Pair>& pairs, const double wrist[3]) {
     std::lock_guard<std::mutex> l(g_mu);
     g_pairs.insert(g_pairs.end(), pairs.begin(), pairs.end());
     if (g_pairs.size() > 600) g_pairs.erase(g_pairs.begin(), g_pairs.begin() + (g_pairs.size() - 600));
-    g_since_fit += (int)pairs.size();
-    if (g_since_fit >= 40 && g_pairs.size() >= 40) {
+    g_frames++; g_since_fit++;
+    for (int i = 0; i < 3; i++) { g_lo[i] = std::min(g_lo[i], wrist[i]); g_hi[i] = std::max(g_hi[i], wrist[i]); }
+    double spread = std::max(g_hi[0] - g_lo[0], std::max(g_hi[1] - g_lo[1], g_hi[2] - g_lo[2]));
+    if (g_frames >= 8 && spread >= 0.25 && g_since_fit >= 4) {
         g_since_fit = 0;
         Fit info;
         Cam trial = g_cam;
@@ -203,7 +211,8 @@ inline void add(const std::vector<Pair>& pairs) {
 
 inline void reset() {
     std::lock_guard<std::mutex> l(g_mu);
-    g_pairs.clear(); g_since_fit = 0; g_fit = Fit();
+    g_pairs.clear(); g_since_fit = 0; g_frames = 0; g_fit = Fit();
+    for (int i = 0; i < 3; i++) { g_lo[i] = 1e9; g_hi[i] = -1e9; }
     int w = g_cam.w, h = g_cam.h;
     g_cam = Cam(); g_cam.w = w; g_cam.h = h; g_cam.f = default_focal(w);
     if (!g_path.empty()) remove(g_path.c_str());

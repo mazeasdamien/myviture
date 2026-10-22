@@ -244,6 +244,8 @@ static void build(AppState& s) {
     ImGui::Text("Pose %.0f Hz   CPU %.2f ms/image", t.pose_hz, t.cpu_ms);
     ImGui::Text("Tremblement %.2f° (p99 %.2f°)", t.shake_p50, t.shake_p99);
     ImGui::TextDisabled("Prédiction utilisée : %.0f %% du mouvement", t.lead_used * 100);
+    ImGui::Text("Corrections visuelles  %d en 2 s · %.2f° · %.1f mm", t.corrections, t.corr_deg, t.corr_mm);
+    ImGui::Checkbox("Lisser les corrections (sinon elles sautent)", &s.smooth_corrections);
     plot("##shake", tail(s.shake_history, 300), 0, 1.0f, 4 * em, "tremblement par image (0–1°)");
     plot("##lat", tail(s.latency_history, 300), 0, 40, 3 * em, "pose → écran (0–40 ms)");
     ImGui::SeparatorText("Prédiction");
@@ -351,9 +353,9 @@ static void build(AppState& s) {
     if (ImGui::SmallButton("Oublier le calage RGB")) rgbcal::reset();
     {
         rgbcal::Fit fi; bool fitted; size_t np;
-        { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; np = rgbcal::g_pairs.size(); }
+        { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; np = (size_t)rgbcal::g_frames; }
         if (fitted) ImGui::TextDisabled("calage RGB : écart %.1f px sur %d points · rotation %.1f° · décalage %.1f %.1f %.1f cm · focale ×%.2f", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
-        else ImGui::TextDisabled("calage RGB : caméra par défaut · %zu points (montre tes mains, immobiles, à plusieurs endroits)%s", np, fi.n && !fi.ok ? " · dernier essai refusé" : "");
+        else ImGui::TextDisabled("calage RGB : caméra par défaut · %zu/8 poses de main (immobile, à des endroits différents)%s", np, fi.n && !fi.ok ? " · dernier essai refusé" : "");
     }
     if (rgb.srv) {
         ImVec2 a = ImGui::GetContentRegionAvail();

@@ -12,6 +12,8 @@ struct Stats {
     float fps = 0, latency_p50 = 0, latency_p99 = 0, cpu_ms = 0, pose_hz = 0;
     float shake_p50 = 0, shake_p99 = 0, lead_used = 0;
     long missed = 0;
+    int corrections = 0;          // visual corrections of the engine in the last 2 s
+    float corr_deg = 0, corr_mm = 0;  // their mean size
 };
 
 struct AppState {
@@ -26,7 +28,8 @@ struct AppState {
     bool hands = true;
     bool hand_predict = false;  // extrapolate the hands' motion to the display time (felt worse: off)
     bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
-    bool rgb_reset = false;    // forget the RGB camera fit  // the floor grid shows height errors and the optics' edges most
+    bool rgb_reset = false;    // forget the RGB camera fit
+    bool smooth_corrections = true;  // blend the engine's visual corrections instead of jumping
     bool recenter = true;
     bool quit = false;
     bool snapshot = false;  // save the dashboard as dashboard.png

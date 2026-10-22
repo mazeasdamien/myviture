@@ -575,6 +575,7 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                 }
             }
             std::vector<rgbcal::Pair> pairs;
+            double wrist_of_pairs[3] = {0, 0, 0};
             for (size_t i = 0; i < out.size() && i < 2; i++) {
                 if (!cropped[i]) continue;
                 float pres, hand, wd[N_JOINTS][3];
@@ -588,16 +589,16 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                 for (int k = 0; k < 3; k++) last_wrist[sd][k] = wr[k];
                 last_wrist_t[sd] = t_img;
                 if (!still || out[i].gap_mm > 15) continue;
+                for (int k = 0; k < 3; k++) wrist_of_pairs[k] = wr[k];
                 for (int k = 0; k < N_JOINTS; k++) pairs.push_back({{out[i].joints[k][0], out[i].joints[k][1], out[i].joints[k][2]}, out[i].rgb[k][0], out[i].rgb[k][1]});
             }
             if (!pairs.empty()) {
-                size_t before; { std::lock_guard<std::mutex> l(rgbcal::g_mu); before = rgbcal::g_pairs.size(); }
-                rgbcal::add(pairs);
-                rgbcal::Fit fi; bool fitted;
-                { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; }
-                if (fi.n && (before / 40) != ((before + pairs.size()) / 40))
+                int before; { std::lock_guard<std::mutex> l(rgbcal::g_mu); before = rgbcal::g_since_fit; }
+                rgbcal::add(pairs, wrist_of_pairs);
+                rgbcal::Fit fi; int after;
+                { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; after = rgbcal::g_since_fit; }
+                if (after < before)  // a fit just ran
                     logf("rgb fit: %s rms %.1f px on %d points, rot %.1f deg, shift %.1f %.1f %.1f cm, f x%.2f\n", fi.ok ? "ok" : "rejected", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
-                (void)fitted;
             }
         }
 

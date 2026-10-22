@@ -574,6 +574,7 @@ int main(int argc, char** argv) {
     std::vector<Pending> pending;
     std::vector<double> latencies, cpu_ms, jerk, gain;
     long status_counts[10] = {};
+    int corr_n = 0; float corr_deg = 0, corr_mm = 0;
     UINT last_refresh = 0, last_present_seen = 0;
     long missed = 0, shown = 0, last_updates = 0;
     int64_t stats_t0 = qpc_now(), frame_t0 = qpc_now();
@@ -611,6 +612,51 @@ int main(int argc, char** argv) {
                     gain.push_back(ang / (rate_dps * (target - base)));
                 }
             }
+        }
+        // The engine's visual update (25 Hz) revises the pose it predicted from the IMU:
+        // a step every camera frame, seen as a twitch. Asking again for last frame's
+        // target gives that revision; an offset absorbs it and fades out, so the scene
+        // slides to the corrected place instead of jumping. Big steps (relocalisation,
+        // recentre) are let through.
+        {
+            static double prev_target = 0;
+            static Q prev_q_at{0, 0, 0, 1};
+            static V3 prev_p_at{0, 0, 0};
+            static Q oq{0, 0, 0, 1};
+            static V3 op{0, 0, 0};
+            static int64_t last_qpc = 0;
+            double target = device_now() + g_predict_ms / 1000.0;
+            M4 re;
+            if (have && prev_target > 0 && engine_pose(prev_target, re)) {
+                Q q_re = mat_q(re);
+                V3 p_re = {re(0, 3), re(1, 3), re(2, 3)};
+                Q dq = qmul(q_re, qconj(prev_q_at));
+                if (dq.w < 0) dq = {-dq.x, -dq.y, -dq.z, -dq.w};
+                V3 dp = {p_re.x - prev_p_at.x, p_re.y - prev_p_at.y, p_re.z - prev_p_at.z};
+                float ang = 2 * atan2f(sqrtf(dq.x * dq.x + dq.y * dq.y + dq.z * dq.z), dq.w) * 57.2958f;
+                float dist = sqrtf(dp.x * dp.x + dp.y * dp.y + dp.z * dp.z);
+                if (ang > 0.003f || dist > 0.0002f) {
+                    corr_n++; corr_deg += ang; corr_mm += dist * 1000;
+                    if (g_app.smooth_corrections && ang < 3 && dist < 0.05) {
+                        oq = qnorm(qmul(qconj(dq), oq));
+                        op = {op.x - dp.x, op.y - dp.y, op.z - dp.z};
+                    } else { oq = {0, 0, 0, 1}; op = {0, 0, 0}; }
+                }
+            }
+            if (have) {
+                M4 now_at;
+                if (engine_pose(target, now_at)) { prev_target = target; prev_q_at = mat_q(now_at); prev_p_at = {now_at(0, 3), now_at(1, 3), now_at(2, 3)}; }
+                // Fade: fast while the head turns (errors are hidden), slow when still.
+                double dt = last_qpc ? qpc_ms(qpc_now() - last_qpc) / 1000.0 : 0.016;
+                double tau = rate_dps > 20 ? 0.08 : 0.25;
+                float k = (float)std::exp(-dt / tau);
+                // oq^k by shrinking its angle
+                float s = sqrtf(oq.x * oq.x + oq.y * oq.y + oq.z * oq.z);
+                if (s > 1e-7f) { float a = 2 * atan2f(s, oq.w) * k; oq = {oq.x / s * sinf(a / 2), oq.y / s * sinf(a / 2), oq.z / s * sinf(a / 2), cosf(a / 2)}; }
+                op = {op.x * k, op.y * k, op.z * k};
+                if (g_app.smooth_corrections) { q = qnorm(qmul(oq, q)); p = {p.x + op.x, p.y + op.y, p.z + op.z}; }
+            }
+            last_qpc = qpc_now();
         }
         int64_t pose_qpc = qpc_now();
         // Shake seen by the eye: change of the per-frame rotation step (deg), RMS.
@@ -803,7 +849,10 @@ int main(int argc, char** argv) {
             auto pct = [](std::vector<double> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, (size_t)(p * v.size()))]; };
             long updates = g_pose_updates - last_updates;
             g_app.stats = {(float)(shown * 1000.0 / since), (float)pct(latencies, 0.5), (float)pct(latencies, 0.99), (float)pct(cpu_ms, 0.5), (float)(updates * 1000.0 / since),
-                           (float)pct(jerk, 0.5), (float)pct(jerk, 0.99), (float)pct(gain, 0.5), missed};
+                           (float)pct(jerk, 0.5), (float)pct(jerk, 0.99), (float)pct(gain, 0.5), missed,
+                           corr_n, corr_n ? corr_deg / corr_n : 0, corr_n ? corr_mm / corr_n : 0};
+            if (!g_stats_paused) printf("      engine corrections: %d (mean %.2f deg, %.1f mm) %s\n", corr_n, corr_n ? corr_deg / corr_n : 0, corr_n ? corr_mm / corr_n : 0, g_app.smooth_corrections ? "blended" : "raw");
+            corr_n = 0; corr_deg = corr_mm = 0;
             if (!g_stats_paused)
                 printf("%5.1f fps  pose %4.0f Hz  pose->vblank p50 %4.1f p99 %4.1f ms  CPU %4.2f ms  missed %ld  head max %4.0f deg/s  shake p50 %.3f p99 %.3f deg  %s %.0f ms\n",
                        shown * 1000.0 / since, updates * 1000.0 / since, pct(latencies, 0.5), pct(latencies, 0.99), pct(cpu_ms, 0.5), missed, max_rate,
