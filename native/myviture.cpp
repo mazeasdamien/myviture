@@ -942,7 +942,20 @@ int main(int argc, char** argv) {
             D3D11_VIEWPORT vp{eye * vw, 0, vw, (float)H, 0, 1};
             ctx->RSSetViewports(1, &vp);
             float off = sbs ? (eye ? ipd / 2 : -ipd / 2) : 0;
-            M4 eye_world = mul(mul(head_scene, rot_x(g_app.pitch_deg * 3.14159265f / 180)), translate({off, g_app.eye_dy_cm / 100, 0}));
+            // Eye frame: the RGB camera's fitted orientation when there is one (the optics are
+            // on the same frame), then the manual tilt and eye height.
+            M4 eye_rot = rot_x(g_app.pitch_deg * 3.14159265f / 180);
+            if (g_app.display_from_rgb) {
+                rgbcal::Cam rc = rgbcal::get();
+                if (rc.fitted) {
+                    double Rr[9];
+                    rgbcal::rotation(rc.rv, Rr);
+                    M4 cam_head = identity();
+                    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) cam_head(i, j) = (float)Rr[j * 3 + i];
+                    eye_rot = mul(cam_head, eye_rot);
+                }
+            }
+            M4 eye_world = mul(mul(head_scene, eye_rot), translate({off, g_app.eye_dy_cm / 100, 0}));
             render_view(mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world)));
         }
 

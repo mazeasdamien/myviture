@@ -296,6 +296,12 @@ static void build(AppState& s) {
     ImGui::SliderFloat("champ vertical (°)", &s.vfov, 20, 40, "%.2f");
     ImGui::SliderFloat("écart des yeux (mm)", &s.ipd_mm, 50, 75, "%.1f");
     ImGui::SliderFloat("sol sous les yeux (m)", &s.floor_m, 0.5f, 2.2f, "%.2f");
+    {
+        rgbcal::Cam rc = rgbcal::get();
+        char lbl[96];
+        snprintf(lbl, sizeof lbl, rc.fitted ? "Orientation de l'écran = caméra RGB calée (%.1f°)" : "Orientation de l'écran = caméra RGB calée (pas encore calée)", rc.fitted ? rc.rv[0] * 57.2958 : 0.0);
+        ImGui::Checkbox(lbl, &s.display_from_rgb);
+    }
     ImGui::SliderFloat("inclinaison (°)", &s.pitch_deg, -20, 20, "%.1f");
     ImGui::SliderFloat("hauteur des yeux (cm)", &s.eye_dy_cm, -10, 10, "%.1f");
     ImGui::TextDisabled("Les objets (et tes mains virtuelles) sont trop hauts : baisse l'inclinaison jusqu'à ce que la main virtuelle couvre la vraie.");
@@ -313,6 +319,13 @@ static void build(AppState& s) {
         int tables = 0; float floor_y = NAN;
         for (auto& p : r.planes) { if (p.kind == 0) floor_y = p.y; else tables++; }
         if (!std::isnan(floor_y)) ImGui::Text("Sol trouvé à %.2f m sous l'origine · %d surface(s) horizontale(s)", -floor_y, tables);
+        // Depth under the gaze (median of the centre 20x20), to check against a tape measure.
+        if (r.depth.size() == (size_t)depth::W * depth::H) {
+            std::vector<float> c;
+            for (int y = depth::H / 2 - 10; y < depth::H / 2 + 10; y++) for (int x = depth::W / 2 - 10; x < depth::W / 2 + 10; x++) { float z = r.depth[y * depth::W + x]; if (z > 0) c.push_back(z); }
+            if (c.size() > 20) { std::sort(c.begin(), c.end()); ImGui::Text("Distance au centre du regard : %.2f m (caméra gauche)", c[c.size() / 2]); }
+            else ImGui::TextDisabled("Distance au centre du regard : pas mesurée");
+        }
         else ImGui::TextDisabled("Sol pas encore trouvé : regarde le sol et autour de toi");
         ImGui::Text("%zu ancre(s)", r.anchors.size());
     }
