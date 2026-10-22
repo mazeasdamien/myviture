@@ -211,15 +211,24 @@ static void build(AppState& s) {
     ImGui::TextUnformatted("myViture");
     ImGui::SameLine();
     ImGui::TextDisabled("VITURE Luma Ultra · %s · moteur VITURE · application Windows", s.serial.c_str());
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 22 * em);
     bool sbs = s.screen_w >= 3000;
-    ImGui::TextColored(sbs ? ImVec4(0.4f, 0.9f, 0.6f, 1) : ImVec4(1, 0.7f, 0.3f, 1), sbs ? "● 3D %dx%d" : "● 2D %dx%d", s.screen_w, s.screen_h);
+    char mode[48];
+    snprintf(mode, sizeof mode, sbs ? "● 3D %dx%d" : "● 2D %dx%d", s.screen_w, s.screen_h);
+    const char* buttons[] = {sbs ? "Passer en 2D" : "Passer en 3D", "Recentrer", "Capture", "Quitter"};
+    const ImGuiStyle& sty = ImGui::GetStyle();
+    float right_w = ImGui::CalcTextSize(mode).x;
+    for (auto b : buttons) right_w += sty.ItemSpacing.x + ImGui::CalcTextSize(b).x + 2 * sty.FramePadding.x;
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - right_w));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(sbs ? ImVec4(0.4f, 0.9f, 0.6f, 1) : ImVec4(1, 0.7f, 0.3f, 1), "%s", mode);
     ImGui::SameLine();
-    if (ImGui::Button(sbs ? "Passer en 2D" : "Passer en 3D")) s.display_request = sbs ? 2 : 3;
+    if (ImGui::Button(buttons[0])) s.display_request = sbs ? 2 : 3;
     ImGui::SameLine();
-    if (ImGui::Button("Recentrer")) s.recenter = true;
+    if (ImGui::Button(buttons[1])) s.recenter = true;
     ImGui::SameLine();
-    if (ImGui::Button("Quitter")) s.quit = true;
+    if (ImGui::Button(buttons[2])) s.snapshot = true;
+    ImGui::SameLine();
+    if (ImGui::Button(buttons[3])) s.quit = true;
     ImGui::Separator();
 
     const float col = ImGui::GetContentRegionAvail().x / 3 - ImGui::GetStyle().ItemSpacing.x;
@@ -284,9 +293,9 @@ static void build(AppState& s) {
     static long last_count = 0; static double last_t = 0; static float imu_hz = 0;
     double now = ImGui::GetTime();
     if (now - last_t > 1) { imu_hz = (float)((imu_count - last_count) / (now - last_t)); last_count = imu_count; last_t = now; }
-    ImGui::SeparatorText("IMU");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%.0f Hz, 2 s", imu_hz);
+    char title[160];
+    snprintf(title, sizeof title, "IMU · %.0f Hz · 2 s", imu_hz);
+    ImGui::SeparatorText(title);
     float chart_h = (ImGui::GetContentRegionAvail().y - 3 * ImGui::GetTextLineHeightWithSpacing()) / 2;
     axis_chart("Gyro", "rad/s", axes + 3, 2.0f, chart_h);
     axis_chart("Accél.", "m/s²", axes, 12.0f, chart_h);
@@ -300,21 +309,26 @@ static void build(AppState& s) {
     static long last_frames = 0; static double last_ft = 0; static float cam_fps = 0;
     long frames; { std::lock_guard<std::mutex> l(g_cams.mu); frames = g_cams.count; }
     if (now - last_ft > 1) { cam_fps = (float)((frames - last_frames) / (now - last_ft)); last_frames = frames; last_ft = now; }
-    ImGui::SeparatorText("Caméras de suivi");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%.0f i/s", cam_fps);
+    snprintf(title, sizeof title, "Caméras de suivi · %.0f i/s", cam_fps);
+    ImGui::SeparatorText(title);
     hands::Result hr;
     { std::lock_guard<std::mutex> l(hands::g_mu); hr = hands::g_result; }
+    // Fixed height (three lines), so the images below never move.
+    const float line = ImGui::GetTextLineHeightWithSpacing();
+    ImGui::BeginChild("handinfo", ImVec2(0, 3 * line + sty.FramePadding.y * 2), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     ImGui::Checkbox("Mains", &s.hands);
     hands::g_enabled = s.hands;
     ImGui::SameLine();
     if (!hr.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", hr.status.c_str());
-    else ImGui::TextDisabled("%zu main(s) · %.0f/s · %s · %.0f ms/image (paume %.0f) · %d paumes/s · image → main %.0f ms",
-                             hr.hands.size(), hr.rate, hr.device.c_str(), hr.ms_total, hr.ms_palm, hr.palm_runs, hr.latency_ms);
-    for (auto& h : hr.hands) {
-        ImGui::TextDisabled("  %s : pincement %.1f cm%s · écart stéréo %.1f mm · poignet %.2f %.2f %.2f m", h.right ? "droite" : "gauche", h.pinch_m * 100,
-                            h.pinching ? " (pince)" : "", h.gap_mm, h.joints[0][0], h.joints[0][1], h.joints[0][2]);
+    else ImGui::TextDisabled("%.0f/s · %s · %.0f ms/paire · image → main %.0f ms", hr.rate, hr.device.c_str(), hr.ms_total, hr.latency_ms);
+    for (int side = 0; side < 2; side++) {
+        const hands::Hand* h = nullptr;
+        for (auto& x : hr.hands) if (x.right == (side == 1)) h = &x;
+        if (h) ImGui::TextDisabled("%s : pince %.1f cm%s · stéréo %.1f mm · poignet %.2f %.2f %.2f m", side ? "droite" : "gauche", h->pinch_m * 100,
+                                   h->pinching ? " ✓" : "", h->gap_mm, h->joints[0][0], h->joints[0][1], h->joints[0][2]);
+        else ImGui::TextDisabled("%s : —", side ? "droite" : "gauche");
     }
+    ImGui::EndChild();
     float avail_w = ImGui::GetContentRegionAvail().x / 2 - ImGui::GetStyle().ItemSpacing.x, avail_h = ImGui::GetContentRegionAvail().y;
     for (int i = 0; i < 2; i++) {
         if (i) ImGui::SameLine();
@@ -338,10 +352,11 @@ static void build(AppState& s) {
     std::string rgb_name, rgb_status;
     { std::lock_guard<std::mutex> l(rgbcam::g_frame.mu); rgb_name = rgbcam::g_frame.name; rgb_status = rgbcam::g_frame.status;
       if (now - last_rt > 1) { rgb_fps = (float)((rgbcam::g_frame.count - last_rgb) / (now - last_rt)); last_rgb = rgbcam::g_frame.count; last_rt = now; } }
-    ImGui::SeparatorText("Caméra RGB");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s %dx%d · %.0f i/s", rgb_name.c_str(), rgb.w, rgb.h, rgb_fps);
+    snprintf(title, sizeof title, "Caméra RGB · %dx%d · %.0f i/s", rgb.w, rgb.h, rgb_fps);
+    ImGui::SeparatorText(title);
+    // One line always, so the image never moves.
     if (!rgb_status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", rgb_status.c_str());
+    else ImGui::TextDisabled("%s", rgb_name.c_str());
     if (rgb.srv) {
         ImVec2 a = ImGui::GetContentRegionAvail();
         float k = std::min(a.x / rgb.w, a.y / rgb.h);
@@ -394,6 +409,14 @@ void frame(AppState& s) {
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     ctx->ClearRenderTargetView(rtv, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (s.snapshot) {
+        s.snapshot = false;
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring png = exe;
+        png = png.substr(0, png.find_last_of(L'\\') + 1) + L"dashboard.png";
+        save_png(png);
+    }
     sc->Present(0, 0);
 }
 

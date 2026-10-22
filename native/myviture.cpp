@@ -319,8 +319,10 @@ static std::vector<Vertex> cube_vertices() {
     std::vector<Vertex> v;
     const float n[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
     for (auto& f : n) {
-        // Two axes spanning the face, chosen so the winding is counter-clockwise seen from outside.
-        float u[3] = {f[1] + f[2], f[2] + f[0], f[0] + f[1]};
+        // Two unit axes spanning the face: u along the next axis, w = n x u.
+        int ax = f[0] != 0 ? 0 : f[1] != 0 ? 1 : 2;
+        float u[3] = {0, 0, 0};
+        u[(ax + 1) % 3] = 1;
         float w[3] = {f[1] * u[2] - f[2] * u[1], f[2] * u[0] - f[0] * u[2], f[0] * u[1] - f[1] * u[0]};
         auto corner = [&](float a, float b) {
             return Vertex{0.5f * (f[0] + a * u[0] + b * w[0]), 0.5f * (f[1] + a * u[1] + b * w[1]), 0.5f * (f[2] + a * u[2] + b * w[2]), f[0], f[1], f[2]};
@@ -528,7 +530,7 @@ int main(int argc, char** argv) {
     }
     D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth = sizeof(Constants); cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.Usage = D3D11_USAGE_DEFAULT;
     CHECK(dev->CreateBuffer(&cbd, nullptr, &cb));
-    D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_BACK; rd.FrontCounterClockwise = TRUE; rd.DepthClipEnable = TRUE;
+    D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.FrontCounterClockwise = TRUE; rd.DepthClipEnable = TRUE;
     Com<ID3D11RasterizerState> rs; CHECK(dev->CreateRasterizerState(&rd, &rs));
     D3D11_DEPTH_STENCIL_DESC dsd{}; dsd.DepthEnable = TRUE; dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dsd.DepthFunc = D3D11_COMPARISON_LESS;
     Com<ID3D11DepthStencilState> dss; CHECK(dev->CreateDepthStencilState(&dsd, &dss));
@@ -889,7 +891,9 @@ int main(int argc, char** argv) {
             GetModuleFileNameW(nullptr, exe, MAX_PATH);
             std::wstring png = exe;
             png = png.substr(0, png.find_last_of(L'\\') + 1) + L"dashboard.png";
-            printf("dashboard snapshot: %s\n", dash::save_png(png) ? "saved" : "failed");
+            g_app.snapshot = true;
+            (void)png;
+            printf("dashboard snapshot requested\n");
         }
 
         if (g_app.display_request) {

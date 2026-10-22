@@ -24,7 +24,7 @@ struct AppState {
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;
-    bool hand_predict = true;  // extrapolate the hands' motion to the display time
+    bool hand_predict = false;  // extrapolate the hands' motion to the display time (felt worse: off)
 
     // display calibration with the hands (align.hpp): D, drawn points -> real points
     double align[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -33,6 +33,7 @@ struct AppState {
     std::string align_status;  // the floor grid shows height errors and the optics' edges most
     bool recenter = true;
     bool quit = false;
+    bool snapshot = false;  // save the dashboard as dashboard.png
     int display_request = 0;  // 2 or 3: switch the glasses to that mode
 
     // ---- written by the renderer
