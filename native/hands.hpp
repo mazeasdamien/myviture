@@ -622,11 +622,11 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                 for (int k = 0; k < N_JOINTS; k++) pairs.push_back({{out[i].joints[k][0], out[i].joints[k][1], out[i].joints[k][2]}, out[i].rgb[k][0], out[i].rgb[k][1]});
             }
             if (!pairs.empty()) {
-                int before; { std::lock_guard<std::mutex> l(rgbcal::g_mu); before = rgbcal::g_since_fit; }
+                static int logged = 0;
                 rgbcal::add(pairs, wrist_of_pairs);
-                rgbcal::Fit fi; int after;
-                { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; after = rgbcal::g_since_fit; }
-                if (after < before)  // a fit just ran
+                rgbcal::Fit fi; int runs;
+                { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; runs = rgbcal::g_fit_runs; }
+                if (runs != logged && (logged = runs))  // a fit finished
                     logf("rgb fit: %s rms %.1f px on %d points, rot %.1f deg, shift %.1f %.1f %.1f cm, f x%.2f\n", fi.ok ? "ok" : "rejected", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
             }
         }

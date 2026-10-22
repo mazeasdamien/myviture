@@ -10,7 +10,12 @@
 #pragma once
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 #include <mutex>
+#include <thread>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #include <string>
 #include <vector>
 
@@ -182,6 +187,7 @@ inline std::vector<Pair> g_pairs;
 inline Fit g_fit;
 inline int g_since_fit = 0;   // frames since the last fit
 inline int g_frames = 0;      // frames of pairs collected
+inline int g_fit_runs = 0;    // fits completed (for the log)
 inline double g_lo[3] = {1e9, 1e9, 1e9}, g_hi[3] = {-1e9, -1e9, -1e9};  // wrist positions' extent (m)
 inline std::string g_path;
 
@@ -208,12 +214,28 @@ inline void add(const std::vector<Pair>& pairs, const double wrist[3]) {
     for (int i = 0; i < 3; i++) { g_lo[i] = std::min(g_lo[i], wrist[i]); g_hi[i] = std::max(g_hi[i], wrist[i]); }
     double spread = std::max(g_hi[0] - g_lo[0], std::max(g_hi[1] - g_lo[1], g_hi[2] - g_lo[2]));
     // Enough spread to separate the focal from the position; with many frames, a little less.
-    if (((g_frames >= 8 && spread >= 0.12) || (g_frames >= 30 && spread >= 0.06)) && g_since_fit >= 4) {
+    // The fit runs on its own thread (it takes ~100 ms and would stall the hands): every
+    // 2 s while poor, every 15 s once good.
+    static std::atomic<bool> busy{false};
+    static double last_fit = -1e9;
+    double now = GetTickCount64() / 1000.0;
+    double every = g_cam.fitted && g_fit.ok && g_fit.rms_px < 20 ? 15 : 2;
+    if (((g_frames >= 8 && spread >= 0.12) || (g_frames >= 30 && spread >= 0.06)) && now - last_fit >= every && !busy.exchange(true)) {
+        last_fit = now;
         g_since_fit = 0;
-        Fit info;
+        std::vector<Pair> P = g_pairs;
         Cam trial = g_cam;
-        if (fit(g_pairs, trial, info)) { g_cam = trial; if (!g_path.empty()) save(g_path, g_cam); }
-        g_fit = info;
+        std::thread([P = std::move(P), trial]() mutable {
+            Fit info;
+            bool ok = fit(P, trial, info);
+            {
+                std::lock_guard<std::mutex> l(g_mu);
+                if (ok) { g_cam = trial; if (!g_path.empty()) save(g_path, g_cam); }
+                g_fit = info;
+                g_fit_runs++;
+            }
+            busy = false;
+        }).detach();
     }
 }
 
