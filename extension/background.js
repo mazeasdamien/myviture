@@ -7,6 +7,11 @@ const sites = new Set();
 /** tabId -> where the tab came from, and whether we switched the glasses to 3D */
 const placed = new Map();
 
+// The dashboard's glasses window asks to be fullscreen (no click needed from here).
+chrome.runtime.onMessage.addListener((m, sender) => {
+  if (m?.type === 'fullscreen' && sender.tab) chrome.windows.update(sender.tab.windowId, { state: 'fullscreen' }).catch(() => {});
+});
+
 chrome.runtime.onConnect.addListener(port => {
   if (port.name === 'app') {
     app = port;
