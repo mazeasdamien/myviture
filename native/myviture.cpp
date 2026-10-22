@@ -18,6 +18,7 @@
 #include "calib.hpp"
 #include "hands.hpp"
 #include "rgbcal.hpp"
+#include "roommap.hpp"
 #include "state.hpp"
 
 #include <d3d11.h>
@@ -313,6 +314,15 @@ float4 ps(VSOut i) : SV_Target {
   float k = lit.x > 0.5 ? 0.45 + 0.55 * saturate(dot(normalize(i.n), normalize(float3(0.4, 1.0, 0.6)))) : 1.0;
   return float4(color.rgb * k, 1);
 }
+// Instanced: one small cube per scanned voxel (position and colour per instance, size in lit.y).
+struct VSOutC { float4 pos : SV_Position; float3 n : NORMAL; float3 col : COLOR; };
+VSOutC vs_inst(float3 p : POSITION, float3 n : NORMAL, float3 ip : INSTPOS, float3 ic : INSTCOL) {
+  VSOutC o; o.pos = mul(mvp, float4(p * lit.y + ip, 1)); o.n = mul((float3x3)model, n); o.col = ic; return o;
+}
+float4 ps_inst(VSOutC i) : SV_Target {
+  float k = 0.45 + 0.55 * saturate(dot(normalize(i.n), normalize(float3(0.4, 1.0, 0.6))));
+  return float4(i.col * k, 1);
+}
 )";
 
 static std::vector<Vertex> cube_vertices() {
@@ -357,6 +367,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == VK_OEM_PLUS || wp == VK_ADD) g_app.predict_ms = std::min(60.0f, g_app.predict_ms + 2);
         else if (wp == VK_OEM_MINUS || wp == VK_SUBTRACT) g_app.predict_ms = std::max(0.0f, g_app.predict_ms - 2);
         else if (wp == 'P') g_stats_paused = !g_stats_paused;
+        else if (wp == 'A') g_app.room_request = 1;
         return 0;
     case WM_CLOSE: g_quit = true; return 0;
     case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
@@ -527,6 +538,28 @@ int main(int argc, char** argv) {
     D3D11_INPUT_ELEMENT_DESC il[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
                                      {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0}};
     Com<ID3D11InputLayout> layout; CHECK(dev->CreateInputLayout(il, 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout));
+    // Instanced pipeline for the scanned room.
+    Com<ID3DBlob> vsib, psib;
+    if (FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "vs_inst", "vs_5_0", 0, 0, &vsib, &err)) ||
+        FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "ps_inst", "ps_5_0", 0, 0, &psib, &err))) {
+        fprintf(stderr, "shader: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
+        return 1;
+    }
+    Com<ID3D11VertexShader> vs_inst; CHECK(dev->CreateVertexShader(vsib->GetBufferPointer(), vsib->GetBufferSize(), nullptr, &vs_inst));
+    Com<ID3D11PixelShader> ps_inst; CHECK(dev->CreatePixelShader(psib->GetBufferPointer(), psib->GetBufferSize(), nullptr, &ps_inst));
+    D3D11_INPUT_ELEMENT_DESC ili[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                      {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                                      {"INSTPOS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+                                      {"INSTCOL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 12, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
+    Com<ID3D11InputLayout> layout_inst; CHECK(dev->CreateInputLayout(ili, 4, vsib->GetBufferPointer(), vsib->GetBufferSize(), &layout_inst));
+    const UINT MAX_INST = 120000;
+    Com<ID3D11Buffer> inst_vb;
+    {
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = MAX_INST * 24; bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        CHECK(dev->CreateBuffer(&bd, nullptr, &inst_vb));
+    }
+    UINT inst_count = 0;
+    uint32_t inst_version = 0;
 
     auto make_vb = [&](const std::vector<Vertex>& v, ID3D11Buffer** out) {
         D3D11_BUFFER_DESC bd{}; bd.ByteWidth = (UINT)(v.size() * sizeof(Vertex)); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_IMMUTABLE;
@@ -575,7 +608,11 @@ int main(int argc, char** argv) {
         calib::Rig rig = calib::load(std::string(dir.begin(), dir.end()) + "..\\calibration.bin");
         rgbcal::g_path = std::string(dir.begin(), dir.end()) + "myviture_rgb.txt";
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); if (rgbcal::load(rgbcal::g_path, rgbcal::g_cam)) printf("RGB camera fit loaded\n"); }
-        if (rig.ok) hands::start(dir + L"models\\", rig);
+        if (rig.ok) {
+            hands::start(dir + L"models\\", rig);
+            room::start(rig, [](double t, float* out) { M4 r; if (!engine_pose(t, r)) return false; memcpy(out, r.m, sizeof r.m); return true; },
+                        std::string(dir.begin(), dir.end()) + "myviture_anchors.txt");
+        }
         else { std::lock_guard<std::mutex> l(hands::g_mu); hands::g_result.status = "calibration.bin introuvable (dossier du projet)"; }
     }
     {
@@ -757,6 +794,42 @@ int main(int argc, char** argv) {
             }
         }
 
+        // The scanned room: new voxel snapshot into the instance buffer, planes and anchors.
+        room::g_scan = g_app.scan;
+        if (g_app.room_request) { room::g_request = g_app.room_request; g_app.room_request = 0; }
+        std::vector<room::Plane> planes;
+        std::vector<room::Anchor> anchors;
+        {
+            std::lock_guard<std::mutex> l(room::g.mu);
+            planes = room::g.planes;
+            anchors = room::g.anchors;
+            if (room::g.version != inst_version && !room::g.points.empty()) {
+                inst_version = room::g.version;
+                D3D11_MAPPED_SUBRESOURCE m;
+                if (SUCCEEDED(ctx->Map(inst_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                    inst_count = std::min<UINT>(MAX_INST, (UINT)(room::g.points.size() / 6));
+                    memcpy(m.pData, room::g.points.data(), inst_count * 24);
+                    ctx->Unmap(inst_vb, 0);
+                }
+            }
+        }
+        // Scene <-> tracking frame: recenter is a yaw and a translation, so heights shift by a constant.
+        const M4 recenter_inv = rigid_inverse(recenter);
+        const float y_shift = recenter(1, 3);
+        // Highest surface under a scene point (floor or table), as a scene height; NAN if none.
+        auto surface_under = [&](float sx, float sy, float sz) {
+            float wx = recenter_inv(0, 0) * sx + recenter_inv(0, 1) * sy + recenter_inv(0, 2) * sz + recenter_inv(0, 3);
+            float wy = recenter_inv(1, 0) * sx + recenter_inv(1, 1) * sy + recenter_inv(1, 2) * sz + recenter_inv(1, 3);
+            float wz = recenter_inv(2, 0) * sx + recenter_inv(2, 1) * sy + recenter_inv(2, 2) * sz + recenter_inv(2, 3);
+            float best = NAN;
+            for (auto& p : planes) {
+                if (p.y > wy + 0.05f) continue;
+                if (p.kind == 1 && (wx < p.minx || wx > p.maxx || wz < p.minz || wz > p.maxz)) continue;
+                if (std::isnan(best) || p.y > best) best = p.y;
+            }
+            return std::isnan(best) ? best : best + y_shift;
+        };
+
         UINT bone_count = 0;
         if (!scene_hands.empty()) {
             D3D11_MAPPED_SUBRESOURCE m;
@@ -814,16 +887,43 @@ int main(int argc, char** argv) {
                 ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
                 ctx->Draw(bone_count, 0);
             }
+            // Anchors: small cyan cubes on the real surfaces (tracking frame -> scene).
+            for (auto& a : anchors) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate({a.p[0], a.p[1], a.p[2]})), scale(0.03f)), 0.3f, 1.0f, 1.0f, true);
+            // The scanned room, one small cube per voxel.
+            if (g_app.show_map && inst_count) {
+                Constants c{mul(vpm, recenter), recenter, {1, 1, 1, 1}, {1, room::VOX * 0.7f, 0, 0}};
+                ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                ID3D11Buffer* vbs[] = {cube_vb, inst_vb};
+                UINT strides[] = {sizeof(Vertex), 24}, offsets[] = {0, 0};
+                ctx->IASetInputLayout(layout_inst);
+                ctx->VSSetShader(vs_inst, nullptr, 0);
+                ctx->PSSetShader(ps_inst, nullptr, 0);
+                ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->DrawInstanced((UINT)cube.size(), inst_count, 0, 0);
+                ctx->IASetInputLayout(layout);
+                ctx->VSSetShader(vs, nullptr, 0);
+                ctx->PSSetShader(ps, nullptr, 0);
+            }
             if (!g_app.scene) return;
-            // Eight cubes around the head at arm's length, one ahead at 1 m, floor 1.6 m down.
+            // Eight cubes around the head at arm's length, one ahead at 1 m: resting on the
+            // floor or the table found under them when the room is scanned.
             for (int i = 0; i < 8; i++) {
                 float a = i * 3.14159265f / 4;
                 float hue = i / 8.0f;
                 float r = 0.5f + 0.5f * cosf(6.2832f * hue), g = 0.5f + 0.5f * cosf(6.2832f * (hue - 0.333f)), b = 0.5f + 0.5f * cosf(6.2832f * (hue - 0.667f));
-                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({sinf(a) * 0.9f, 0, -cosf(a) * 0.9f}), scale(0.12f)), r, g, b, true);
+                V3 at = {sinf(a) * 0.9f, 0, -cosf(a) * 0.9f};
+                if (g_app.place_on_planes) { float y = surface_under(at.x, at.y, at.z); if (!std::isnan(y)) at.y = y + 0.06f; }
+                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(at), scale(0.12f)), r, g, b, true);
             }
-            draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate({0, -0.1f, -1.0f}), scale(0.05f)), 1, 1, 1, true);
-            if (g_app.floor_grid) draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, -g_app.floor_m, 0}), 0.3f, 0.7f, 1.0f, false);
+            {
+                V3 at = {0, -0.1f, -1.0f};
+                if (g_app.place_on_planes) { float y = surface_under(at.x, at.y, at.z); if (!std::isnan(y)) at.y = y + 0.025f; }
+                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(at), scale(0.05f)), 1, 1, 1, true);
+            }
+            float floor_y = -g_app.floor_m;
+            for (auto& p : planes) if (p.kind == 0) floor_y = p.y + y_shift;
+            if (g_app.floor_grid) draw(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, translate({0, floor_y, 0}), 0.3f, 0.7f, 1.0f, false);
         };
         if (have) for (int eye = 0; eye < views; eye++) {
             float vw = (float)W / views;
@@ -956,6 +1056,7 @@ int main(int argc, char** argv) {
     printf("stopping...\n");
     // Whatever hangs on the way out (engine, camera, GPU), the process ends.
     CreateThread(nullptr, 0, [](LPVOID) -> DWORD { Sleep(6000); fflush(stdout); TerminateProcess(GetCurrentProcess(), 0); return 0; }, nullptr, 0, nullptr);
+    room::stop();
     hands::stop();
     rgbcam::stop();
     dash::shutdown();

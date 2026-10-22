@@ -23,6 +23,7 @@
 #include "rgbcam.hpp"
 #include "hands.hpp"
 #include "rgbcal.hpp"
+#include "roommap.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -39,7 +40,29 @@ static std::string ini_path;
 
 // Camera images as RGBA textures (ImGui draws a single-channel texture in red).
 struct CamTex { ID3D11Texture2D* tex = nullptr; ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
-static CamTex cams[2], rgb;
+static CamTex cams[2], rgb, depth_tex;
+static void ensure_tex(CamTex& t, int w, int h);
+
+/** The last depth map as a colour image: near warm, far cold, black where unknown. */
+static void update_depth() {
+    std::vector<float> d;
+    { std::lock_guard<std::mutex> l(room::g.mu); d = room::g.depth; }
+    if (d.size() != (size_t)depth::W * depth::H) return;
+    ensure_tex(depth_tex, depth::W, depth::H);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx->Map(depth_tex.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    for (int y = 0; y < depth::H; y++) {
+        uint32_t* row = (uint32_t*)((uint8_t*)m.pData + y * m.RowPitch);
+        for (int x = 0; x < depth::W; x++) {
+            float z = d[y * depth::W + x];
+            if (!(z > 0)) { row[x] = 0xff000000u; continue; }
+            float t = std::clamp((logf(z) - logf(0.2f)) / (logf(4.0f) - logf(0.2f)), 0.0f, 1.0f);
+            int r = (int)(255 * powf(1 - t, 0.8f)), g = (int)(255 * sinf(3.14159f * std::min(1.0f, t * 1.1f)) * 0.85f), b = (int)(255 * t);
+            row[x] = 0xff000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+    ctx->Unmap(depth_tex.tex, 0);
+}
 static uint32_t cam_seq = 0, rgb_seq = 0;
 static std::vector<uint32_t> rgba;
 
@@ -278,6 +301,26 @@ static void build(AppState& s) {
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
     if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; }
     ImGui::Checkbox("Prédire le mouvement des mains", &s.hand_predict);
+    ImGui::SeparatorText("Pièce (scan)");
+    {
+        std::lock_guard<std::mutex> l(room::g.mu);
+        auto& r = room::g;
+        if (!r.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", r.status.c_str());
+        ImGui::Text("%zu voxels · profondeur %.0f/s · %.0f %% mesurés · %.0f ms", r.voxels, r.rate, r.valid_ratio * 100, r.ms);
+        int tables = 0; float floor_y = NAN;
+        for (auto& p : r.planes) { if (p.kind == 0) floor_y = p.y; else tables++; }
+        if (!std::isnan(floor_y)) ImGui::Text("Sol trouvé à %.2f m sous l'origine · %d surface(s) horizontale(s)", -floor_y, tables);
+        else ImGui::TextDisabled("Sol pas encore trouvé : regarde le sol et autour de toi");
+        ImGui::Text("%zu ancre(s)", r.anchors.size());
+    }
+    ImGui::Checkbox("Scanner", &s.scan);
+    ImGui::SameLine();
+    ImGui::Checkbox("Afficher le nuage", &s.show_map);
+    ImGui::SameLine();
+    ImGui::Checkbox("Objets posés sur les surfaces", &s.place_on_planes);
+    if (ImGui::Button("Ancrer là où je regarde (A)")) s.room_request = 1;
+    ImGui::SameLine();
+    if (ImGui::Button("Oublier la pièce")) s.room_request = 2;
     ImGui::EndChild();
 
     // ---- IMU
@@ -325,9 +368,14 @@ static void build(AppState& s) {
         else ImGui::TextDisabled("%s : —", side ? "droite" : "gauche");
     }
     ImGui::EndChild();
-    float avail_w = ImGui::GetContentRegionAvail().x / 2 - ImGui::GetStyle().ItemSpacing.x, avail_h = ImGui::GetContentRegionAvail().y;
-    for (int i = 0; i < 2; i++) {
+    update_depth();
+    float avail_w = ImGui::GetContentRegionAvail().x / 3 - ImGui::GetStyle().ItemSpacing.x, avail_h = ImGui::GetContentRegionAvail().y;
+    for (int i = 0; i < 3; i++) {
         if (i) ImGui::SameLine();
+        if (i == 2) {
+            if (depth_tex.srv) { float kd = std::min(avail_w / depth_tex.w, avail_h / depth_tex.h); ImGui::Image((ImTextureID)(intptr_t)depth_tex.srv, ImVec2(depth_tex.w * kd, depth_tex.h * kd)); }
+            continue;
+        }
         if (!cams[i].srv) { ImGui::Dummy(ImVec2(avail_w, avail_h)); continue; }
         float k = std::min(avail_w / cams[i].w, (ImGui::GetContentRegionAvail().y) / cams[i].h);
         ImVec2 o = ImGui::GetCursorScreenPos();

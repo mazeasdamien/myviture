@@ -30,6 +30,10 @@ struct AppState {
     bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
     bool rgb_reset = false;    // forget the RGB camera fit
     bool smooth_corrections = true;  // blend the engine's visual corrections instead of jumping
+    bool scan = true;            // accumulate the room from the depth maps
+    bool show_map = true;        // draw the scanned room in the glasses
+    bool place_on_planes = true; // rest the test objects on the floor / tables found
+    int room_request = 0;        // 1: anchor at the gaze, 2: forget the room
     bool recenter = true;
     bool quit = false;
     bool snapshot = false;  // save the dashboard as dashboard.png
