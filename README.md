@@ -1,56 +1,88 @@
 # myViture
 
-Application web pour les lunettes **VITURE Luma Ultra**, **sans SDK ni DLL propriétaire** : tout passe par WebUSB et la webcam UVC, avec nos propres pilote, fusion IMU, profondeur stéréo, odométrie 6DoF et rendu stéréo. C'est le successeur de [myXreal](https://github.com/mazeasdamien/myXreal) (C++/ImGui pour XREAL Air 2 Ultra).
+**English** · [Français](#français)
 
-Seule dépendance externe : [MediaPipe](https://github.com/google-ai-edge/mediapipe) (open source, Apache 2.0) pour les mains, avec son modèle téléchargé au premier lancement depuis storage.googleapis.com.
+A technician assistant for the **VITURE Luma Ultra** optical see-through AR glasses: a virtual human who walks in your room, stands on the real floor and shows you where things are, driven by voice or by another program (MCP).
 
-## Lancer
+<p align="center">
+  <img src="docs/images/human-in-room-map.jpg" width="49%" alt="The virtual human in the room's 3D map">
+  <img src="docs/images/room-map-top-view.jpg" width="49%" alt="The room map seen from above">
+</p>
+<p align="center">
+  <img src="docs/images/rgb-view.jpg" width="49%" alt="The glasses' RGB camera view">
+  <img src="docs/images/stereo-depth.jpg" width="49%" alt="Stereo depth: tracking camera, census, SGM">
+</p>
 
-```bash
-npm install
-npm run dev
+## What it does
+
+The native Windows app (`native/`, C++ / Direct3D 11):
+
+- **Head tracking**: 6DoF from VITURE's engine, with our own late latching and rotation timewarp. Side-by-side 3840×1200 at 60 or 90 Hz.
+- **Room map**: GPU stereo depth (census + 8-path SGM) from the two tracking cameras. Depth Anything V2 runs on the RGB camera, scaled by the stereo. Then a voxel map, a mesh for occlusion, the floor and the walkable area.
+- **Virtual human**: Rocketbox character, idle and walk animations, A* paths on the floor seen. It comes to you, wanders, and walks to an object to point at it.
+- **Hands**: skeleton from VITURE's hand tracking, predicted to the display. Three cubes fall on the scanned surfaces and can be grabbed and thrown.
+- **Objects and voice**: name what you look at (« scan drill »), then ask « where is the drill? ». Speech goes to Whisper through the lab's Orange gateway.
+- **MCP server** (JSON-RPC over HTTP): room, user, human, markers, robot-frame calibration, so a robot's MCP can orchestrate it.
+- **Recording**: MP4 of the RGB camera with the virtual content over it. A dashboard (Dear ImGui) shows RGB, 3D and diagnostics views.
+
+The first version, a WebUSB web app with its own USB driver, is in `src/`. It is documented in [docs/web-app.md](docs/web-app.md), with the decoded USB protocol.
+
+## Status
+
+Work on the PC version stopped in October 2026. The next step is a standalone version on the VITURE neckband (Unity SDK).
+
+## Build and run
+
+Windows 11, Visual Studio 2026 (C++), and VITURE SpaceWalker installed (the app loads its `carina_vio.dll`, not included here). Glasses connected, display set to Extend (Win+P).
+
+```bat
+native\fetch_deps.bat
+native\build.bat
+native\myviture.exe
 ```
 
-Ouvrir **http://localhost:5180 dans Chrome ou Edge** (WebUSB nécessaire), puis « Connecter les lunettes ». Fermer SpaceWalker et arrêter le service « VitureXrRuntime » avant : un seul programme peut ouvrir le port USB des lunettes à la fois. Pour la scène 3D, les lunettes doivent être un écran séparé (Win+P → Étendre).
+`fetch_deps.bat` downloads ONNX Runtime, DirectML, the hand and Depth Anything models, and bakes the human. Voice commands need `.env.local` at the repository root with `ORANGE_GATEWAY` and `ORANGE_PROXY_SECRET`. It is never committed.
+
+## Credits
+
+Microsoft Rocketbox avatars (MIT), Depth Anything V2 Small (Apache 2.0), ONNX Runtime and DirectML (MIT), Dear ImGui (MIT), MediaPipe hand models via opencv_zoo (Apache 2.0). VITURE's runtime is proprietary and not part of this repository.
+
+---
+
+## Français
+
+Un assistant pour technicien sur les lunettes de réalité augmentée **VITURE Luma Ultra** (optique transparente). Un humain virtuel marche dans ta pièce, se tient sur le vrai sol et te montre où sont les choses. On le pilote à la voix ou par un autre programme (MCP).
 
 ## Ce que fait l'appli
 
-- **Tête** : orientation 3DoF (filtre de Mahony sur l'IMU à 1000 Hz, calibration d'usine, biais gyro suivi à l'arrêt), position 6DoF par odométrie stéréo et IMU, recentrage et mise à niveau.
-- **Caméras de suivi** : stéréo 640×480 à 25 i/s, exposition automatique ou manuelle.
-- **Profondeur** : rectification, census 5×5, volume de coûts agrégé, contrôle gauche-droite et filtre anti-taches sur GPU (WebGL2), environ 8 cartes/s ; occlusion du virtuel par le réel (option).
-- **Mains** : MediaPipe sur les deux caméras de suivi, articulations triangulées en 3D et lissées (filtre One Euro), pincement. Source RGB possible.
-- **Caméra RGB** : 1920×1080 à 30 i/s, photo, vidéo WebM. Case « MR » : la scène 3D vue depuis la caméra RGB est superposée au flux (vue à la première personne), et l'enregistrement capture le mélange.
-- **Scène 3D** : passe les lunettes en 3840×1200 (3D côte à côte) par USB et ouvre une fenêtre dédiée posée sur leur écran (clic ou F11 pour le plein écran), rendu par œil. Contenu proche et lumineux, adapté à la vision directe. Pincer près d'un cube pour l'attraper, ou viser de loin et pincer. `R` recentre, `S` bascule mono/stéréo, Échap quitte (et repasse les lunettes en 2D). Un personnage animé se tient à 2 m (Rocketbox, MIT) : `1` repos, `2` parler, `3` écouter (en boucle), `4` saluer, `5` hausser les épaules, `6` réfléchir, `7` applaudir (une fois, puis retour à la boucle).
-- **Affichage** : champ vertical (28,15° par défaut), écart des yeux, position des yeux, inclinaison, prédiction de la tête par le gyroscope (30 ms par défaut), test d'ancrage avec des poteaux tous les 15° à 2 m.
-- **Mains** : placées dans le repère du monde avec la pose de la tête à l'instant de l'image, puis extrapolées à l'instant d'affichage.
+L'application Windows native (`native/`, C++ / Direct3D 11) :
 
-## Architecture
+- **Suivi de la tête** : 6DoF par le moteur de VITURE, avec notre late latching et notre timewarp en rotation. Côte à côte 3840×1200 à 60 ou 90 Hz.
+- **Carte de la pièce** : profondeur stéréo sur GPU (census + SGM sur 8 directions) depuis les deux caméras de suivi. Depth Anything V2 tourne sur la caméra RGB, mis à l'échelle par la stéréo. Ensuite une carte de voxels, un maillage pour l'occlusion, le sol et la zone marchable.
+- **Humain virtuel** : personnage Rocketbox, animations de repos et de marche, chemins A* sur le sol vu. Il vient vers toi, se promène, et va jusqu'à un objet pour le montrer du bras.
+- **Mains** : squelette issu du suivi des mains de VITURE, prédit jusqu'à l'affichage. Trois cubes tombent sur les surfaces scannées ; on les attrape et on les lance.
+- **Objets et voix** : nommer ce qu'on regarde (« scan perceuse »), puis demander « où est la perceuse ? ». La parole part à Whisper par la passerelle Orange du labo.
+- **Serveur MCP** (JSON-RPC sur HTTP) : pièce, porteur, humain, repères, calage sur le repère du robot, pour être orchestré par le MCP d'un robot.
+- **Enregistrement** : MP4 de la caméra RGB avec le virtuel par-dessus. Un tableau de bord (Dear ImGui) montre les vues RGB, 3D et diagnostics.
 
-Trois Web Workers pour que l'affichage ne bloque jamais les flux USB :
+La première version, une application web WebUSB avec son propre pilote USB, est dans `src/`. Elle est décrite dans [docs/web-app.md](docs/web-app.md), avec le protocole USB décodé.
 
-| Thread | Rôle |
-| --- | --- |
-| page ([src/main.ts](src/main.ts)) | tableau de bord, scène 3D (three.js), caméra RGB |
-| [device.worker](src/workers/device.worker.ts) | WebUSB, IMU, orientation, position inertielle, exposition auto |
-| [vision.worker](src/workers/vision.worker.ts) | profondeur stéréo (GPU), odométrie, plans |
-| [hands.worker](src/workers/hands.worker.ts) | MediaPipe, triangulation des mains |
+## État
 
-## Protocole USB (35ca:1104)
+Le travail sur la version PC s'est arrêté en octobre 2026. La suite : une version autonome sur le neckband VITURE (SDK Unity).
 
-Décodé à partir de captures USB ; détails dans [src/device/protocol.ts](src/device/protocol.ts) et [src/device/mcu.ts](src/device/mcu.ts).
+## Compiler et lancer
 
-| Endpoint | Contenu |
-| --- | --- |
-| `0x81` interrupt | IMU, 1000 Hz, 28 octets : compteur, horodatage (100 µs), gyro ±2000 °/s, accél ±4 g, température |
-| `0x82` bulk | caméras gauche/droite 640×480, tranches de 16 Kio (en-tête `aa 8f`), plus des points caractéristiques calculés par l'appareil |
-| `0x83` interrupt | vsync de l'écran, 60 Hz |
-| `0x04` / `0x85` bulk | commandes `fa 55 <cmd> <flag> <len> …` : `0x95` démarrer, `0x94` arrêter, `0x90` exposition, `0x92` gain, `0xed` série, `0x80` firmware, `0xe4`/`0xe5` calibration d'usine (protobuf) |
-| `0x06` / `0x87` bulk | messages MCU de 512 octets (`ff fe`, CRC-16/XMODEM) : `8` = mode d'affichage (`0x41` 2D 1920×1200, `0x42` 3D 3840×1200), luminosité, volume |
+Windows 11, Visual Studio 2026 (C++) et VITURE SpaceWalker installé (l'appli charge son `carina_vio.dll`, absent de ce dépôt). Lunettes branchées, affichage en mode Étendre (Win+P).
 
-## Outils
+```bat
+native\fetch_deps.bat
+native\build.bat
+native\myviture.exe
+```
 
-- `npm run probe [s]` : teste le pilote WebUSB depuis Node (débits IMU et caméras, sauvegarde de la calibration et d'une image).
-- `npx tsx tools/calib.ts` : affiche la calibration décodée.
-- `npx tsx tools/rig.ts` : vérifie la géométrie stéréo (projection puis triangulation).
-- `npx tsx tools/exposure.ts` : vérifie l'effet des commandes d'exposition et de gain.
-- `npx tsx tools/display3d.ts` : passe les lunettes en 3D puis en 2D.
+`fetch_deps.bat` télécharge ONNX Runtime, DirectML, les modèles des mains et de Depth Anything, et prépare l'humain. Les commandes vocales demandent un `.env.local` à la racine du dépôt avec `ORANGE_GATEWAY` et `ORANGE_PROXY_SECRET`. Ce fichier n'est jamais commité.
+
+## Crédits
+
+Avatars Microsoft Rocketbox (MIT), Depth Anything V2 Small (Apache 2.0), ONNX Runtime et DirectML (MIT), Dear ImGui (MIT), modèles des mains MediaPipe via opencv_zoo (Apache 2.0). Le runtime de VITURE est propriétaire et ne fait pas partie de ce dépôt.

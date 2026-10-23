@@ -25,6 +25,37 @@ import struct
 
 import numpy as np
 
+
+def white_shirt(path, head=False):
+    """The polo, black in the Rocketbox texture, made white (its folds kept, the logo too):
+    the torso panel and the two sleeve bands of the body atlas, where the cloth is dark grey;
+    in the head atlas, the collar's inside under the neck (not the eyes and teeth corner)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print('PIL missing: the shirt stays black')
+        return
+    im = np.asarray(Image.open(path).convert('RGB')).astype(np.float32)
+    h, w = im.shape[:2]
+    mask = np.zeros((h, w), bool)
+    if head:
+        mask[int(0.55 * h):, :] = True
+        mask[int(0.58 * h):, :int(0.37 * w)] = False                             # eyes, teeth
+    else:
+        mask[int(0.02 * h):int(0.85 * h), int(0.32 * w):int(0.68 * w)] = True   # torso, front and back
+        mask[int(0.45 * h):int(0.62 * h), :int(0.31 * w)] = True                # left sleeve
+        mask[int(0.45 * h):int(0.62 * h), int(0.69 * w):] = True                # right sleeve
+    mx, mn = im.max(2), im.min(2)
+    cloth = mask & (mx < 90) & (mx - mn < 25)
+    lum = im.mean(2)
+    ref = np.median(lum[cloth]) if cloth.any() else 30.0
+    v = np.clip(232 + (lum - ref) * 1.5, 205, 248)  # folds kept, the weave's seams faint
+    out = im.copy()
+    for c in range(3):
+        out[..., c] = np.where(cloth, v, im[..., c])
+    Image.fromarray(out.astype(np.uint8)).save(path, quality=92)
+    print('shirt made white:', int(cloth.sum()), 'pixels')
+
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 SRC = os.path.join(ROOT, 'public', 'models', 'human.glb')
 IDLE = os.path.join(ROOT, 'public', 'models', 'anims', 'idle.glb')
@@ -112,47 +143,67 @@ mesh_node = next(i for i, nd in enumerate(nodes) if 'mesh' in nd)
 G0 = globals_of(rest)
 mesh_inv = np.linalg.inv(G0[mesh_node])
 
-# The idle clip, by node name.
-agl, ABIN = load(IDLE)
-anim = agl['animations'][0]
+# A clip, by node name, sampled at FPS: per frame, every node's local TRS.
 by_name = {n: i for i, n in enumerate(names)}
-tracks = []  # (node, path, times, values)
-tmax = 0
-for ch in anim['channels']:
-    tn = agl['nodes'][ch['target']['node']].get('name', '')
-    # Bones only, as the web app does: the clip's root (Bip01) carries Blender's own
-    # scale and offset, which would make the body 100 times too big.
-    if tn not in by_name or by_name[tn] not in joints:
-        continue
-    smp = anim['samplers'][ch['sampler']]
-    times = accessor(agl, ABIN, smp['input'])[:, 0]
-    vals = accessor(agl, ABIN, smp['output'])
-    tracks.append((by_name[tn], ch['target']['path'], times, vals))
-    tmax = max(tmax, float(times[-1]))
-F = max(1, int(round(tmax * FPS)))
-frames = []
-for f in range(F):
-    t = f / FPS
-    local = [list(map(list, r)) for r in rest]
-    for node, path, times, vals in tracks:
-        k = int(np.searchsorted(times, t, side='right')) - 1
-        if k < 0: v = vals[0]
-        elif k >= len(times) - 1: v = vals[-1]
-        else:
-            u = (t - times[k]) / max(1e-9, times[k + 1] - times[k])
-            v = slerp(vals[k], vals[k + 1], u) if path == 'rotation' else vals[k] + u * (vals[k + 1] - vals[k])
-        idx = {'translation': 0, 'rotation': 1, 'scale': 2}.get(path)
-        if idx is not None: local[node][idx] = list(map(float, v))
-    frames.append(local)
+def sample_clip(path):
+    agl, ABIN = load(path)
+    anim = agl['animations'][0]
+    tracks = []  # (node, path, times, values)
+    tmax = 0
+    for ch in anim['channels']:
+        tn = agl['nodes'][ch['target']['node']].get('name', '')
+        # Bones only, as the web app does: the clip's root (Bip01) carries Blender's own
+        # scale and offset, which would make the body 100 times too big.
+        if tn not in by_name or by_name[tn] not in joints:
+            continue
+        smp = anim['samplers'][ch['sampler']]
+        times = accessor(agl, ABIN, smp['input'])[:, 0]
+        vals = accessor(agl, ABIN, smp['output'])
+        tracks.append((by_name[tn], ch['target']['path'], times, vals))
+        tmax = max(tmax, float(times[-1]))
+    t0 = min(float(t[0]) for _, _, t, _ in tracks)
+    F = max(1, int(round((tmax - t0) * FPS)))
+    frames = []
+    for f in range(F):
+        t = t0 + f / FPS
+        local = [list(map(list, r)) for r in rest]
+        for node, path, times, vals in tracks:
+            k = int(np.searchsorted(times, t, side='right')) - 1
+            if k < 0: v = vals[0]
+            elif k >= len(times) - 1: v = vals[-1]
+            else:
+                u = (t - times[k]) / max(1e-9, times[k + 1] - times[k])
+                v = slerp(vals[k], vals[k + 1], u) if path == 'rotation' else vals[k] + u * (vals[k + 1] - vals[k])
+            idx = {'translation': 0, 'rotation': 1, 'scale': 2}.get(path)
+            if idx is not None: local[node][idx] = list(map(float, v))
+        frames.append(local)
+    return frames
+
+frames = sample_clip(IDLE)
+F = len(frames)
+WALK = os.path.join(ROOT, 'public', 'models', 'anims', 'walk.glb')
+walk = sample_clip(WALK) if os.path.exists(WALK) else []
 
 # Forward: heel (foot) -> toe, level, at rest.
 def pos(G, name): return G[by_name[name]][:3, 3]
 fwd = (pos(G0, 'Bip01 L Toe0') - pos(G0, 'Bip01 L Foot')) + (pos(G0, 'Bip01 R Toe0') - pos(G0, 'Bip01 R Foot'))
 fwd[1] = 0; fwd /= np.linalg.norm(fwd)
 foot_y = min(pos(G0, 'Bip01 L Toe0')[1], pos(G0, 'Bip01 R Toe0')[1])
+stride = 0.0
+if walk:
+    Gs = [globals_of([tuple(map(list, r)) for r in fr]) for fr in walk]
+    speeds = []
+    for k in range(len(Gs)):
+        a, b = Gs[k], Gs[(k + 1) % len(Gs)]
+        side = 'L' if pos(a, 'Bip01 L Foot')[1] < pos(a, 'Bip01 R Foot')[1] else 'R'
+        d = pos(b, 'Bip01 %s Foot' % side) - pos(a, 'Bip01 %s Foot' % side)
+        speeds.append(-float(np.dot(d, fwd)) * FPS)
+    v = float(np.median(speeds))
+    stride = v * len(walk) / FPS
+    print('walk', len(walk), 'frames, planted foot back at', round(v, 3), 'm/s, stride per cycle', round(stride, 3), 'm')
 
 os.makedirs(OUT, exist_ok=True)
-out = bytearray(b'MVHU' + struct.pack('<I', 1))
+out = bytearray(b'MVHU' + struct.pack('<I', 2))
 out += struct.pack('<I', N)
 for i in range(N):
     t, r, s = rest[i]
@@ -176,6 +227,8 @@ for p in prims:
     fname = 'human_' + mat.get('name', 'part').split('_')[-1] + '.' + ext
     bv = gl['bufferViews'][img['bufferView']]
     open(os.path.join(OUT, fname), 'wb').write(BIN[bv.get('byteOffset', 0):bv.get('byteOffset', 0) + bv['byteLength']])
+    if fname.startswith('human_body') or fname.startswith('human_head'):
+        white_shirt(os.path.join(OUT, fname), head=fname.startswith('human_head'))
     alpha = 1 if mat.get('alphaMode') == 'MASK' else 0
     out += struct.pack('<III', len(P), len(I), alpha) + fname.encode().ljust(32, b'\0')
     for k in range(len(P)):
@@ -187,6 +240,11 @@ for local in frames:
     for t, r, s in local:
         out += struct.pack('<3f4f3f', *t, *r, *s)
 out += struct.pack('<3ff', *fwd, foot_y)
+# version 2: the walk cycle (looping), and the distance it covers per cycle
+out += struct.pack('<fIf', FPS, len(walk), stride)
+for local in walk:
+    for t, r, s_ in local:
+        out += struct.pack('<3f4f3f', *t, *r, *s_)
 open(os.path.join(OUT, 'human.bin'), 'wb').write(out)
 print('nodes', N, 'joints', len(joints), 'idle frames', F, 'forward', fwd, 'foot height', foot_y, 'bytes', len(out))
 for nm in ['Bip01', 'Bip01 Pelvis', 'Bip01 L Thigh', 'Bip01 L Calf', 'Bip01 L Foot', 'Bip01 L UpperArm', 'Bip01 Head']:

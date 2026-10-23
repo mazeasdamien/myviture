@@ -253,7 +253,8 @@ inline void stop() {
     if (g_feeder.joinable()) g_feeder.join();
     api.reg(nullptr, nullptr, nullptr, nullptr);
     api.stop();
-    api.uninit();
+    // No gesture_uninit: its inference thread still runs a frame after gesture_stop, and
+    // freeing under it crashed the exit (139). The process ends next; that frees it.
     if (g_raw) { fclose(g_raw); g_raw = nullptr; }
 }
 

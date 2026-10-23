@@ -19,10 +19,10 @@ copy /y "%TMPD%\dml\LICENSE.txt" third_party\directml >nul
 set ZOO=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models
 curl -sL -o models\palm_detection_mediapipe_2023feb.onnx %ZOO%/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx || exit /b 1
 curl -sL -o models\handpose_estimation_mediapipe_2023feb.onnx %ZOO%/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx || exit /b 1
-rem SegFormer-B0 ADE20K (NVIDIA, research licence), ONNX export by Xenova: the room's categories.
-rem Its labels.txt and configs are kept in git.
-set HF=https://huggingface.co/Xenova/segformer-b0-finetuned-ade-512-512/resolve/main
-curl -sL -o models\segformer\model.onnx %HF%/onnx/model.onnx || exit /b 1
+rem Depth Anything V2 Small (Apache 2.0), int8 ONNX by onnx-community: dense depth from the RGB camera.
+mkdir models\depthanything 2>nul
+curl -sL -o models\depthanything\model.onnx https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx || exit /b 1
+rem The Rocketbox walk (MIT): public/models/anims/walk.glb is kept in git; tools/avatar/anims.py made it.
 rem The virtual human for the native app, from public/models (Python + numpy).
 python ..\tools\avatar\bake_native.py || echo bake_native.py failed: the human will be missing
 rmdir /s /q "%TMPD%"

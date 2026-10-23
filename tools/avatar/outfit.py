@@ -1,6 +1,7 @@
 # Outfit painted into the Rocketbox m002 body texture: black polo with the Orange logo on
-# the left chest, grey trousers instead of the khaki shorts, white sneakers.
-# Coordinates are pixels of the 2048x2048 atlas; the right leg mirrors the left one.
+# the left chest, grey trousers instead of the khaki shorts, white sneakers. Also darkens
+# the hair painted on the scalp in the head texture.
+# Coordinates are pixels of the 2048x2048 atlases; the right leg mirrors the left one.
 import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -56,19 +57,21 @@ shorts = rect(0, 505, 0, 640, mirror=True) & ~bg
 shin = (rect(505, 885, 0, 640, mirror=True) & ~bg & ~torso) | (rect(885, 960, 0, 640, mirror=True) & skin)
 cloth_shade = np.clip(lum / np.median(lum[shorts]), 0.45, 1.45)
 cloth = GREY[None, None, :] * cloth_shade[..., None]  # grey cloth, folds of the shorts
-form_all = closing(lum, 41)
-for side in (0, 1):
-    # Mirrored views put either leg at columns 0..625; writes go through to `cloth`.
-    c = cloth[:, ::-1] if side else cloth
-    f = form_all[:, ::-1] if side else form_all
-    # The shorts body (rows 0..440) stays; its turned-up hem (440..505) and the shin
-    # (505..960) get cloth from the middle of the shorts, stretched over that height,
-    # cross-faded over 40 rows so the join does not show.
-    patch = Image.fromarray(np.clip(c[150:430, 0:575], 0, 255).astype(np.uint8)).resize((640, 960 - 400), Image.BICUBIC)
-    form = np.clip(f[400:960, 0:640] / np.median(f[400:960, 0:640]), 0.8, 1.15)  # the leg's baked shading
-    filled = np.asarray(patch).astype(np.float32) * form[..., None]
-    t = np.clip((np.arange(400, 960) - 400) / 40, 0, 1)[:, None, None]
-    c[400:960, 0:640] = c[400:960, 0:640] * (1 - t) + filled * t
+# Below row 430 the cloth continues the shorts downwards, read back up through them and
+# bouncing between rows 430 and 150 (the clean middle, away from pocket and hem). The
+# columns line up between the two islands (front ~450, back ~150), and the shorts' last
+# visible row (470) and the first visible shin row (588) read the same source row, so
+# the leg reads as one piece of cloth across the knee. Shin rows are ~4% denser.
+def source_row(offset):
+    t = np.mod(offset, 560)
+    return np.rint(430 - np.where(t > 280, 560 - t, t)).astype(int)
+rows = np.arange(430, 960)
+offset = np.where(rows < 505, rows - 430, 40 + (rows - 588) * 0.96)
+cloth[430:960] = cloth[source_row(offset)]
+# The shin islands are wider than the shorts (to column 620 against 555): mirror the
+# last cloth columns over the padding streaks there.
+for c in (cloth, cloth[:, ::-1]):
+    c[430:960, 555:640] = c[430:960, 554:469:-1]
 trousers = shorts | shin
 out[trousers] = cloth[trousers]
 # Ankle showing at the shoe opening: same cloth, a shade darker, as if tucked in.
@@ -89,3 +92,17 @@ rough[..., 1][shoes] = 170
 rough[ys, xs, 1] = 200
 Image.fromarray(rough).resize((1024, 1024), Image.LANCZOS).save(f'{tex}/body_rough.jpg', quality=90)
 print('polo', polo.sum(), 'trousers', trousers.sum(), 'shoes', shoes.sum(), 'ankle', ankle.sum())
+
+# ---- scalp (head texture): the hair painted on the scalp sits under the hair cards and
+# faces up, so it caught more light than the cards and read as a pale shell over the
+# head. Darken it as hair in the cards' shade, fading at the edges; the face is left alone.
+head = np.asarray(Image.open(f'{src}/m002_head_color.tga').convert('RGB')).astype(np.float32)
+hr, hg, hb = head[..., 0], head[..., 1], head[..., 2]
+hl = 0.299 * hr + 0.587 * hg + 0.114 * hb
+scalp = (hl < 95) & (hr > hb + 6)
+scalp[1000:] = False            # eyes, mouth and teeth below
+scalp[380:1000, 760:1290] = False  # face: eyebrows, lashes
+soft = np.asarray(Image.fromarray((scalp * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(6))).astype(np.float32) / 255
+head *= (1 - 0.45 * soft)[..., None]
+Image.fromarray(np.clip(head, 0, 255).astype(np.uint8)).save(f'{tex}/head_color.jpg', quality=92)
+print('scalp', scalp.sum())

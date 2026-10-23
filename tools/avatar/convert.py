@@ -21,10 +21,11 @@ def widen_shins(o):
 
     The shin vertices (body faces whose UVs fall in the shin islands, below the knee)
     are pushed away from each leg's axis to at least a straight profile: 6.2 cm at 20 cm
-    up to 7.2 cm at 45 cm and above, which stays inside the shorts' hem (8.5 to 9 cm),
-    then back towards the ankle inside the shoe. The flared hem of the shorts is pulled
-    in to 7.8 cm so the leg goes straight past the knee. Same offset on every shape key,
-    so the face keys stay relative.
+    up to 7.6 cm at 44 cm, then back towards the ankle inside the shoe; above the hem
+    (47 cm) they stay put, inside the shorts, which are not round higher up. The
+    flared, uneven hem of the shorts is made round at 7.8 cm, fading out by 62 cm, so the
+    shorts end 2 mm outside the shin and the leg goes straight past the knee. Same offset
+    on every shape key, so the face keys stay relative.
     """
     import math
     from mathutils import Vector
@@ -63,7 +64,8 @@ def widen_shins(o):
             dx, dy = p.x - ax(p.z), p.y - ay(p.z)
             r = math.hypot(dx, dy)
             if r < 1e-4: continue
-            if p.z >= 0.2: target = max(r, 0.062 + (0.072 - 0.062) * min(1, (p.z - 0.2) / 0.25))
+            if p.z >= 0.47: continue
+            if p.z >= 0.2: target = max(r, 0.062 + (0.076 - 0.062) * min(1, (p.z - 0.2) / 0.24))
             else: target = max(r, r * 1.1 + (0.062 - r * 1.1) * max(0, (p.z - 0.12) / 0.08))
             if target <= r: continue
             move(i, dx, dy, r, target)
@@ -73,9 +75,9 @@ def widen_shins(o):
             if p.x * side <= 0: continue
             dx, dy = p.x - ax(p.z), p.y - ay(p.z)
             r = math.hypot(dx, dy)
-            if r <= 0.078: continue
+            if r < 1e-4: continue
             w = min(1, max(0, (0.62 - p.z) / 0.12))  # full at the hem, nothing from 62 cm up
-            move(i, dx, dy, r, r - (r - 0.078) * w)
+            move(i, dx, dy, r, r + (0.078 - r) * w)
             moved += 1
     print('SHINS', len(shin), 'HEM', len(hem), 'moved', moved)
 

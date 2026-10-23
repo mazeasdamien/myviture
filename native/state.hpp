@@ -40,6 +40,7 @@ struct AppState {
     bool engine_predict = true;
     float vfov = 28.147f;   // per-eye vertical field, degrees
     float ipd_mm = 63.0f;
+    float ipd_adj_mm = 0;      // added to the engine's eyes' separation: the virtual's depth (more: nearer and smaller)
     float floor_m = 1.6f;   // floor below the eyes
     float pitch_deg = 0;    // display tilt about x: objects too high -> lower it
     bool display_from_rgb = false; // the display takes the RGB camera's fitted orientation (superseded by the engine's eyes)
@@ -57,7 +58,7 @@ struct AppState {
     bool shadows = true;       // contact shadows under virtual objects and hands (RGB view)
     bool camera_look = true;   // the RGB view's virtual softened and grained like the camera
     float room_level = 0;      // the room's mean luminance (0..1), for the dashboard
-    bool panel = true;         // the test text panel in front of the wearer
+    bool panel = false;         // the test text panel in front of the wearer
     bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
     float rgb_latency_ms = 50; // an RGB frame's age when it arrives: the virtual is drawn for that moment
     int rec_request = 0;       // 1: start recording the RGB view, 2: stop
@@ -67,14 +68,20 @@ struct AppState {
     bool rgb_reset = false;    // forget the RGB camera fit
     bool smooth_corrections = true;  // blend the engine's visual corrections instead of jumping
     bool scan = true;            // accumulate the room from the depth maps
+    bool voice = true;           // voice commands (Orange's Whisper)
     bool show_map = false;       // draw the room as thin lines: floor-wall seams, wall edges, tables, walkable area
     bool show_mesh = false;      // draw the clutter mesh (debug: it fills the view)
     // The virtual human: shown, wandering on its own; requests from the dashboard or the MCP.
     bool human = true;
     bool human_wander = true;
+    float human_height = 1.72f;  // the human's height (m; the model's own: 1.72)
+    int cubes_request = 0;     // 1: three new cubes in front of the wearer
     int human_request = 0;       // 1: come in front of me, 2: go to human_target (tracking frame)
     float human_target[2] = {0, 0};
     std::string human_state;     // (written) what it is doing
+    int show_request = 0;        // an anchor's id: the human goes and points at it
+    std::string anchor_label;    // the name for the next anchor (room_request 1)
+    bool aiming = false;         // a name is being typed: the aiming dot in the glasses
     float human_pos[3] = {0, 0, 0};  // (written) tracking frame, on the floor
     bool occlusion = true;       // real surfaces (the room mesh) hide the virtual behind them
     bool place_on_planes = true; // rest the test objects on the floor / tables found
@@ -85,7 +92,12 @@ struct AppState {
     int tab_request = -1;   // tests: 0 shows the RGB view tab, 1 the diagnostics
     std::string notice;     // shown in the top bar for a few seconds
     double notice_until = 0;
-    int display_request = 0;  // 2 or 3: switch the glasses to that mode
+    int display_request = 0;  // 2 or 3: switch the glasses to that mode; 4: 3D at 90 Hz
+    int screen_hz = 0;        // (written) the glasses' refresh rate, from Windows
+    float vsync_hz = 0;       // (written) the engine's vsync callback rate
+    int brightness = 4, brightness_request = -1;  // the screen's level, 0..8
+    bool film_dark = false; int film_request = -1;
+    bool expo_fixed = false; int expo_request = -1;  // the tracking cameras' exposure
 
     // ---- written by the renderer
     std::string serial;
@@ -101,7 +113,7 @@ struct AppState {
     float v3_yaw = 0.6f, v3_pitch = 0.6f, v3_dist = 5.0f;   // orbit around the target (rad, m)
     float v3_target[3] = {0, 0, 0};    // tracking frame
     bool v3_follow = true;             // target = the head
-    bool v3_voxels = true, v3_evidence = false, v3_live = true, v3_planes = true, v3_walk = true, v3_mesh = false, v3_trail = true;
+    bool v3_voxels = true, v3_evidence = false, v3_live = false, v3_planes = true, v3_walk = true, v3_mesh = false, v3_trail = true, v3_dense = true;
     int mr_w = 0, mr_h = 0;
     std::vector<float> shake_history;    // deg per frame, newest last
     std::vector<float> latency_history;  // pose -> vblank, ms

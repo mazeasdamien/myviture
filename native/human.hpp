@@ -98,6 +98,9 @@ struct Model {
     uint32_t frames = 0;
     std::vector<TRS> clip;           // frames x nodes
     float fwd[3] = {0, 0, 1}, foot_y = 0;
+    uint32_t walk_frames = 0;        // the walk cycle (version 2): frames x nodes
+    float walk_fps = 30, walk_stride = 0;  // metres covered per cycle
+    std::vector<TRS> walk;
     int find(const char* n) const { for (size_t i = 0; i < names.size(); i++) if (names[i] == n) return (int)i; return -1; }
 };
 
@@ -111,7 +114,9 @@ inline bool load_model(const std::string& path, Model& m, std::string& err) {
     auto u32 = [&]() { uint32_t v; rd(&v, 4); return v; };
     try {
         char magic[4]; rd(magic, 4);
-        if (memcmp(magic, "MVHU", 4) || u32() != 1) { err = "human.bin : format inconnu"; return false; }
+        if (memcmp(magic, "MVHU", 4)) { err = "human.bin : format inconnu"; return false; }
+        uint32_t version = u32();
+        if (version < 1 || version > 2) { err = "human.bin : version inconnue"; return false; }
         uint32_t N = u32();
         m.parent.resize(N); m.rest.resize(N); m.names.resize(N);
         for (uint32_t i = 0; i < N; i++) {
@@ -136,6 +141,11 @@ inline bool load_model(const std::string& path, Model& m, std::string& err) {
         m.clip.resize((size_t)m.frames * N);
         for (auto& t : m.clip) { rd(t.t, 12); rd(t.r, 16); rd(t.s, 12); }
         rd(m.fwd, 12); rd(&m.foot_y, 4);
+        if (version >= 2) {
+            rd(&m.walk_fps, 4); m.walk_frames = u32(); rd(&m.walk_stride, 4);
+            m.walk.resize((size_t)m.walk_frames * N);
+            for (auto& t : m.walk) { rd(t.t, 12); rd(t.r, 16); rd(t.s, 12); }
+        }
     } catch (...) { err = "human.bin tronqué"; return false; }
     if (m.joint_node.size() > MAX_BONES) { err = "trop d'os"; return false; }
     // Parents before children.
@@ -206,7 +216,7 @@ struct Renderer {
     struct CB { Mat vp, model; float tint[4], opt[4]; Mat bones[MAX_BONES]; };
     CB cbuf{};
     // Indices of the bones the walk moves.
-    int thigh[2], calf[2], foot[2], uarm[2], farm[2], pelvis, spine;
+    int thigh[2], calf[2], foot[2], uarm[2], farm[2], hand[2], pelvis, spine;
 
     bool init(ID3D11Device* dev, ID3D11DeviceContext* ctx, const std::wstring& dir) {
         std::string d8(dir.begin(), dir.end());
@@ -249,6 +259,7 @@ struct Renderer {
             snprintf(n, sizeof n, "Bip01 %s Foot", side[s]); foot[s] = model.find(n);
             snprintf(n, sizeof n, "Bip01 %s UpperArm", side[s]); uarm[s] = model.find(n);
             snprintf(n, sizeof n, "Bip01 %s Forearm", side[s]); farm[s] = model.find(n);
+            snprintf(n, sizeof n, "Bip01 %s Hand", side[s]); hand[s] = model.find(n);
         }
         pelvis = model.find("Bip01 Pelvis"); spine = model.find("Bip01 Spine");
         ok = vs && ps && layout && cb;
@@ -257,9 +268,10 @@ struct Renderer {
 
     /**
      * Bone matrices for the idle clip at time t, with the walk laid over it: gait phase
-     * (radians, one full cycle = two steps) and how much of the walk (0..1).
+     * (radians, one full cycle = two steps) and how much of the walk (0..1). aim: a point in
+     * the model's frame (m) the right arm points at, by aim_w (0..1).
      */
-    void pose(double t, double phase, float walk, Mat out_nodes_global[]) {
+    void pose(double t, double phase, float walk, Mat out_nodes_global[], const float* aim = nullptr, float aim_w = 0) {
         size_t N = model.parent.size();
         std::vector<TRS> local(N);
         double ft = std::fmod(t * model.fps, (double)std::max(1u, model.frames));
@@ -272,10 +284,27 @@ struct Renderer {
             for (int k = 0; k < 3; k++) { local[i].t[k] = a.t[k] + u * (b.t[k] - a.t[k]); local[i].s[k] = a.s[k] + u * (b.s[k] - a.s[k]); }
             slerp(a.r, b.r, u, local[i].r);
         }
-        // Walk deltas, as rotations in the model's frame (x: the character's left, y up,
-        // z forward) about each joint. A leg swings forward with a negative angle about x.
+        // The Rocketbox walk cycle (in place), at the gait phase, blended in by how much it walks.
+        if (walk > 0 && model.walk_frames) {
+            double wf = std::fmod(phase / 6.2831853, 1.0); if (wf < 0) wf += 1;
+            wf *= model.walk_frames;
+            uint32_t w0 = (uint32_t)wf % model.walk_frames, w1 = (w0 + 1) % model.walk_frames;
+            float wu = (float)(wf - std::floor(wf)), k = std::min(1.0f, walk);
+            for (size_t i = 0; i < N; i++) {
+                const TRS& a = model.walk[w0 * N + i];
+                const TRS& b = model.walk[w1 * N + i];
+                TRS w;
+                for (int q = 0; q < 3; q++) { w.t[q] = a.t[q] + wu * (b.t[q] - a.t[q]); w.s[q] = a.s[q] + wu * (b.s[q] - a.s[q]); }
+                slerp(a.r, b.r, wu, w.r);
+                for (int q = 0; q < 3; q++) { local[i].t[q] += k * (w.t[q] - local[i].t[q]); local[i].s[q] += k * (w.s[q] - local[i].s[q]); }
+                float r[4]; slerp(local[i].r, w.r, k, r); memcpy(local[i].r, r, sizeof r);
+            }
+        }
+        // Without the clip: a procedural walk, as rotations in the model's frame (x: the
+        // character's left, y up, z forward) about each joint; a leg swings forward with a
+        // negative angle about x.
         std::vector<float> dx(N, 0.0f), dy(N, 0.0f);
-        if (walk > 0) {
+        if (walk > 0 && !model.walk_frames) {
             const float D = 3.14159265f / 180;
             for (int s = 0; s < 2; s++) {
                 double ph = phase + s * 3.14159265;
@@ -304,17 +333,39 @@ struct Renderer {
                 L = mul(affine_inv(P), mul(mul(T1, mul(R, T2)), G));
             }
             out_nodes_global[i] = mul(P, L);
+            // Pointing: the upper arm, then the forearm, turned so that each one's bone (to its
+            // child joint) heads for the point: the whole arm straight towards it.
+            if (aim && aim_w > 0 && (i == uarm[1] || i == farm[1])) {
+                int child = i == uarm[1] ? farm[1] : hand[1];
+                if (child < 0) continue;
+                Mat& G = out_nodes_global[i];
+                const float* ct = model.rest[child].t;
+                float a[3], d[3] = {aim[0] - G(0, 3), aim[1] - G(1, 3), aim[2] - G(2, 3)};
+                for (int r = 0; r < 3; r++) a[r] = G(r, 0) * ct[0] + G(r, 1) * ct[1] + G(r, 2) * ct[2];
+                float na = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), nd = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (na < 1e-6f || nd < 1e-6f) continue;
+                for (int r = 0; r < 3; r++) { a[r] /= na; d[r] /= nd; }
+                float ax[3] = {a[1] * d[2] - a[2] * d[1], a[2] * d[0] - a[0] * d[2], a[0] * d[1] - a[1] * d[0]};
+                float sn = std::sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]), cs = a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
+                if (sn < 1e-5f) continue;
+                Mat R = rot_axis(ax[0] / sn, ax[1] / sn, ax[2] / sn, std::atan2(sn, cs) * aim_w);
+                Mat T1 = ident(), T2 = ident();
+                T1(0, 3) = G(0, 3); T1(1, 3) = G(1, 3); T1(2, 3) = G(2, 3); T2(0, 3) = -G(0, 3); T2(1, 3) = -G(1, 3); T2(2, 3) = -G(2, 3);
+                G = mul(T1, mul(R, mul(T2, G)));
+            }
         }
     }
 
     /** Draws the human: vp the eye's view-projection, world the model -> scene placement. */
-    void draw(ID3D11DeviceContext* ctx, const float vp[16], const float world[16], const float tint[3], double t, double phase, float walk) {
+    void draw(ID3D11DeviceContext* ctx, const float vp[16], const float world[16], const float tint[3], double t, double phase, float walk, const float* aim = nullptr, float aim_w = 0) {
         if (!ok) return;
         std::vector<Mat> G(model.parent.size());
-        pose(t, phase, walk, G.data());
+        pose(t, phase, walk, G.data(), aim, aim_w);
         memcpy(cbuf.vp.m, vp, 64); memcpy(cbuf.model.m, world, 64);
         cbuf.tint[0] = tint[0]; cbuf.tint[1] = tint[1]; cbuf.tint[2] = tint[2]; cbuf.tint[3] = 1;
-        for (size_t j = 0; j < model.joint_node.size(); j++) cbuf.bones[j] = mul(model.mesh_inv, mul(G[model.joint_node[j]], model.ibm[j]));
+        // glTF skinning: joint global x inverse bind. The mesh node's own transform is not
+        // applied (here it sits under Bip01, scaled 0.01: undoing it made the body 100 times too big).
+        for (size_t j = 0; j < model.joint_node.size(); j++) cbuf.bones[j] = mul(G[model.joint_node[j]], model.ibm[j]);
         ID3D11RasterizerState* old_rs = nullptr; ctx->RSGetState(&old_rs);
         ID3D11InputLayout* old_il = nullptr; ctx->IAGetInputLayout(&old_il);
         ctx->RSSetState(rs);
@@ -344,17 +395,17 @@ struct Renderer {
 // ---- where it walks
 
 /** A* over the walkable cells (8 neighbours), then shortened by straight lines. Empty if none. */
-inline std::vector<std::array<float, 2>> find_path(const room::WalkGrid& g, float sx, float sz, float tx, float tz) {
+inline std::vector<std::array<float, 2>> find_path(const room::WalkGrid& g, float sx, float sz, float tx, float tz, int snap_cells = 15) {
     std::vector<std::array<float, 2>> out;
     if (!g.nx || !g.nz) return out;
     auto idx = [&](float x, float z, int& i, int& j) { i = (int)std::floor((x - g.x0) / g.cell); j = (int)std::floor((z - g.z0) / g.cell); return i >= 0 && j >= 0 && i < g.nx && j < g.nz; };
     auto free_at = [&](int i, int j) { return i >= 0 && j >= 0 && i < g.nx && j < g.nz && g.c[j * g.nx + i] == 1; };
-    // The nearest walkable cell to a point (within 1.5 m).
+    // The nearest walkable cell to a point (within snap_cells, 1.5 m by default).
     auto snap = [&](float x, float z, int& i, int& j) {
         idx(x, z, i, j);
         if (free_at(i, j)) return true;
         int ci = i, cj = j; float best = 1e9f;
-        for (int r = 1; r <= 15; r++) for (int dj = -r; dj <= r; dj++) for (int di = -r; di <= r; di++) {
+        for (int r = 1; r <= snap_cells && best >= 1e9f; r++) for (int dj = -r; dj <= r; dj++) for (int di = -r; di <= r; di++) {
             if (std::max(std::abs(di), std::abs(dj)) != r || !free_at(ci + di, cj + dj)) continue;
             float d = (float)(di * di + dj * dj);
             if (d < best) { best = d; i = ci + di; j = cj + dj; }
@@ -422,8 +473,9 @@ struct Walker {
     double idle_since = 0, next_wander = 4;
     std::string state = "absent";
     std::mt19937 rng{1234};
-    static constexpr float WALK_SPEED = 0.9f;
-    static constexpr float STRIDE = 1.22f;  // one gait cycle (two steps), m
+    static constexpr float WALK_SPEED = 0.85f;  // about the walk clip's own pace
+    float stride = 1.22f;  // one gait cycle (two steps), m: the walk clip's when there is one
+    bool look = false; float look_x = 0, look_z = 0;  // idle: faces this place instead of the wearer
 
     bool go_to(const room::WalkGrid& g, float tx, float tz) {
         auto p = find_path(g, x, z, tx, tz);
@@ -450,17 +502,26 @@ struct Walker {
             }
             if (next >= path.size()) { path.clear(); next = 0; idle_since = now; state = "attend"; std::uniform_real_distribution<double> w(6, 12); next_wander = now + w(rng); }
         } else {
-            // Idle: face the wearer, slowly.
-            float want = std::atan2(ux - x, uz - z);
+            // Idle: face the wearer (or what it shows), slowly.
+            float want = look ? std::atan2(look_x - x, look_z - z) : std::atan2(ux - x, uz - z);
             float diff = std::remainder(want - heading, 6.2831853f);
             if (std::fabs(diff) > 0.15f) heading += std::clamp(diff, -1.5f * dt, 1.5f * dt);
             if (wander && now > next_wander) {
-                std::uniform_real_distribution<float> ang(0, 6.2831853f), rad(1.0f, 3.5f);
-                for (int k = 0; k < 20; k++) {
+                // A walkable cell 1 to 3.5 m from the wearer; else, with little floor known
+                // there, any reachable one 1 to 4 m from where it stands.
+                std::uniform_real_distribution<float> ang(0, 6.2831853f), rad(1.0f, 3.5f), rad2(1.0f, 4.0f);
+                bool going = false;
+                for (int k = 0; k < 30 && !going; k++) {
                     float a = ang(rng), r = rad(rng);
                     float tx = ux + std::sin(a) * r, tz = uz + std::cos(a) * r;
-                    if (g.at(tx, tz) == 1 && go_to(g, tx, tz)) break;
+                    going = g.at(tx, tz) == 1 && go_to(g, tx, tz);
                 }
+                for (int k = 0; k < 40 && !going; k++) {
+                    float a = ang(rng), r = rad2(rng);
+                    float tx = x + std::sin(a) * r, tz = z + std::cos(a) * r;
+                    going = g.at(tx, tz) == 1 && go_to(g, tx, tz);
+                }
+                if (!going) state = "attend (pas d'endroit où aller)";
                 std::uniform_real_distribution<double> w(6, 12);
                 next_wander = now + w(rng);
             }
@@ -468,7 +529,7 @@ struct Walker {
         speed += (target_speed - speed) * std::min(1.0f, dt * 4);
         x += std::sin(heading) * speed * dt;
         z += std::cos(heading) * speed * dt;
-        phase += 6.2831853 * speed / STRIDE * dt;
+        phase += 6.2831853 * speed / stride * dt;
         if (speed < 0.02f && next >= path.size()) phase = 0;
     }
 };

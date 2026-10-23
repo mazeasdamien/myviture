@@ -350,6 +350,8 @@ const toHands = (m: ToHands, transfer: Transferable[] = []) => handsWorker.postM
 let hands: Hand[] = [];
 const handPredictor = new HandPredictor();
 let handsRate = 0;
+/** Smoothed hand latency parts (ms): waiting for the worker, MediaPipe, page queue. */
+const handLatency = { waited: 0, detect: 0, queue: 0 };
 let handsStatus = '';
 let rgbBusy = false;
 const handSource = $('sel-hand-source') as HTMLSelectElement;
@@ -382,6 +384,13 @@ syncHandOptions();
 handsWorker.onmessage = (e: MessageEvent<FromHands>) => {
   const m = e.data;
   if (m.type === 'hands') {
+    if (m.ms) {
+      // Where the latency goes: before MediaPipe, in it, and queued for the page's thread.
+      const k = 0.1, l = handLatency;
+      l.waited += (m.ms.waited - l.waited) * k;
+      l.detect += (m.ms.convert + m.ms.detect - l.detect) * k;
+      l.queue += (absNow() - m.ms.posted - l.queue) * k;
+    }
     if (calib) collectCalibration(m.hands, m.source);
     if (m.source === handSource.value && checked('chk-hands')) {
       hands = m.hands;
@@ -503,7 +512,9 @@ setInterval(() => {
   if (!handsStatus.startsWith('prêt')) { setText('hands-info', handsStatus || 'chargement du modèle…'); return; }
   const headPos = new THREE.Vector3(0, 0, 0).applyMatrix4(world.head.matrixWorld);
   const desc = hands.map(h => `${h.side === 'left' ? 'G' : 'D'} ${(headPos.distanceTo(new THREE.Vector3(...h.joints[0])) * 100).toFixed(0)} cm ${h.depth}${h.pinching ? ' · pince' : ''}`).join('\n');
-  setText('hands-info', `${handsRate.toFixed(0)} détections/s, ${handsStatus.slice(6, -1)}, latence ${handPredictor.latencyMs.toFixed(0)} ms (compensée)\n${desc || 'aucune main'}`);
+  const l = handLatency;
+  setText('hands-info', `${handsRate.toFixed(0)} détections/s, ${handsStatus.slice(6, -1)}, latence ${handPredictor.latencyMs.toFixed(0)} ms (compensée)\n` +
+    `= attente ${l.waited.toFixed(0)} + MediaPipe ${l.detect.toFixed(0)} + page ${l.queue.toFixed(0)} ms\n${desc || 'aucune main'}`);
 }, 250);
 
 // ---------------------------------------------------------------- display calibration
@@ -672,6 +683,7 @@ function onSceneKey(e: KeyboardEvent) {
   else if (k === 'escape') closeImmersive();
   // 1..7: the human's clips (idle, talk, listen, wave, shrug, think, clap)
   else if (/^[1-9]$/.test(k) && HUMAN_ANIMS[+k - 1]) world.human.play(HUMAN_ANIMS[+k - 1]);
+  else if (k === 'l') world.human.studio = !world.human.studio;
 }
 
 // ---------------------------------------------------------------- WebXR (step 6)

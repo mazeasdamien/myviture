@@ -1,13 +1,17 @@
-// Stereo depth from the two tracking cameras, on the GPU with Direct3D 11 compute shaders
-// (the web app's src/depth/stereoDepth.ts, same steps):
+// Stereo depth from the two tracking cameras, on the GPU with Direct3D 11 compute shaders,
+// by semi-global matching (SGM, Hirschmüller 2008; costs and penalties as in libSGM):
 //   1. rectification of both fisheye images into a common pinhole frame whose x axis is
-//      the baseline (lookup tables from the factory calibration), 320 x 240;
-//   2. census transform 5x5 (24 bits): matching on intensity order, so the cameras'
+//      the baseline (lookup tables from the factory calibration), 320 x 240 (at 640 x 480
+//      these cameras' noise leaves SGM grainy, 7x slower for little: measured on 20 pairs);
+//   2. census transform 9x7 (62 bits): matching on intensity order, so the cameras'
 //      different exposure and vignetting do not matter;
-//   3. cost volume: Hamming distance for 64 disparities, 5x5 box aggregation;
-//   4. winner-takes-all with uniqueness and sub-pixel refinement, left and right, then a
+//   3. cost volume: Hamming distance for 64 disparities (one byte each);
+//   4. semi-global aggregation along 8 directions: along each, a disparity step of one
+//      costs P1, a larger jump P2, so a plain wall or floor takes the disparity of its
+//      textured edges instead of none;
+//   5. winner-takes-all with uniqueness and sub-pixel refinement, left and right, then a
 //      left-right check;
-//   5. CPU: speckle removal, 3x3 median, depth = f * baseline / disparity.
+//   6. CPU: speckle removal, 3x3 median, depth = f * baseline / disparity.
 // Runs on its own D3D11 device, on the room-mapping thread (roommap.hpp).
 
 #pragma once
@@ -29,7 +33,8 @@
 namespace depth {
 
 constexpr int W = 320, H = 240, MAX_DISP = 64;
-constexpr float RECT_F = 150;  // px, rectified focal (~93 deg horizontal field)
+constexpr float RECT_F = 150;     // px, rectified focal (~93 deg horizontal field)
+constexpr int SRC_W = 640, SRC_H = 480;  // the tracking cameras' images
 
 /** Rectified frame in the head coordinates (x along the baseline, y down, z forward). */
 struct Axes { double ex[3], ey[3], ez[3], origin[3], baseline, f; };
@@ -47,22 +52,24 @@ struct Frame {
     }
 };
 
+// W, H, MAXD, SRC_W, SRC_H: defined by the compiler call from the constants above.
 static const char* CS = R"(
-cbuffer P : register(b0) { int base; int dirx; int diry; int pad; };
+cbuffer P : register(b0) { int dirx; int diry; int first; int pad; };
 Texture2D<float> img : register(t0);
 Texture2D<float2> lut : register(t1);
 Texture2D<float> rectIn : register(t2);
-Texture2D<uint> L : register(t3);
-Texture2D<uint> R : register(t4);
-Texture2DArray<float> volIn : register(t5);
+Texture2D<uint2> L : register(t3);
+Texture2D<uint2> R : register(t4);
 Texture2D<float> dispLIn : register(t6);
 Texture2D<float> dispRIn : register(t7);
 SamplerState lin : register(s0);
 RWTexture2D<float> rectOut : register(u0);
-RWTexture2D<uint> censusOut : register(u1);
-RWTexture2DArray<float> volOut : register(u2);
+RWTexture2D<uint2> censusOut : register(u1);
 RWTexture2D<float> dispOut : register(u3);
-static const int W = 320, H = 240, MAXD = 64;
+RWByteAddressBuffer costBuf : register(u4);  // W*H*MAXD bytes: pixel-major, disparity inside
+RWByteAddressBuffer sumBuf : register(u5);   // W*H*MAXD/2 uints: two 16-bit sums of the paths
+static const uint P1 = 10, P2 = 120, BAD = 62;
+static const uint INVALID = 0x80000000u;
 
 [numthreads(16, 16, 1)]
 void rectify(uint3 id : SV_DispatchThreadID) {
@@ -70,7 +77,7 @@ void rectify(uint3 id : SV_DispatchThreadID) {
   float2 p = lut[id.xy];
   if (p.x < 0) { rectOut[id.xy] = 0; return; }
   // Real pixels are at least 1/255: 0 means outside the rectified field.
-  rectOut[id.xy] = max(img.SampleLevel(lin, (p + 0.5) / float2(640, 480), 0), 1.0 / 255.0);
+  rectOut[id.xy] = max(img.SampleLevel(lin, (p + 0.5) / float2(SRC_W, SRC_H), 0), 1.0 / 255.0);
 }
 
 [numthreads(16, 16, 1)]
@@ -78,14 +85,15 @@ void census(uint3 id : SV_DispatchThreadID) {
   if (id.x >= W || id.y >= H) return;
   int2 c = int2(id.xy);
   float ctr = rectIn[c];
-  uint bits = 0, k = 0;
-  for (int y = -2; y <= 2; y++) for (int x = -2; x <= 2; x++) {
+  uint2 bits = 0;
+  uint k = 0;
+  [unroll] for (int y = -3; y <= 3; y++) [unroll] for (int x = -4; x <= 4; x++) {
     if (x == 0 && y == 0) continue;
     int2 q = clamp(c + int2(x, y), int2(0, 0), int2(W - 1, H - 1));
-    if (rectIn[q] < ctr) bits |= 1u << k;
+    if (rectIn[q] < ctr) { if (k < 31) bits.x |= 1u << k; else bits.y |= 1u << (k - 31); }
     k++;
   }
-  if (ctr == 0) bits |= 0x80000000u;
+  if (ctr == 0) bits.x |= INVALID;
   censusOut[c] = bits;
 }
 
@@ -93,51 +101,80 @@ void census(uint3 id : SV_DispatchThreadID) {
 void cost(uint3 id : SV_DispatchThreadID) {
   if (id.x >= W || id.y >= H) return;
   int2 c = int2(id.xy);
-  uint a = L[c];
-  for (int d = 0; d < MAXD; d++) {
-    int xr = c.x - d;
-    float v = 1.0;
-    if (xr >= 0) {
-      uint b = R[int2(xr, c.y)];
-      if (((a | b) & 0x80000000u) == 0) v = countbits(a ^ b) / 24.0;
+  uint2 a = L[c];
+  bool bad = (a.x & INVALID) != 0;
+  uint base = (c.y * W + c.x) * MAXD;
+  for (int d = 0; d < MAXD; d += 4) {
+    uint w = 0;
+    [unroll] for (int j = 0; j < 4; j++) {
+      int xr = c.x - d - j;
+      uint v = BAD;
+      if (!bad && xr >= 0) {
+        uint2 b = R[int2(xr, c.y)];
+        if ((b.x & INVALID) == 0) v = countbits((a.x ^ b.x) & ~INVALID) + countbits(a.y ^ b.y);
+      }
+      w |= v << (8 * j);
     }
-    volOut[int3(c, d)] = v;
+    costBuf.Store(base + d, w);
   }
 }
 
-[numthreads(16, 16, 1)]
-void box(uint3 id : SV_DispatchThreadID) {
-  if (id.x >= W || id.y >= H) return;
-  int2 c = int2(id.xy);
+// One path direction: a thread group per image line along (dirx, diry), a thread per two
+// disparities; L(p, d) = C(p, d) + min(L(p-r, d), L(p-r, d+-1) + P1, min L(p-r) + P2) - min L(p-r).
+groupshared uint gsL[MAXD + 2];  // the previous pixel's L at d + 1; both ends: none
+groupshared uint gsMin[3];       // min over d of L, rotating: written, read, cleared
+
+[numthreads(MAXD / 2, 1, 1)]
+void sgm(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
   int2 dir = int2(dirx, diry);
-  for (int d = 0; d < MAXD; d++) {
-    float s = 0;
-    for (int k = -2; k <= 2; k++) s += volIn[int3(clamp(c + dir * k, int2(0, 0), int2(W - 1, H - 1)), d)];
-    volOut[int3(c, d)] = s / 5.0;
+  int n = gid.x;
+  int2 p;
+  if (dir.y == 0) p = int2(dir.x > 0 ? 0 : W - 1, n);
+  else if (n < W) p = int2(n, dir.y > 0 ? 0 : H - 1);
+  else { int m = n - W; p = int2(dir.x > 0 ? 0 : W - 1, dir.y > 0 ? m + 1 : H - 2 - m); }
+  uint t = tid.x, d0 = 2 * t;
+  if (t == 0) { gsL[0] = 0xFFFF; gsL[MAXD + 1] = 0xFFFF; gsMin[0] = 0xFFFF; gsMin[1] = 0xFFFF; gsMin[2] = 0xFFFF; }
+  GroupMemoryBarrierWithGroupSync();
+  uint k = 0;
+  [loop] while (p.x >= 0 && p.x < W && p.y >= 0 && p.y < H) {
+    uint pix = p.y * W + p.x;
+    uint cw = costBuf.Load(pix * MAXD + (d0 & ~3u));
+    uint sh = (d0 & 3u) * 8;
+    uint c0 = (cw >> sh) & 0xFF, c1 = (cw >> (sh + 8)) & 0xFF;
+    uint l0 = c0, l1 = c1;
+    if (k > 0) {
+      uint m = gsMin[(k + 2) % 3];
+      uint am = gsL[d0], a = gsL[d0 + 1], b = gsL[d0 + 2], bp = gsL[d0 + 3];
+      l0 = c0 + min(min(a, m + P2), min(am, b) + P1) - m;
+      l1 = c1 + min(min(b, m + P2), min(a, bp) + P1) - m;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    gsL[d0 + 1] = l0; gsL[d0 + 2] = l1;
+    if (t == 0) gsMin[(k + 1) % 3] = 0xFFFF;
+    InterlockedMin(gsMin[k % 3], min(l0, l1));
+    uint addr = (pix * (MAXD / 2) + t) * 4, v = l0 | (l1 << 16);
+    sumBuf.Store(addr, first ? v : sumBuf.Load(addr) + v);
+    GroupMemoryBarrierWithGroupSync();
+    p += dir; k++;
   }
 }
 
-float costAt(int2 p, int d) { return volIn[int3(p, d)]; }
+uint S(uint pix, int d) { uint v = sumBuf.Load((pix * (MAXD / 2) + (d >> 1)) * 4); return (d & 1) ? v >> 16 : v & 0xFFFF; }
 
 [numthreads(16, 16, 1)]
 void wtaLeft(uint3 id : SV_DispatchThreadID) {
   if (id.x >= W || id.y >= H) return;
   int2 c = int2(id.xy);
-  float best = 1e9; int bd = -1;
-  for (int d = 0; d < MAXD; d++) {
-    if (c.x - d < 3) break;
-    float v = costAt(c, d);
-    if (v < best) { best = v; bd = d; }
-  }
-  if (bd < 1 || bd >= MAXD - 1 || best > 0.4) { dispOut[c] = 0; return; }
-  float second = 1e9;
-  for (int d2 = 0; d2 < MAXD; d2++) {
-    if (c.x - d2 < 3) break;
-    if (abs(d2 - bd) <= 1) continue;
-    second = min(second, costAt(c, d2));
-  }
-  if (best > second * 0.95) { dispOut[c] = 0; return; }
-  float c0 = costAt(c, bd - 1), c2 = costAt(c, bd + 1);
+  int dmax = min(MAXD - 1, c.x - 4);
+  if ((L[c].x & INVALID) != 0 || dmax < 3) { dispOut[c] = 0; return; }
+  uint pix = c.y * W + c.x;
+  uint best = 0xFFFFFFFF; int bd = -1;
+  for (int d = 0; d <= dmax; d++) { uint v = S(pix, d); if (v < best) { best = v; bd = d; } }
+  if (bd < 1 || bd >= dmax) { dispOut[c] = 0; return; }
+  uint second = 0xFFFFFFFF;
+  for (int d2 = 0; d2 <= dmax; d2++) if (abs(d2 - bd) > 1) second = min(second, S(pix, d2));
+  if (best * 100 > second * 95) { dispOut[c] = 0; return; }  // not unique by 5 %
+  float c0 = S(pix, bd - 1), c2 = S(pix, bd + 1);
   float den = c0 - 2.0 * best + c2;
   float sub = den > 1e-6 ? clamp(0.5 * (c0 - c2) / den, -0.5, 0.5) : 0.0;
   dispOut[c] = bd + sub;
@@ -147,11 +184,11 @@ void wtaLeft(uint3 id : SV_DispatchThreadID) {
 void wtaRight(uint3 id : SV_DispatchThreadID) {
   if (id.x >= W || id.y >= H) return;
   int2 c = int2(id.xy);
-  float best = 1e9; int bd = -1;
+  uint best = 0xFFFFFFFF; int bd = -1;
   for (int d = 0; d < MAXD; d++) {
     int xl = c.x + d;
     if (xl >= W) break;
-    float v = costAt(int2(xl, c.y), d);
+    uint v = S(c.y * W + xl, d);
     if (v < best) { best = v; bd = d; }
   }
   dispOut[c] = bd;
@@ -182,15 +219,18 @@ public:
     bool ok = false;
     std::string error;
     Axes axes{};
+    int paths = 8;  // SGM directions: 8 (with the diagonals) or 4
 
     Stereo(const calib::Rig& rig) {
         axes = rectified_axes(rig);
         D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ctx))) { error = "D3D11 device"; return; }
-        const char* entries[] = {"rectify", "census", "cost", "box", "wtaLeft", "wtaRight", "lrCheck"};
+        std::string mw = std::to_string(W), mh = std::to_string(H), md = std::to_string(MAX_DISP), msw = std::to_string(SRC_W), msh = std::to_string(SRC_H);
+        D3D_SHADER_MACRO defs[] = {{"W", mw.c_str()}, {"H", mh.c_str()}, {"MAXD", md.c_str()}, {"SRC_W", msw.c_str()}, {"SRC_H", msh.c_str()}, {nullptr, nullptr}};
+        const char* entries[] = {"rectify", "census", "cost", "sgm", "wtaLeft", "wtaRight", "lrCheck"};
         for (int i = 0; i < 7; i++) {
             Com<ID3DBlob> blob, err;
-            if (FAILED(D3DCompile(CS, strlen(CS), nullptr, nullptr, nullptr, entries[i], "cs_5_0", 0, 0, &blob, &err))) {
+            if (FAILED(D3DCompile(CS, strlen(CS), nullptr, defs, nullptr, entries[i], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err))) {
                 error = std::string("shader ") + entries[i] + ": " + (err ? (const char*)err->GetBufferPointer() : "?");
                 return;
             }
@@ -201,7 +241,7 @@ public:
             return dev->CreateTexture2D(&d, nullptr, t);
         };
         for (int i = 0; i < 2; i++) {
-            tex2d(DXGI_FORMAT_R8_UNORM, 640, 480, D3D11_BIND_SHADER_RESOURCE, &img[i], D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
+            tex2d(DXGI_FORMAT_R8_UNORM, SRC_W, SRC_H, D3D11_BIND_SHADER_RESOURCE, &img[i], D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
             dev->CreateShaderResourceView(img[i], nullptr, &img_srv[i]);
             tex2d(DXGI_FORMAT_R32G32_FLOAT, W, H, D3D11_BIND_SHADER_RESOURCE, &lut[i]);
             dev->CreateShaderResourceView(lut[i], nullptr, &lut_srv[i]);
@@ -210,17 +250,18 @@ public:
             tex2d(DXGI_FORMAT_R32_FLOAT, W, H, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &rect[i]);
             dev->CreateShaderResourceView(rect[i], nullptr, &rect_srv[i]);
             dev->CreateUnorderedAccessView(rect[i], nullptr, &rect_uav[i]);
-            tex2d(DXGI_FORMAT_R32_UINT, W, H, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &cen[i]);
+            tex2d(DXGI_FORMAT_R32G32_UINT, W, H, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &cen[i]);
             dev->CreateShaderResourceView(cen[i], nullptr, &cen_srv[i]);
             dev->CreateUnorderedAccessView(cen[i], nullptr, &cen_uav[i]);
         }
-        for (int i = 0; i < 2; i++) {
-            D3D11_TEXTURE2D_DESC d{}; d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = MAX_DISP; d.Format = DXGI_FORMAT_R16_FLOAT; d.SampleDesc.Count = 1;
-            d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-            dev->CreateTexture2D(&d, nullptr, &vol[i]);
-            dev->CreateShaderResourceView(vol[i], nullptr, &vol_srv[i]);
-            dev->CreateUnorderedAccessView(vol[i], nullptr, &vol_uav[i]);
-        }
+        auto rawbuf = [&](UINT bytes, ID3D11Buffer** b, ID3D11UnorderedAccessView** u) {
+            D3D11_BUFFER_DESC d{}; d.ByteWidth = bytes; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS; d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            if (FAILED(dev->CreateBuffer(&d, nullptr, b))) return false;
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{}; ud.Format = DXGI_FORMAT_R32_TYPELESS; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            ud.Buffer.NumElements = bytes / 4; ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+            return SUCCEEDED(dev->CreateUnorderedAccessView(*b, &ud, u));
+        };
+        if (!rawbuf(W * H * MAX_DISP, &cost_buf, &cost_uav) || !rawbuf(W * H * MAX_DISP * 2, &sum_buf, &sum_uav)) { error = "GPU memory (cost volume)"; return; }
         for (int i = 0; i < 3; i++) {
             tex2d(DXGI_FORMAT_R32_FLOAT, W, H, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &disp[i]);
             dev->CreateShaderResourceView(disp[i], nullptr, &disp_srv[i]);
@@ -242,37 +283,41 @@ public:
         for (int i = 0; i < 2; i++) {
             D3D11_MAPPED_SUBRESOURCE m;
             if (FAILED(ctx->Map(img[i], 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
-            for (int y = 0; y < 480; y++) memcpy((uint8_t*)m.pData + y * m.RowPitch, src[i] + y * 640, 640);
+            for (int y = 0; y < SRC_H; y++) memcpy((uint8_t*)m.pData + y * m.RowPitch, src[i] + y * SRC_W, SRC_W);
             ctx->Unmap(img[i], 0);
         }
         ID3D11Buffer* cbs[] = {cb};
         ctx->CSSetConstantBuffers(0, 1, cbs);
         ID3D11SamplerState* ss[] = {sampler};
         ctx->CSSetSamplers(0, 1, ss);
-        auto run = [&](int shader, std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs) {
+        auto run = [&](int shader, std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs, UINT groups = 0) {
             ID3D11ShaderResourceView* s[8] = {}; int i = 0;
             for (auto v : srvs) s[i++] = v;
-            ID3D11UnorderedAccessView* u[4] = {}; i = 0;
+            ID3D11UnorderedAccessView* u[6] = {}; i = 0;
             for (auto v : uavs) u[i++] = v;
             ctx->CSSetShader(cs[shader], nullptr, 0);
             ctx->CSSetShaderResources(0, 8, s);
-            ctx->CSSetUnorderedAccessViews(0, 4, u, nullptr);
-            ctx->Dispatch(W / 16, H / 16, 1);
+            ctx->CSSetUnorderedAccessViews(0, 6, u, nullptr);
+            if (groups) ctx->Dispatch(groups, 1, 1); else ctx->Dispatch((W + 15) / 16, (H + 15) / 16, 1);
             ID3D11ShaderResourceView* none_s[8] = {};
-            ID3D11UnorderedAccessView* none_u[4] = {};
+            ID3D11UnorderedAccessView* none_u[6] = {};
             ctx->CSSetShaderResources(0, 8, none_s);
-            ctx->CSSetUnorderedAccessViews(0, 4, none_u, nullptr);
+            ctx->CSSetUnorderedAccessViews(0, 6, none_u, nullptr);
         };
-        auto params = [&](int base, int dx, int dy) { int p[4] = {base, dx, dy, 0}; ctx->UpdateSubresource(cb, 0, nullptr, p, 0, 0); };
-        params(0, 0, 0);
+        auto params = [&](int dx, int dy, int first) { int p[4] = {dx, dy, first, 0}; ctx->UpdateSubresource(cb, 0, nullptr, p, 0, 0); };
+        ID3D11ShaderResourceView* _ = nullptr;
         for (int i = 0; i < 2; i++) run(0, {img_srv[i], lut_srv[i]}, {rect_uav[i]});
-        for (int i = 0; i < 2; i++) run(1, {nullptr, nullptr, rect_srv[i]}, {nullptr, cen_uav[i]});
-        run(2, {nullptr, nullptr, nullptr, cen_srv[0], cen_srv[1]}, {nullptr, nullptr, vol_uav[0]});
-        params(0, 1, 0); run(3, {nullptr, nullptr, nullptr, nullptr, nullptr, vol_srv[0]}, {nullptr, nullptr, vol_uav[1]});
-        params(0, 0, 1); run(3, {nullptr, nullptr, nullptr, nullptr, nullptr, vol_srv[1]}, {nullptr, nullptr, vol_uav[0]});
-        run(4, {nullptr, nullptr, nullptr, nullptr, nullptr, vol_srv[0]}, {nullptr, nullptr, nullptr, disp_uav[0]});
-        run(5, {nullptr, nullptr, nullptr, nullptr, nullptr, vol_srv[0]}, {nullptr, nullptr, nullptr, disp_uav[1]});
-        run(6, {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, disp_srv[0], disp_srv[1]}, {nullptr, nullptr, nullptr, disp_uav[2]});
+        for (int i = 0; i < 2; i++) run(1, {_, _, rect_srv[i]}, {nullptr, cen_uav[i]});
+        run(2, {_, _, _, cen_srv[0], cen_srv[1]}, {nullptr, nullptr, nullptr, nullptr, cost_uav});
+        const int DIRS[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+        for (int k = 0; k < std::clamp(paths, 1, 8); k++) {
+            int dx = DIRS[k][0], dy = DIRS[k][1];
+            params(dx, dy, k == 0);
+            run(3, {}, {nullptr, nullptr, nullptr, nullptr, cost_uav, sum_uav}, dy == 0 ? H : dx == 0 ? W : W + H - 1);
+        }
+        run(4, {_, _, _, cen_srv[0]}, {nullptr, nullptr, nullptr, disp_uav[0], nullptr, sum_uav});
+        run(5, {}, {nullptr, nullptr, nullptr, disp_uav[1], nullptr, sum_uav});
+        run(6, {_, _, _, _, _, _, disp_srv[0], disp_srv[1]}, {nullptr, nullptr, nullptr, disp_uav[2]});
         ctx->CopyResource(stage_disp, disp[2]);
         ctx->CopyResource(stage_rect, rect[0]);
 
@@ -300,9 +345,10 @@ public:
 private:
     Com<ID3D11Device> dev; Com<ID3D11DeviceContext> ctx;
     Com<ID3D11ComputeShader> cs[7];
-    Com<ID3D11Texture2D> img[2], lut[2], rect[2], cen[2], vol[2], disp[3], stage_disp, stage_rect;
-    Com<ID3D11ShaderResourceView> img_srv[2], lut_srv[2], rect_srv[2], cen_srv[2], vol_srv[2], disp_srv[3];
-    Com<ID3D11UnorderedAccessView> rect_uav[2], cen_uav[2], vol_uav[2], disp_uav[3];
+    Com<ID3D11Texture2D> img[2], lut[2], rect[2], cen[2], disp[3], stage_disp, stage_rect;
+    Com<ID3D11Buffer> cost_buf, sum_buf;
+    Com<ID3D11ShaderResourceView> img_srv[2], lut_srv[2], rect_srv[2], cen_srv[2], disp_srv[3];
+    Com<ID3D11UnorderedAccessView> rect_uav[2], cen_uav[2], disp_uav[3], cost_uav, sum_uav;
     Com<ID3D11Buffer> cb;
     Com<ID3D11SamplerState> sampler;
 
@@ -339,7 +385,7 @@ private:
             if (pc[2] <= 0.05) { o[0] = o[1] = -1; continue; }
             double pu, pv;
             cam.distort(pc[0] / pc[2], pc[1] / pc[2], pu, pv);
-            bool inside = pu >= 0 && pu < 640 && pv >= 0 && pv < 480;
+            bool inside = pu >= 0 && pu < SRC_W && pv >= 0 && pv < SRC_H;
             o[0] = inside ? (float)pu : -1; o[1] = inside ? (float)pv : -1;
         }
         return t;

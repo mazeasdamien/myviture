@@ -146,13 +146,12 @@ struct Snapshot {
     std::vector<room::Plane> planes;
     room::WalkGrid walk;
     std::vector<room::Anchor> anchors;
-    std::vector<room::Opening> openings;
     bool human_visible = false, human_placed = false, human_wander = false;
     float human_pos[3] = {}; float human_heading = 0; std::string human_state;
     bool hand[2] = {false, false}; float index_tip[2][3] = {};  // [0] left, [1] right
 };
 /** Requests for the render thread. */
-struct Cmd { std::string op; float v[3] = {0, 0, 0}; bool flag = false; };
+struct Cmd { std::string op; float v[3] = {0, 0, 0}; bool flag = false; std::string text; };
 struct Marker { std::string name; float p[3]; float color[3]; };
 
 inline std::mutex g_mu;
@@ -270,7 +269,7 @@ inline bool gaze_hit(const Snapshot& s, float out[3], std::string& what) {
 // ---------------------------------------------------------------- tools
 struct Tool { const char* name; const char* description; const char* schema; };
 static const Tool TOOLS[] = {
-    {"get_room", "La pièce vue par les lunettes : hauteur du sol, murs (extrémités au sol, hauteur), portes et fenêtres (reconnues par segmentation), tables (rectangle, hauteur), zone marchable (surface, bornes), ancres. frame: world (repère des lunettes, m, y vers le haut) ou robot (repère de la cellule, si calé).",
+    {"get_room", "La pièce vue par les lunettes : hauteur du sol, tables (rectangle, hauteur), zone marchable (surface, bornes), ancres. frame: world (repère des lunettes, m, y vers le haut) ou robot (repère de la cellule, si calé).",
      R"({"type":"object","properties":{"frame":{"type":"string","enum":["world","robot"]}}})"},
     {"get_user", "Le porteur des lunettes : position de la tête, direction du regard, point regardé sur la pièce (sol, mur, table), mains visibles et bout des index.",
      R"({"type":"object","properties":{"frame":{"type":"string","enum":["world","robot"]}}})"},
@@ -290,6 +289,14 @@ static const Tool TOOLS[] = {
      R"({"type":"object","properties":{"name":{"type":"string"},"point":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"frame":{"type":"string","enum":["world","robot"]},"color":{"type":"string","enum":["vert","rouge","orange","bleu","blanc"]}},"required":["name","point"]})"},
     {"clear_markers", "Enlève un repère virtuel (name) ou tous.",
      R"({"type":"object","properties":{"name":{"type":"string"}}})"},
+    {"add_anchor", "Pose une ancre nommée sur l'objet que le porteur regarde (le centre de sa vue, sur la pièce scannée). Ex. label='perceuse'.",
+     R"({"type":"object","properties":{"label":{"type":"string"}},"required":["label"]})"},
+    {"show_object", "L'humain virtuel va jusqu'à l'objet nommé (une ancre, par son nom) et le montre du bras. Rend la liste des noms si aucun ne correspond.",
+     R"({"type":"object","properties":{"label":{"type":"string"}},"required":["label"]})"},
+    {"calibrate_floor", "Cale le sol (3 s) : le porteur regarde le sol devant lui (debout, assis ou allongé). La zone de travail est centrée sur lui.",
+     R"({"type":"object","properties":{}})"},
+    {"set_work_zone", "Zone de travail : le disque au sol où l'humain virtuel peut marcher. Centre (x, z) dans le repère donné, ou at='user' (sous le porteur) ; rayon en m.",
+     R"({"type":"object","properties":{"x":{"type":"number"},"z":{"type":"number"},"radius":{"type":"number"},"frame":{"type":"string","enum":["world","robot"]},"at":{"type":"string","enum":["point","user"]}}})"},
 };
 
 inline std::string text_result(const std::string& text, bool error = false) {
@@ -311,7 +318,11 @@ inline std::string call_tool(const std::string& name, const J& args) {
     char b[512];
     if (name == "get_room") {
         std::string o = std::string("Repère ") + fr + " (m).\n";
-        if (!s.has_floor) o += "Sol pas encore trouvé (il faut regarder le sol).\n";
+        {
+            std::lock_guard<std::mutex> lz(room::g_zone_mu);
+            if (room::g_zone.on) { float zc[3] = {room::g_zone.x, s.floor_y, room::g_zone.z}; snprintf(b, sizeof b, "Zone de travail : disque de %.1f m autour de %s\n", room::g_zone.r, pt(zc, robot).c_str()); o += b; }
+        }
+        if (!s.has_floor) o += "Sol pas encore trouvé : calibrate_floor (debout, regarder ses pieds).\n";
         else { float f[3] = {s.head[3], s.floor_y, s.head[11]}; snprintf(b, sizeof b, "Sol : y = %.3f (world)%s\n", s.floor_y, robot ? (" ; point du sol sous la tête en robot " + pt(f, true)).c_str() : ""); o += b; }
         int nw = 0, nt = 0;
         for (auto& p : s.planes) {
@@ -328,16 +339,7 @@ inline std::string call_tool(const std::string& name, const J& args) {
         int walk = 0; for (uint8_t c : s.walk.c) walk += c == 1;
         snprintf(b, sizeof b, "Zone marchable : %.1f m² dans x %.2f..%.2f, z %.2f..%.2f (world, cases de %.0f cm)\n", walk * s.walk.cell * s.walk.cell, s.walk.x0, s.walk.x0 + s.walk.nx * s.walk.cell, s.walk.z0, s.walk.z0 + s.walk.nz * s.walk.cell, s.walk.cell * 100);
         o += b;
-        for (auto& op : s.openings) {
-            if (op.wall < 0 || op.wall >= (int)s.planes.size()) continue;
-            const room::Plane& w = s.planes[op.wall];
-            int wn = 0; for (int i = 0; i <= op.wall; i++) wn += s.planes[i].kind == 2;
-            float a[3] = {w.d * w.nx - w.nz * op.t0, op.y0, w.d * w.nz + w.nx * op.t0}, c2[3] = {w.d * w.nx - w.nz * op.t1, op.y1, w.d * w.nz + w.nx * op.t1};
-            snprintf(b, sizeof b, "%s sur le mur %d : coins %s et %s, %.2f m de large, de %.2f à %.2f m du sol\n", op.kind == semseg::DOOR ? "Porte" : "Fenêtre", wn,
-                     pt(a, robot).c_str(), pt(c2, robot).c_str(), op.t1 - op.t0, op.y0 - s.floor_y, op.y1 - s.floor_y);
-            o += b;
-        }
-        for (auto& a : s.anchors) { snprintf(b, sizeof b, "Ancre %d : %s\n", a.id, pt(a.p, robot).c_str()); o += b; }
+        for (auto& a : s.anchors) { snprintf(b, sizeof b, "Ancre %d « %s » : %s\n", a.id, a.label.c_str(), pt(a.p, robot).c_str()); o += b; }
         for (auto& m : g_markers) { o += "Repère virtuel « " + m.name + " » : " + pt(m.p, robot) + "\n"; }
         return text_result(o);
     }
@@ -370,6 +372,21 @@ inline std::string call_tool(const std::string& name, const J& args) {
         }
         g_cmds.push_back(c);
         return text_result(c.op == "human_come" ? "L'humain vient devant le porteur." : "L'humain y va.");
+    }
+    if (name == "add_anchor") {
+        std::string lb = args.str("label");
+        if (lb.empty()) return text_result("label est nécessaire.", true);
+        Cmd c; c.op = "anchor"; c.text = lb; g_cmds.push_back(c);
+        return text_result("Ancre « " + lb + " » posée là où le porteur regarde (si la pièce y est scannée) : get_room pour la voir.");
+    }
+    if (name == "show_object") {
+        std::string lb = args.str("label"), names;
+        auto low = [](std::string x) { for (auto& ch : x) ch = (char)std::tolower((unsigned char)ch); return x; };
+        const room::Anchor* hit = nullptr;
+        for (auto& a : s.anchors) { if (!hit && !a.label.empty() && low(a.label).find(low(lb)) != std::string::npos) hit = &a; names += (names.empty() ? "" : ", ") + a.label; }
+        if (!hit) return text_result("Aucune ancre « " + lb + " ». Ancres : " + (names.empty() ? "aucune" : names), true);
+        Cmd c; c.op = "human_show"; c.v[0] = (float)hit->id; g_cmds.push_back(c);
+        return text_result("L'humain va montrer « " + hit->label + " ».");
     }
     if (name == "set_human") {
         if (auto v = args.get("visible")) { Cmd c; c.op = "human_visible"; c.flag = v->b; g_cmds.push_back(c); }
@@ -436,6 +453,20 @@ inline std::string call_tool(const std::string& name, const J& args) {
         for (auto& m : g_markers) if (m.name == nm) { memcpy(m.p, w, sizeof w); memcpy(m.color, c, sizeof c); found = true; }
         if (!found) { Marker m; m.name = nm; memcpy(m.p, w, sizeof w); memcpy(m.color, c, sizeof c); g_markers.push_back(m); }
         return text_result("Repère « " + nm + " » en " + num3(w) + " (world).");
+    }
+    if (name == "calibrate_floor") {
+        room::g_floor_request = 1;
+        return text_result("Calage du sol lancé pour 3 s : le porteur, debout, regarde le sol à ses pieds.");
+    }
+    if (name == "set_work_zone") {
+        std::lock_guard<std::mutex> lz(room::g_zone_mu);
+        float r = (float)args.num("radius", room::g_zone.r);
+        float p[3] = {(float)args.num("x", NAN), 0, (float)args.num("z", NAN)};
+        if (args.str("at") == "user" || std::isnan(p[0]) || std::isnan(p[2])) { p[0] = s.head[3]; p[2] = s.head[11]; }
+        else if (robot) { float inv[16], w[3]; rigid_inv(g_robot, inv); p[1] = s.floor_y; apply(inv, p, w); p[0] = w[0]; p[2] = w[2]; }
+        room::g_zone.on = true; room::g_zone.x = p[0]; room::g_zone.z = p[2]; room::g_zone.r = std::clamp(r, 0.5f, 6.0f);
+        snprintf(b, sizeof b, "Zone de travail : %.1f m autour de (%.2f, %.2f) world%s.", room::g_zone.r, p[0], p[2], s.has_floor ? "" : " (le sol n'est pas encore calé : calibrate_floor)");
+        return text_result(b);
     }
     if (name == "clear_markers") {
         std::string nm = args.str("name");

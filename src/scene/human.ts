@@ -11,6 +11,7 @@
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { humanLight, humanShading, shadowBlob, shadowTexture, studioEnvironment } from './humanLook';
 
 const URL = '/models/human.glb';
 const ANIMS = '/models/anims/';
@@ -37,8 +38,16 @@ export class Human {
   private base: HumanAnim = 'idle';
   private nextBlink = 2;
   private blinkT = -1;
+  /** contact shadows under each foot, following them */
+  private feet: { bone: THREE.Object3D; blob: THREE.Mesh; restY: number }[] = [];
+  private v = new THREE.Vector3();
+  private shadowMap = shadowTexture();
+  private _studio = true;
 
   constructor() {
+    // Soft occlusion under the whole body. On the see-through glasses black is
+    // transparent, so the shadows only show over other content and in the MR video.
+    this.root.add(shadowBlob(this.shadowMap, 0.8, 0.55, 0.45));
     this.load().catch(e => console.warn('human: cannot load', e));
   }
 
@@ -55,6 +64,26 @@ export class Human {
       if (o.morphTargetDictionary) this.morphs = o.morphTargetDictionary;
     });
     this.root.add(gltf.scene);
+
+    const env = studioEnvironment();
+    for (const p of this.parts) {
+      const m = p.material as THREE.MeshStandardMaterial;
+      m.envMap = env;
+      // Hair cards lie almost flat on the scalp: seen at a grazing angle, plain mipmapping
+      // blurs them into smooth grey sheets. Anisotropic filtering keeps the strands.
+      for (const t of [m.map, m.normalMap, m.roughnessMap]) if (t) t.anisotropy = 16;
+      humanShading(m, m.alphaTest === 0);
+    }
+    this.studio = this._studio;
+    gltf.scene.updateMatrixWorld(true);
+    for (const name of ['Bip01_L_Foot', 'Bip01_R_Foot']) {
+      const bone = gltf.scene.getObjectByName(name);
+      if (!bone) continue;
+      const blob = shadowBlob(this.shadowMap, 0.2, 0.32, 0.55);
+      this.root.add(blob);
+      this.feet.push({ bone, blob, restY: this.root.worldToLocal(bone.getWorldPosition(this.v)).y });
+    }
+
     const mixer = new THREE.AnimationMixer(gltf.scene);
     mixer.addEventListener('finished', e => { if (e.action === this.action) this.play(this.base); });
     this.mixer = mixer;
@@ -71,6 +100,24 @@ export class Human {
 
   get loaded() {
     return this.mixer !== null;
+  }
+
+  /**
+   * Studio lighting (default): a quarter of the scene's ambient, nearly twice its key
+   * light, stronger reflections. Off: the scene's flat lighting, as the other objects get.
+   */
+  get studio() {
+    return this._studio;
+  }
+
+  set studio(on: boolean) {
+    this._studio = on;
+    humanLight.ambient.value = on ? 0.3 : 1;
+    humanLight.key.value = on ? 1.9 : 1;
+    for (const p of this.parts) {
+      const m = p.material as THREE.MeshStandardMaterial;
+      m.envMapIntensity = m.alphaTest > 0 ? (on ? 0.5 : 0.35) : (on ? 1 : 0.6);
+    }
   }
 
   /** Name of the clip playing, null before the clips load. */
@@ -108,6 +155,15 @@ export class Human {
     if (!this.mixer) return;
     this.mixer.update(dt);
     this.blink(dt);
+    // Feet shadows: under the foot bones (last frame's pose), fainter and wider as a
+    // foot lifts.
+    for (const f of this.feet) {
+      const p = this.root.worldToLocal(f.bone.getWorldPosition(this.v));
+      const lift = Math.max(0, p.y - f.restY);
+      f.blob.position.set(p.x, 0.003, p.z + 0.04);
+      f.blob.scale.setScalar(1 + lift * 2);
+      (f.blob.material as THREE.MeshBasicMaterial).opacity = 0.55 * Math.max(0, 1 - lift / 0.25);
+    }
   }
 
   /** Idle blink every 2 to 6 s, now and then a double one. */

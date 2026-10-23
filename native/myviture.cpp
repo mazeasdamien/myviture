@@ -9,7 +9,7 @@
 //
 //   myviture.exe [--sdk DIR] [--seconds N] [--probe]
 //   A dashboard window (Dear ImGui, dashboard.cpp) opens on the PC's screen.
-//   Keys (glasses window focused): Esc quit, R recenter, + / - prediction, P pause stats.
+//   No keyboard shortcuts: everything is a button on the dashboard.
 
 // dbghelp before ONNX Runtime's DirectML header, which undefines OPTIONAL.
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +20,7 @@
 #include "vio.hpp"
 #include "dashboard.hpp"
 #include "orange.hpp"
+#include "voice.hpp"
 #include "rgbcam.hpp"
 #include "calib.hpp"
 #include "hands.hpp"
@@ -30,6 +31,7 @@
 #include "textpanel.hpp"
 #include "human.hpp"
 #include "mcp.hpp"
+#include "depthany.hpp"
 #include "state.hpp"
 
 #include <d3d11.h>
@@ -444,20 +446,12 @@ static int g_mcp_port = 8765;  // the scene's MCP server (--mcp-port N, 0: off)
 static std::string g_settings_path;
 static void save_settings() {
     if (g_settings_path.empty()) return;
-    if (FILE* f = fopen(g_settings_path.c_str(), "w")) { fprintf(f, "%.3f %.2f %.3f %.2f %.2f %.2f %.2f %.1f\n", g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm, g_app.eye_dz_cm, g_app.yaw_deg, g_app.predict_ms); fclose(f); }
+    if (FILE* f = fopen(g_settings_path.c_str(), "w")) { fprintf(f, "%.3f %.2f %.3f %.2f %.2f %.2f %.2f %.1f %.1f\n", g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm, g_app.eye_dz_cm, g_app.yaw_deg, g_app.predict_ms, g_app.ipd_adj_mm); fclose(f); }
 }
 static bool g_stats_paused = false;
 
 static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) g_quit = true;
-        else if (wp == 'R') g_app.recenter = true;
-        else if (wp == VK_OEM_PLUS || wp == VK_ADD) g_app.predict_ms = std::min(60.0f, g_app.predict_ms + 1);
-        else if (wp == VK_OEM_MINUS || wp == VK_SUBTRACT) g_app.predict_ms = std::max(0.0f, g_app.predict_ms - 1);
-        else if (wp == 'P') g_stats_paused = !g_stats_paused;
-        else if (wp == 'A') g_app.room_request = 1;
-        return 0;
     case WM_CLOSE: g_quit = true; return 0;
     case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
     }
@@ -469,7 +463,13 @@ static BOOL WINAPI on_ctrl(DWORD) { g_quit = true; return TRUE; }
 // Engine callbacks: the pose is polled; its callback and the images also feed VITURE's
 // hand tracking.
 static void on_pose(float* d, double t) { vhands::feed_pose(d, t); }
-static void on_vsync(double) {}
+// The engine's vsync callback (device seconds): its rate, to know what it marks.
+static std::atomic<double> g_vsync_last{0}, g_vsync_period{0};
+static void on_vsync(double t) {
+    double last = g_vsync_last.exchange(t);
+    double d = t - last;
+    if (last > 0 && d > 0.002 && d < 0.2) { double p = g_vsync_period; g_vsync_period = p > 0 ? p * 0.95 + d * 0.05 : d; }
+}
 static void on_imu(float* d, double t) {
     int64_t now = qpc_now(), prev = g_imu_qpc.exchange(now);
     g_imu_t = t;
@@ -568,7 +568,6 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--probe")) probe_only = true;
         else if (!strcmp(argv[i], "--no-room")) g_no_room = true;
         else if (!strcmp(argv[i], "--mcp-port") && i + 1 < argc) g_mcp_port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--seg-gpu")) semseg::g_use_gpu = true;
         else if (!strcmp(argv[i], "--no-rgb")) g_no_rgb = true;
         else if (!strcmp(argv[i], "--rgb-1080")) rgbcam::g_allow_1080 = true;
         else if (!strcmp(argv[i], "--no-vhands")) g_no_vhands = true;
@@ -579,6 +578,20 @@ int main(int argc, char** argv) {
     SetConsoleCtrlHandler(on_ctrl, TRUE);
     timeBeginPeriod(1);
 
+    // Without the glasses the engine ends the process when it starts: wait for their screen.
+    {
+        auto plugged = []() { for (auto& m : monitors()) if (m.name.find(L"VITURE") != std::wstring::npos) return true; return false; };
+        bool waited = false;
+        for (int i = 0; !plugged() && !g_quit; i++) {
+            if (i % 15 == 0) printf("glasses not plugged in (no VITURE screen): waiting for them...\n");
+            waited = true;
+            Sleep(2000);
+        }
+        if (g_quit) return 0;
+        // Just plugged in: their screen comes first; started then, the engine finds neither the
+        // IMU nor the tracking cameras ready (3DoF, then spinning). 10 s for them to boot.
+        if (waited) { printf("glasses plugged in: 10 s for them to start...\n"); Sleep(10000); }
+    }
     printf("myViture native: starting the VITURE engine...\n");
     if (!vio::start(sdk, on_pose, on_vsync, on_imu, on_cam, on_points, on_event)) return 2;
     g_app.serial = vio::api.get_sn ? vio::api.get_sn() : "?";
@@ -635,6 +648,23 @@ int main(int argc, char** argv) {
     }
     printf("engine pose changes when polled at 1 kHz: latest %.0f Hz, at device time %.0f Hz\n", unique_rate(false), unique_rate(true));
     std::thread poses(pose_thread);
+    {
+        unsigned char ra[48] = {}, rb[128] = {};
+        if (vio::get_render_para(ra, rb) == 0) {
+            const float* fa = (const float*)ra; const float* fb = (const float*)rb;
+            std::string o = "engine render para A (12 floats):";
+            char b[32];
+            for (int i = 0; i < 12; i++) { snprintf(b, sizeof b, " %.5g", fa[i]); o += b; }
+            o += "\nengine render para B (32 floats):";
+            for (int i = 0; i < 32; i++) { snprintf(b, sizeof b, " %.5g", fb[i]); o += b; }
+            const double* da = (const double*)ra; const double* dbl = (const double*)rb;
+            o += "\nengine render para A (6 doubles):";
+            for (int i = 0; i < 6; i++) { snprintf(b, sizeof b, " %.6g", da[i]); o += b; }
+            o += "\nengine render para B (16 doubles):";
+            for (int i = 0; i < 16; i++) { snprintf(b, sizeof b, " %.6g", dbl[i]); o += b; }
+            hands::logf("%s\n", o.c_str());
+        } else hands::logf("engine render para: not available\n");
+    }
 
     // The glasses' screen, switched to side-by-side 3D (3840 wide) through the MCU.
     Monitor mon;
@@ -894,11 +924,12 @@ int main(int argc, char** argv) {
         if (g_mcp_port > 0) mcp::start(g_mcp_port, std::string(dir.begin(), dir.end()) + "myviture_robot_frame.txt");
         g_settings_path = std::string(dir.begin(), dir.end()) + "myviture_settings.txt";
         if (FILE* f = fopen(g_settings_path.c_str(), "r")) {
-            float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-            int n = fscanf(f, "%f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+            float v[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+            int n = fscanf(f, "%f %f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8]);
             if (n >= 5) { g_app.vfov = v[0]; g_app.ipd_mm = v[1]; g_app.floor_m = v[2]; g_app.pitch_deg = v[3]; g_app.eye_dy_cm = v[4]; }
             if (n >= 7) { g_app.eye_dz_cm = v[5]; g_app.yaw_deg = v[6]; }
             if (n >= 8) g_app.predict_ms = v[7];
+            if (n >= 9) g_app.ipd_adj_mm = v[8];
             fclose(f);
         }
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); if (rgbcal::load(rgbcal::g_path, rgbcal::g_cam)) printf("RGB camera fit loaded\n"); }
@@ -922,10 +953,12 @@ int main(int argc, char** argv) {
                         std::string(dir.begin(), dir.end()) + "myviture_anchors.txt");
             // What the RGB camera sees, labelled (floor, walls, tables, doors, windows...): its
             // frames carry QPC times, the engine's poses device times.
-            if (!g_no_room) semseg::start(dir, [](double tq, float* out) {
+            auto pose_qpc = [](double tq, float* out) {
                 double td = device_now() - (qpc_now() / qpc_freq() - tq);
                 M4 r; if (td <= 0 || !engine_pose(td, r)) return false; memcpy(out, r.m, sizeof r.m); return true;
-            });
+            };
+            // Dense depth from the RGB camera, in metres from the stereo's points.
+            if (!g_no_room) dany::start(dir, pose_qpc);
         }
         else { std::lock_guard<std::mutex> l(hands::g_mu); hands::g_result.status = "calibration.bin introuvable (dossier du projet)"; }
     }
@@ -934,7 +967,7 @@ int main(int argc, char** argv) {
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
         std::string dir = exe;
         dir = dir.substr(0, dir.find_last_of('\\') + 1);
-        if (orange::load_config(dir + "..\\.env.local")) orange::refresh_spend();
+        if (orange::load_config(dir + "..\\.env.local")) { orange::refresh_spend(); voice::start(); }
         else { std::lock_guard<std::mutex> l(orange::g_costs.mu); orange::g_costs.status = ".env.local introuvable (à côté du dossier native)"; }
     }
 
@@ -956,7 +989,7 @@ int main(int argc, char** argv) {
     M4 recenter = identity();
     bool dash_on = true;
 
-    printf("rendering on the glasses: Esc quit, R recenter, +/- prediction (%.0f ms)\n", g_app.predict_ms);
+    printf("rendering on the glasses, screen latency %.0f ms\n", g_app.predict_ms);
     // vblank timing from the frame statistics, for late latching
     int64_t vblank_qpc = 0;
     double period_ms = 1000.0 / 60;
@@ -967,6 +1000,7 @@ int main(int argc, char** argv) {
     // The smoother's reference: the pose last shown for a target time (the warp's when it ran).
     double sm_prev_target = 0; Q sm_prev_q{0, 0, 0, 1}; V3 sm_prev_p{0, 0, 0};
     room::WalkGrid walk; uint32_t walk_version = 0; float walk_floor = NAN, walk_floor_guess = 0;  // the room model, tracking frame
+    std::string walk_src;  // where its floor comes from
     long fallbacks = 0, missed_fast = 0;
     // The stability test's cross, in the tracking frame (so a recentre does not move it).
     V3 stab_pos{0, 0, 0}; float stab_yaw = 0;
@@ -979,7 +1013,11 @@ int main(int argc, char** argv) {
     {
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         std::wstring dir = exe; dir = dir.substr(0, dir.find_last_of(L'\\') + 1);
-        if (human_r.init(dev, ctx, dir)) printf("human: %zu bones, %zu parts, idle %u frames\n", human_r.model.joint_node.size(), human_r.model.parts.size(), human_r.model.frames);
+        if (human_r.init(dev, ctx, dir)) {
+            printf("human: %zu bones, %zu parts, idle %u frames, walk %u frames (%.2f m a cycle)\n", human_r.model.joint_node.size(), human_r.model.parts.size(),
+                   human_r.model.frames, human_r.model.walk_frames, human_r.model.walk_stride);
+            if (human_r.model.walk_stride > 0.3f) walker.stride = human_r.model.walk_stride;  // the feet do not slide
+        }
         else printf("human: %s\n", human_r.error.c_str());
     }
     constexpr UINT ROOM_VERTS = 65536;
@@ -989,7 +1027,7 @@ int main(int argc, char** argv) {
         CHECK(dev->CreateBuffer(&bd, nullptr, &occ_vb));
         CHECK(dev->CreateBuffer(&bd, nullptr, &line_vb));
     }
-    UINT occ_count = 0, line_count = 0, door_count = 0, window_count = 0;  // door then window lines follow the room's lines in line_vb
+    UINT occ_count = 0, line_count = 0;
     uint32_t room_geo_version = ~0u;
     // The 3D debug view: its target, its point buffers (instanced cubes), a line buffer
     // rewritten every frame (head, trail, paths) and a wireframe state for the planes.
@@ -1013,8 +1051,10 @@ int main(int argc, char** argv) {
         bd.ByteWidth = V3_LINES * sizeof(Vertex);
         CHECK(dev->CreateBuffer(&bd, nullptr, &v3_line_vb));
     }
-    UINT v3_ev_count = 0, v3_live_count = 0;
-    uint32_t v3_ev_version = 0, v3_live_version = 0;
+    UINT v3_ev_count = 0, v3_live_count = 0, v3_dense_count = 0;
+    uint32_t v3_ev_version = 0, v3_live_version = 0, v3_dense_version = 0;
+    Com<ID3D11Buffer> v3_dense_vb;
+    { D3D11_BUFFER_DESC bd{}; bd.ByteWidth = V3_PTS * 24; bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; CHECK(dev->CreateBuffer(&bd, nullptr, &v3_dense_vb)); }
     Com<ID3D11RasterizerState> rs_wire;
     Com<ID3D11BlendState> alpha_blend;
     {
@@ -1027,27 +1067,22 @@ int main(int argc, char** argv) {
     std::vector<V3> head_trail;  // tracking frame, every 0.1 s
     double trail_t = 0;
     double human_last_t = qpc_now() / qpc_freq(), human_t0 = human_last_t;
+    // Showing an object: going to it, then pointing at it (tracking frame).
+    struct Show { bool on = false; int id = 0; float a[3] = {0, 0, 0}; std::string label; double arrived = 0; } show;
+    // Three cubes (tracking frame): dropped in front of the wearer once the floor is known,
+    // falling on it (or on a table), taken with a pinch and thrown when let go.
+    struct Cube { V3 p, v; int held = -1; V3 off; float col[3]; bool hover = false; float ground = NAN; };
+    std::shared_ptr<const std::unordered_set<uint64_t>> solid;  // the room's confirmed voxels (tracking frame)
+    std::vector<Cube> cubes;
+    bool cubes_dropped = false;
+    V3 pinch_prev[2] = {}; double pinch_prev_t = 0;
+    constexpr float CUBE = 0.08f;
     while (!g_quit && !g_app.quit) {
         g_engine_predict = g_app.engine_predict;
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-        // Keys that work whatever window has the focus (the wearer looks through the glasses,
-        // the dashboard keeps the keyboard): Ctrl+Up/Down the screen latency, Ctrl+L the
-        // stability test's cross, Ctrl+K the next setting to compare.
+        // The stabilisation setting compared in the stability test (dashboard buttons).
         {
-            static bool was[4] = {};
-            const int keys[4] = {VK_UP, VK_DOWN, 'L', 'K'};
-            bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
-            for (int k = 0; k < 4; k++) {
-                bool down = ctrl && (GetAsyncKeyState(keys[k]) & 0x8000);
-                if (down && !was[k]) {
-                    if (k == 0) g_app.predict_ms = std::min(60.0f, g_app.predict_ms + 1);
-                    else if (k == 1) g_app.predict_ms = std::max(0.0f, g_app.predict_ms - 1);
-                    else if (k == 2) g_app.stab_request = g_app.stab_test ? 2 : 1;
-                    else g_app.stab_mode = (g_app.stab_mode + 1) % 4;
-                }
-                was[k] = down;
-            }
             if (g_app.stab_mode != stab_applied) {
                 stab_applied = g_app.stab_mode;
                 g_app.smooth_corrections = stab_applied == 0 || stab_applied == 2;
@@ -1219,7 +1254,10 @@ int main(int argc, char** argv) {
                 Q d = qmul(q, qconj(last_q));
                 float ang = 2 * atan2f(sqrtf(d.x * d.x + d.y * d.y + d.z * d.z), fabsf(d.w)) * 57.2958f;
                 float dist = sqrtf((p.x - last_p.x) * (p.x - last_p.x) + (p.y - last_p.y) * (p.y - last_p.y) + (p.z - last_p.z) * (p.z - last_p.z));
-                bool wild = primed && (ang > 15 || dist > 0.25f || rate_dps > 900);
+                // Also when the IMU has gone quiet (its stream stopped): the engine would go on
+                // extrapolating the last rotation, the scene spinning.
+                bool imu_quiet = g_imu_qpc && qpc_ms(qpc_now() - g_imu_qpc) > 200;
+                bool wild = primed && (ang > 15 || dist > 0.25f || rate_dps > 900 || imu_quiet);
                 last_q = q; last_p = p; primed = true;
                 if (wild) { sane = 0; if (!g_app.tracking_lost) { g_app.tracking_lost = true; g_app.tracking_losses++; } }
                 else if (++sane >= 30) g_app.tracking_lost = false;
@@ -1287,6 +1325,10 @@ int main(int argc, char** argv) {
                         for (int k = 0; k < hands::N_JOINTS; k++) for (int a = 0; a < 3; a++) smoothed[side][k][a] = (float)filt[side][k][a].apply(w[k][a], vo.t);
                     }
                     memcpy(w, smoothed[side], sizeof w);
+                    // Predicted to the display: the answer's age (plus ~30 ms of camera and
+                    // inference before it arrived, and the screen's latency) at the filtered speed.
+                    float ahead = (float)std::clamp(qpc_now() / qpc_freq() - vo.t + 0.03 + g_app.predict_ms / 1000.0, 0.0, 0.12);
+                    for (int k = 0; k < hands::N_JOINTS; k++) for (int a = 0; a < 3; a++) w[k][a] += (float)filt[side][k][a].dx * ahead;
                     SceneHand sh{side == 1, false, 0, {}};
                     for (int k = 0; k < hands::N_JOINTS; k++) {
                         const float* q = w[k];
@@ -1313,23 +1355,26 @@ int main(int argc, char** argv) {
 
         // The scanned room: new voxel snapshot into the instance buffer, planes and anchors.
         room::g_scan = g_app.scan;
-        semseg::g_latency_s = g_app.rgb_latency_ms / 1000.0f;
-        if (g_app.room_request) { room::g_request = g_app.room_request; g_app.room_request = 0; }
+        room::g_eye_height = g_app.floor_m;
+        dany::g_latency_s = g_app.rgb_latency_ms / 1000.0f;
+        if (g_app.room_request) {
+            if (g_app.room_request == 1) { std::lock_guard<std::mutex> l(room::g_label_mu); room::g_anchor_label = g_app.anchor_label; }
+            room::g_request = g_app.room_request; g_app.room_request = 0;
+        }
         std::vector<room::Plane> planes;
         std::vector<room::Anchor> anchors;
-        std::vector<room::Opening> openings;
         std::vector<float> new_mesh;
         bool mesh_changed = false;
         {
             std::lock_guard<std::mutex> l(room::g.mu);
             planes = room::g.planes;
             anchors = room::g.anchors;
-            openings = room::g.openings;
-            if (room::g.walk_version != walk_version) { walk_version = room::g.walk_version; walk = room::g.walk; walk_floor = room::g.has_floor ? room::g.floor_y : NAN; walk_floor_guess = room::g.floor_y; }
+            if (room::g.walk_version != walk_version) { walk_version = room::g.walk_version; walk = room::g.walk; walk_floor = room::g.has_floor ? room::g.floor_y : NAN; walk_floor_guess = room::g.floor_y; walk_src = room::g.floor_source; }
             // The new mesh is taken (a swap), and copied to the GPU after the lock.
             if (room::g.mesh_version != mesh_version) { mesh_version = room::g.mesh_version; new_mesh.swap(room::g.mesh); mesh_changed = true; }
             if (room::g.version != inst_version && !room::g.points.empty()) {
                 inst_version = room::g.version;
+                solid = room::g.solid;
                 D3D11_MAPPED_SUBRESOURCE m;
                 if (SUCCEEDED(ctx->Map(inst_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
                     inst_count = std::min<UINT>(MAX_INST, (UINT)(room::g.points.size() / 6));
@@ -1378,26 +1423,35 @@ int main(int argc, char** argv) {
                     if (!walkable(i, j + 1)) seg({x0, y, z1}, {x1, y, z1});
                 }
             }
-            // Doors and windows: their outline on the wall, 1 cm into the room.
-            line_count = (UINT)lines.size();
-            for (int kind : {(int)semseg::DOOR, (int)semseg::WINDOW}) {
-                size_t before = lines.size();
-                for (auto& o : openings) {
-                    if (o.kind != kind || o.wall < 0 || o.wall >= (int)planes.size()) continue;
-                    const room::Plane& w = planes[o.wall];
-                    auto at = [&](float t, float y) { return V3{w.d * w.nx - w.nz * t + w.nx * 0.01f, y, w.d * w.nz + w.nx * t + w.nz * 0.01f}; };
-                    V3 a = at(o.t0, o.y0), b = at(o.t1, o.y0), c2 = at(o.t1, o.y1), d = at(o.t0, o.y1);
-                    seg(a, b); seg(b, c2); seg(c2, d); seg(d, a);
-                }
-                (kind == semseg::DOOR ? door_count : window_count) = (UINT)(lines.size() - before);
-            }
             occ_count = (UINT)std::min<size_t>(occ.size(), ROOM_VERTS);
-            if (lines.size() > ROOM_VERTS) { lines.resize(ROOM_VERTS); door_count = window_count = 0; line_count = std::min<UINT>(line_count, ROOM_VERTS); }
-            line_count &= ~1u;
-            UINT all_lines = line_count + door_count + window_count;
+            line_count = (UINT)std::min<size_t>(lines.size(), ROOM_VERTS) & ~1u;
+            UINT all_lines = line_count;
             D3D11_MAPPED_SUBRESOURCE m;
             if (occ_count && SUCCEEDED(ctx->Map(occ_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, occ.data(), occ_count * sizeof(Vertex)); ctx->Unmap(occ_vb, 0); }
             if (all_lines && SUCCEEDED(ctx->Map(line_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, lines.data(), all_lines * sizeof(Vertex)); ctx->Unmap(line_vb, 0); }
+        }
+        // Voice commands: « scan X » names an anchor at the gaze, « où est X » shows it, « viens ».
+        voice::g_on = g_app.voice;
+        {
+            std::deque<voice::Command> heard;
+            { std::lock_guard<std::mutex> l(voice::g_mu); heard.swap(voice::g_cmds); }
+            for (auto& vc : heard) {
+                if (vc.op == "scan") {
+                    g_app.anchor_label = vc.label.empty() ? "objet " + std::to_string(anchors.size() + 1) : vc.label;
+                    g_app.room_request = 1;
+                    voice::set_status("ancre « " + g_app.anchor_label + " » là où tu regardes");
+                } else if (vc.op == "come") g_app.human_request = 1;
+                else if (vc.op == "show") {
+                    // The anchor whose name holds what was said (or the reverse), accents aside.
+                    int id = 0;
+                    for (auto& a : anchors) {
+                        std::string n = voice::fold(a.label);
+                        if (!n.empty() && (n.find(vc.label) != std::string::npos || vc.label.find(n) != std::string::npos)) { id = a.id; break; }
+                    }
+                    if (id) { g_app.show_request = id; voice::set_status("l'humain va montrer « " + vc.label + " »"); }
+                    else voice::set_status("pas d'ancre « " + vc.label + " » : dis « scan " + vc.label + " » en la regardant");
+                }
+            }
         }
         // The human: placed in front of the wearer once the floor is known, then walking.
         {
@@ -1405,22 +1459,43 @@ int main(int argc, char** argv) {
             float dt = (float)std::min(0.1, now_s - human_last_t);
             human_last_t = now_s;
             bool can = g_app.human && human_r.ok && !std::isnan(walk_floor) && walk.nx && have;
-            if (can && (!walker.placed || g_app.human_request == 1)) {
+            // Once the floor is known: standing on it 1 m in front of the wearer, facing them (no
+            // walkable area needed for that; walking needs one).
+            if (g_app.human && human_r.ok && !std::isnan(walk_floor) && have && !walker.placed) {
                 float fx = -head(0, 2), fz = -head(2, 2), n = sqrtf(fx * fx + fz * fz);
                 if (n > 1e-3f) {
-                    fx /= n; fz /= n;
-                    float tx = p.x + 1.6f * fx, tz = p.z + 1.6f * fz;
-                    if (!walker.placed) {
-                        // Start on the nearest walkable cell to that point.
-                        auto pth = human::find_path(walk, tx, tz, tx, tz);
-                        if (!pth.empty()) { walker.x = pth[0][0]; walker.z = pth[0][1]; walker.heading = atan2f(p.x - walker.x, p.z - walker.z); walker.placed = true; walker.state = "attend"; walker.next_wander = now_s + 8; }
-                    } else walker.go_to(walk, tx, tz);
+                    walker.x = p.x + fx / n; walker.z = p.z + fz / n; walker.heading = atan2f(p.x - walker.x, p.z - walker.z);
+                    walker.placed = true; walker.state = "attend"; walker.next_wander = now_s + 8;
                 }
+            }
+            if (can && g_app.human_request == 1) {
+                float fx = -head(0, 2), fz = -head(2, 2), n = sqrtf(fx * fx + fz * fz);
+                if (n > 1e-3f) { fx /= n; fz /= n; walker.go_to(walk, p.x + 1.6f * fx, p.z + 1.6f * fz); }
                 g_app.human_request = 0;
             }
+            // Show an anchor: go 0.6 m from it, on the wearer's side, face it and point (10 s).
+            if (g_app.show_request && walker.placed) {
+                for (auto& a : anchors) if (a.id == g_app.show_request) {
+                    float dx = p.x - a.p[0], dz = p.z - a.p[2], n = sqrtf(dx * dx + dz * dz);
+                    if (n < 0.05f) { dx = walker.x - a.p[0]; dz = walker.z - a.p[2]; n = std::max(0.05f, sqrtf(dx * dx + dz * dz)); }
+                    float gx = a.p[0] + 0.6f * dx / n, gz = a.p[2] + 0.6f * dz / n;
+                    // By the walkable area if it has a way, else straight there.
+                    if (!walk.nx || !walker.go_to(walk, gx, gz)) { walker.path = {{walker.x, walker.z}, {gx, gz}}; walker.next = 1; walker.state = "marche"; }
+                    show.on = true; show.id = a.id; memcpy(show.a, a.p, sizeof show.a); show.label = a.label; show.arrived = 0;
+                    walker.look = true; walker.look_x = a.p[0]; walker.look_z = a.p[2];
+                }
+                g_app.show_request = 0;
+            }
+            if (show.on) {
+                if (walker.path.empty() && show.arrived == 0) show.arrived = now_s;
+                if (show.arrived > 0) walker.state = "montre « " + show.label + " »";
+                if (show.arrived > 0 && now_s - show.arrived > 10) { show.on = false; walker.look = false; walker.state = "attend"; }
+            }
             if (can && g_app.human_request == 2) { if (!walker.go_to(walk, g_app.human_target[0], g_app.human_target[1])) walker.state = "pas de chemin"; g_app.human_request = 0; }
-            if (can) walker.update(now_s, dt, walk, p.x, p.z, g_app.human_wander);
+            if (human_r.model.walk_stride > 0.3f) walker.stride = human_r.model.walk_stride * g_app.human_height / 1.72f;  // a smaller body, shorter steps
+            if (walker.placed && !std::isnan(walk_floor) && have) walker.update(now_s, dt, walk, p.x, p.z, g_app.human_wander && !show.on);
             g_app.human_state = !g_app.human ? "caché" : !human_r.ok ? human_r.error : std::isnan(walk_floor) ? "attend le sol (regarde le sol)" : walker.placed ? walker.state : "pas de place pour lui";
+            if (show.on && show.arrived == 0) g_app.human_state = "va montrer « " + show.label + " »";
             g_app.human_pos[0] = walker.x; g_app.human_pos[1] = std::isnan(walk_floor) ? 0 : walk_floor; g_app.human_pos[2] = walker.z;
         }
         if (mesh_changed) {
@@ -1434,12 +1509,120 @@ int main(int argc, char** argv) {
         // Scene <-> tracking frame: recenter is a yaw and a translation, so heights shift by a constant.
         const M4 recenter_inv = rigid_inverse(recenter);
         // The scene's MCP: its requests, then what it reads (tracking frame), a few times a second.
+        // The cubes: dropped once the floor is found (measured or calibrated), 0.8 m ahead.
+        {
+            double now_s = qpc_now() / qpc_freq();
+            float dt = (float)std::clamp(now_s - pinch_prev_t, 0.0, 0.05);
+            bool floor_ok = !std::isnan(walk_floor) && walk_src.find("estim") == std::string::npos;
+            if (have && floor_ok && (!cubes_dropped || g_app.cubes_request)) {
+                float fx = -head(0, 2), fz = -head(2, 2), n = sqrtf(fx * fx + fz * fz);
+                if (n > 1e-3f) {
+                    fx /= n; fz /= n;
+                    cubes.clear();
+                    const float COL[3][3] = {{0.95f, 0.3f, 0.25f}, {0.3f, 0.85f, 0.35f}, {0.3f, 0.5f, 1.0f}};
+                    for (int k = 0; k < 3; k++) {
+                        float side = (k - 1) * 0.25f;
+                        Cube cb2;
+                        cb2.p = {p.x + 0.8f * fx - side * fz, p.y - 0.1f, p.z + 0.8f * fz + side * fx};
+                        cb2.v = {0, 0, 0};
+                        memcpy(cb2.col, COL[k], sizeof cb2.col);
+                        cubes.push_back(cb2);
+                    }
+                    cubes_dropped = true;
+                }
+                g_app.cubes_request = 0;
+            }
+            // Pinch points (thumb and index tips' middle), tracking frame, and their speed.
+            V3 pinch[2] = {{1e9f, 1e9f, 1e9f}, {1e9f, 1e9f, 1e9f}}; bool pinching[2] = {false, false};
+            for (auto& h : scene_hands) {
+                int k = h.right ? 1 : 0;
+                V3 a = h.j[4], b = h.j[8], m2 = {(a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2};
+                pinch[k] = {recenter_inv(0, 0) * m2.x + recenter_inv(0, 1) * m2.y + recenter_inv(0, 2) * m2.z + recenter_inv(0, 3),
+                            recenter_inv(1, 0) * m2.x + recenter_inv(1, 1) * m2.y + recenter_inv(1, 2) * m2.z + recenter_inv(1, 3),
+                            recenter_inv(2, 0) * m2.x + recenter_inv(2, 1) * m2.y + recenter_inv(2, 2) * m2.z + recenter_inv(2, 3)};
+                pinching[k] = h.pinching;
+            }
+            std::vector<V3> tips;  // fingertips, tracking frame
+            for (auto& h : scene_hands) for (int t : {4, 8, 12, 16, 20}) {
+                V3 q = h.j[t];
+                tips.push_back({recenter_inv(0, 0) * q.x + recenter_inv(0, 1) * q.y + recenter_inv(0, 2) * q.z + recenter_inv(0, 3),
+                                recenter_inv(1, 0) * q.x + recenter_inv(1, 1) * q.y + recenter_inv(1, 2) * q.z + recenter_inv(1, 3),
+                                recenter_inv(2, 0) * q.x + recenter_inv(2, 1) * q.y + recenter_inv(2, 2) * q.z + recenter_inv(2, 3)});
+            }
+            for (auto& cb2 : cubes) {
+                // In contact: a fingertip within 1.5 cm of the cube, or a pinch able to take it.
+                cb2.hover = false;
+                for (auto& t : tips) cb2.hover |= std::fabs(t.x - cb2.p.x) < CUBE / 2 + 0.015f && std::fabs(t.y - cb2.p.y) < CUBE / 2 + 0.015f && std::fabs(t.z - cb2.p.z) < CUBE / 2 + 0.015f;
+                for (int k = 0; k < 2; k++) {
+                    float dx = pinch[k].x - cb2.p.x, dy = pinch[k].y - cb2.p.y, dz = pinch[k].z - cb2.p.z;
+                    cb2.hover |= !scene_hands.empty() && dx * dx + dy * dy + dz * dz < 0.09f * 0.09f;
+                }
+                if (cb2.held >= 0) {
+                    int k = cb2.held;
+                    if (pinching[k]) {
+                        V3 np = {pinch[k].x + cb2.off.x, pinch[k].y + cb2.off.y, pinch[k].z + cb2.off.z};
+                        if (dt > 1e-4f) cb2.v = {(np.x - cb2.p.x) / dt * 0.5f + cb2.v.x * 0.5f, (np.y - cb2.p.y) / dt * 0.5f + cb2.v.y * 0.5f, (np.z - cb2.p.z) / dt * 0.5f + cb2.v.z * 0.5f};
+                        cb2.p = np;
+                        continue;
+                    }
+                    cb2.held = -1;  // let go: thrown with the hand's speed (3 m/s at most)
+                    float sp = sqrtf(cb2.v.x * cb2.v.x + cb2.v.y * cb2.v.y + cb2.v.z * cb2.v.z);
+                    if (sp > 3) { cb2.v.x *= 3 / sp; cb2.v.y *= 3 / sp; cb2.v.z *= 3 / sp; }
+                }
+                // A pinch starting at the cube (within 9 cm) takes it.
+                for (int k = 0; k < 2; k++) {
+                    if (!pinching[k] || cb2.held >= 0) continue;
+                    float dx = pinch[k].x - cb2.p.x, dy = pinch[k].y - cb2.p.y, dz = pinch[k].z - cb2.p.z;
+                    if (dx * dx + dy * dy + dz * dz < 0.09f * 0.09f) {
+                        bool taken = false;
+                        for (auto& o : cubes) taken |= o.held == k;
+                        if (!taken) { cb2.held = k; cb2.off = {cb2.p.x - pinch[k].x, cb2.p.y - pinch[k].y, cb2.p.z - pinch[k].z}; }
+                    }
+                }
+                if (cb2.held >= 0) continue;
+                // Falling: gravity, then onto the scanned room's voxels (or the floor).
+                auto occupied = [&](float x, float y, float z) {
+                    return solid && solid->count(room::key((int)std::floor(x / room::VOX), (int)std::floor(y / room::VOX), (int)std::floor(z / room::VOX)));
+                };
+                cb2.v.y -= 9.81f * dt;
+                V3 was = cb2.p;
+                cb2.p = {cb2.p.x + cb2.v.x * dt, cb2.p.y + cb2.v.y * dt, cb2.p.z + cb2.v.z * dt};
+                // Into something on the side (its middle in a voxel above the ground): back, bounced.
+                if ((cb2.v.x != 0 || cb2.v.z != 0) && occupied(cb2.p.x, cb2.p.y, cb2.p.z) && !occupied(was.x, was.y, was.z)) {
+                    cb2.p.x = was.x; cb2.p.z = was.z; cb2.v.x *= -0.3f; cb2.v.z *= -0.3f;
+                }
+                // The ground: the top of the highest voxel under the cube's footprint and below
+                // its bottom (2 cm tolerance), searched down 3 m; the floor at most.
+                float ground = std::isnan(walk_floor) ? -1e9f : walk_floor;
+                if (solid) {
+                    const float H = CUBE / 2 - 0.01f;
+                    int top = (int)std::floor((cb2.p.y - CUBE / 2 + 0.02f) / room::VOX);
+                    for (float ox : {-H, 0.0f, H}) for (float oz : {-H, 0.0f, H}) {
+                        int cx = (int)std::floor((cb2.p.x + ox) / room::VOX), cz = (int)std::floor((cb2.p.z + oz) / room::VOX);
+                        for (int cy = top; cy > top - 120; cy--) {
+                            if ((cy + 1) * room::VOX <= ground) break;
+                            if (solid->count(room::key(cx, cy, cz))) { ground = std::max(ground, (cy + 1) * room::VOX); break; }
+                        }
+                    }
+                }
+                cb2.ground = ground > -1e8f ? ground : NAN;
+                if (cb2.p.y - CUBE / 2 < ground) {
+                    cb2.p.y = ground + CUBE / 2;
+                    cb2.v.y = cb2.v.y < -0.5f ? -cb2.v.y * 0.3f : 0.0f;
+                    cb2.v.x *= 0.85f; cb2.v.z *= 0.85f;
+                }
+            }
+            for (int k = 0; k < 2; k++) if (pinching[k]) pinch_prev[k] = pinch[k];
+            pinch_prev_t = now_s;
+        }
         std::vector<mcp::Marker> mcp_markers;
         {
             std::lock_guard<std::mutex> l(mcp::g_mu);
             for (auto& cm : mcp::g_cmds) {
                 if (cm.op == "human_go") { g_app.human_target[0] = cm.v[0]; g_app.human_target[1] = cm.v[2]; g_app.human_request = 2; }
                 else if (cm.op == "human_come") g_app.human_request = 1;
+                else if (cm.op == "human_show") g_app.show_request = (int)cm.v[0];
+                else if (cm.op == "anchor") { g_app.anchor_label = cm.text; g_app.room_request = 1; }
                 else if (cm.op == "human_visible") g_app.human = cm.flag;
                 else if (cm.op == "human_wander") g_app.human_wander = cm.flag;
             }
@@ -1451,7 +1634,7 @@ int main(int argc, char** argv) {
                 sn.tracking = have && !g_app.tracking_lost;
                 memcpy(sn.head, head.m, sizeof sn.head);
                 sn.has_floor = !std::isnan(walk_floor); sn.floor_y = sn.has_floor ? walk_floor : 0;
-                sn.planes = planes; sn.walk = walk; sn.anchors = anchors; sn.openings = openings;
+                sn.planes = planes; sn.walk = walk; sn.anchors = anchors;
                 sn.human_visible = g_app.human && walker.placed; sn.human_placed = walker.placed; sn.human_wander = g_app.human_wander;
                 sn.human_pos[0] = walker.x; sn.human_pos[1] = sn.floor_y; sn.human_pos[2] = walker.z; sn.human_heading = walker.heading;
                 sn.human_state = g_app.human_state;
@@ -1528,9 +1711,11 @@ int main(int argc, char** argv) {
         if (stab_panel_ok && g_app.stab_test) {
             static const char* MODES[4] = {"lissage + timewarp", "sans lissage", "sans timewarp", "ni lissage ni timewarp"};
             char a[96], b[96];
-            snprintf(a, sizeof a, "Latence de l'écran : %.0f ms   (Ctrl+haut / Ctrl+bas)", g_app.predict_ms);
-            snprintf(b, sizeof b, "Réglage : %s   (Ctrl+K)", MODES[g_app.stab_mode & 3]);
-            stab_panel.draw(ctx, "Test de stabilité", {"Secoue la tête : la croix doit rester collée au bord réel.", a, b, "Elle traîne : monte la latence. Elle part en avance : baisse-la."}, "Ctrl+L", false);
+            snprintf(a, sizeof a, "Latence de l'écran : %.0f ms", g_app.predict_ms);
+            snprintf(b, sizeof b, "Réglage : %s", MODES[g_app.stab_mode & 3]);
+            char d[120];
+            snprintf(d, sizeof d, "Profondeur %+.0f mm · hauteur %+.1f°", g_app.ipd_adj_mm, g_app.pitch_deg);
+            stab_panel.draw(ctx, "Test de stabilité", {"Secoue la tête : la croix doit rester collée au bord réel.", a, b, d}, "réglages : onglet Vue RGB", false);
         }
 
         float clear[4] = {0, 0, 0, 1};
@@ -1607,26 +1792,19 @@ int main(int argc, char** argv) {
             }
             if (mesh_count && g_app.show_mesh) draw(mesh_vb, mesh_count, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, recenter, 0.22f, 0.30f, 0.42f, true);
             if (line_count && g_app.show_map && !v3_pass) draw(line_vb, line_count, D3D11_PRIMITIVE_TOPOLOGY_LINELIST, recenter, 0.25f, 0.85f, 1.0f, false);
-            if ((g_app.show_map || v3_pass) && door_count + window_count) {
-                // Doors (magenta) and windows (light blue), after the room's lines in the buffer.
-                ID3D11Buffer* vbs[] = {line_vb};
-                ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-                for (int k = 0; k < 2; k++) {
-                    UINT n = k ? window_count : door_count, first = line_count + (k ? door_count : 0);
-                    if (!n) continue;
-                    const float* cc = semseg::CAT_COLOR[k ? semseg::WINDOW : semseg::DOOR];
-                    Constants co{mul(vpm, recenter), recenter, {cc[0], cc[1], cc[2], 1}, {0, 0, 0, 0}};
-                    ctx->UpdateSubresource(cb, 0, nullptr, &co, 0, 0);
-                    ctx->Draw(n, first);
-                }
-            }
             // The human, behind the occluders.
             if (g_app.human && walker.placed && human_r.ok && !std::isnan(walk_floor)) {
-                M4 place = mul(recenter, mul(translate({walker.x, walk_floor, walker.z}), rot_y(walker.heading)));
+                float hk = g_app.human_height / 1.72f;
+                M4 place = mul(recenter, mul(translate({walker.x, walk_floor, walker.z}), mul(rot_y(walker.heading), scale(hk))));
                 float tint[3] = {room_tint[0], room_tint[1], room_tint[2]};
                 float walk_amt = std::min(1.0f, walker.speed / human::Walker::WALK_SPEED * 1.3f);
-                human_r.draw(ctx, vpm.m, place.m, tint, qpc_now() / qpc_freq() - human_t0, walker.phase, walk_amt);
+                float aim[3], aim_w = 0;
+                if (show.on && show.arrived > 0) {
+                    float dx = show.a[0] - walker.x, dy = show.a[1] - walk_floor, dz = show.a[2] - walker.z, ch = cosf(walker.heading), sh = sinf(walker.heading);
+                    aim[0] = (ch * dx - sh * dz) / hk; aim[1] = dy / hk; aim[2] = (sh * dx + ch * dz) / hk;
+                    aim_w = (float)std::clamp((qpc_now() / qpc_freq() - show.arrived) / 0.5, 0.0, 1.0);
+                }
+                human_r.draw(ctx, vpm.m, place.m, tint, qpc_now() / qpc_freq() - human_t0, walker.phase, walk_amt, aim, aim_w);
                 ctx->IASetInputLayout(layout);
                 ctx->VSSetShader(vs, nullptr, 0);
                 ctx->PSSetShader(ps, nullptr, 0);
@@ -1655,7 +1833,14 @@ int main(int argc, char** argv) {
                 ctx->PSSetShader(ps, nullptr, 0);
             }
             // Anchors: small cyan cubes on the real surfaces (tracking frame -> scene).
-            for (auto& a : anchors) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate({a.p[0], a.p[1], a.p[2]})), scale(0.03f)), 0.3f, 1.0f, 1.0f, true);
+            for (auto& a : anchors) {
+                bool shown = show.on && show.id == a.id;
+                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate({a.p[0], a.p[1], a.p[2]})), scale(shown ? 0.05f : 0.03f)), shown ? 1.0f : 0.3f, 1.0f, shown ? 0.2f : 1.0f, !shown);
+            }
+            if (g_app.aiming && have && !v3_pass) {
+                V3 at = {p.x - head(0, 2) * 1.5f, p.y - head(1, 2) * 1.5f, p.z - head(2, 2) * 1.5f};
+                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate(at)), scale(0.012f)), 0.2f, 1.0f, 0.3f, false);
+            }
             // The scanned room, one small cube per voxel.
             if (g_app.calage && inst_count) {
                 Constants c{mul(vpm, recenter), recenter, {1, 1, 1, 1}, {1, room::VOX * (g_app.calage ? 0.25f : 0.7f), 0, 0}};
@@ -1705,25 +1890,37 @@ int main(int argc, char** argv) {
                     ctx->PSSetShader(ps, nullptr, 0);
                 }
             }
-            if (!g_app.scene || g_app.calage) return;
-            // Eight cubes around the head at arm's length, one ahead at 1 m: resting on the
-            // floor or the table found under them when the room is scanned.
-            for (int i = 0; i < 8; i++) {
-                float a = i * 3.14159265f / 4;
-                float hue = i / 8.0f;
-                float r = 0.5f + 0.5f * cosf(6.2832f * hue), g = 0.5f + 0.5f * cosf(6.2832f * (hue - 0.333f)), b = 0.5f + 0.5f * cosf(6.2832f * (hue - 0.667f));
-                V3 at = {sinf(a) * 0.9f, 0, -cosf(a) * 0.9f};
-                float ys = g_app.place_on_planes ? surface_under(at.x, at.y, at.z) : NAN;
-                if (!std::isnan(ys)) at.y = ys + 0.06f;
-                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(at), scale(0.12f)), r, g, b, true);
-                if (!std::isnan(ys)) shadow(at.x, ys, at.z, 0.11f, 0.55f);
+            for (auto& h : scene_hands) {
+                float hr = h.right ? 1.0f : 0.3f, hg = h.right ? 0.48f : 0.55f, hb = h.right ? 0.27f : 1.0f;
+                if (h.pinching) { hr = hr * 0.5f + 0.5f; hg = hg * 0.5f + 0.5f; hb = hb * 0.5f + 0.5f; }
+                for (auto& bn : hands::BONES) {
+                    V3 a = h.j[bn[0]], b = h.j[bn[1]], d = {b.x - a.x, b.y - a.y, b.z - a.z};
+                    float len = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+                    if (len < 1e-4f) continue;
+                    // A 4 mm box from a to b: its y axis along the bone.
+                    V3 y = {d.x / len, d.y / len, d.z / len}, ref = fabsf(y.y) < 0.9f ? V3{0, 1, 0} : V3{1, 0, 0};
+                    V3 x = {ref.y * y.z - ref.z * y.y, ref.z * y.x - ref.x * y.z, ref.x * y.y - ref.y * y.x};
+                    float xn = sqrtf(x.x * x.x + x.y * x.y + x.z * x.z); x = {x.x / xn, x.y / xn, x.z / xn};
+                    V3 z = {x.y * y.z - x.z * y.y, x.z * y.x - x.x * y.z, x.x * y.y - x.y * y.x};
+                    const float T = 0.004f;
+                    M4 mb = identity();
+                    mb(0, 0) = x.x * T; mb(1, 0) = x.y * T; mb(2, 0) = x.z * T;
+                    mb(0, 1) = d.x; mb(1, 1) = d.y; mb(2, 1) = d.z;
+                    mb(0, 2) = z.x * T; mb(1, 2) = z.y * T; mb(2, 2) = z.z * T;
+                    mb(0, 3) = (a.x + b.x) / 2; mb(1, 3) = (a.y + b.y) / 2; mb(2, 3) = (a.z + b.z) / 2;
+                    draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mb, hr, hg, hb, false);
+                }
+                for (int k = 0; k < hands::N_JOINTS; k++) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[k]), scale(0.009f)), hr, hg, hb, false);
             }
-            {
-                V3 at = {0, -0.1f, -1.0f};
-                float ys = g_app.place_on_planes ? surface_under(at.x, at.y, at.z) : NAN;
-                if (!std::isnan(ys)) at.y = ys + 0.025f;
-                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(at), scale(0.05f)), 1, 1, 1, true);
-                if (!std::isnan(ys)) shadow(at.x, ys, at.z, 0.05f, 0.55f);
+            if (!g_app.scene || g_app.calage) return;
+            // The three cubes (tracking frame -> scene), their contact shadow on what they rest on.
+            for (auto& cb2 : cubes) {
+                M4 at = mul(recenter, translate(cb2.p));
+                // Touched: 12 % bigger and lit towards white; held: 20 % and brighter.
+                float glow = cb2.held >= 0 ? 1.0f : cb2.hover ? 0.6f : 0.0f;
+                float cr = cb2.col[0] + (1 - cb2.col[0]) * 0.5f * glow, cg = cb2.col[1] + (1 - cb2.col[1]) * 0.5f * glow, cbl = cb2.col[2] + (1 - cb2.col[2]) * 0.5f * glow;
+                draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(at, scale(CUBE * (1 + 0.2f * glow))), cr, cg, cbl, glow == 0);
+                if (!std::isnan(cb2.ground)) shadow(at(0, 3), cb2.ground + y_shift, at(2, 3), CUBE, 0.5f);
             }
             float floor_y = -g_app.floor_m;
             for (auto& p : planes) if (p.kind == 0) floor_y = p.y + y_shift;
@@ -1744,7 +1941,9 @@ int main(int argc, char** argv) {
                 if (sbs) memcpy(D.m, eye ? g_app.eye_r : g_app.eye_l, sizeof D.m);
                 else for (int k = 0; k < 16; k++) D.m[k] = (g_app.eye_l[k] + g_app.eye_r[k]) / 2;  // 2D: one view, between the eyes
                 M4 fine = mul(translate({0, g_app.eye_dy_cm / 100, g_app.eye_dz_cm / 100}), mul(rot_y(g_app.yaw_deg * 3.14159265f / 180), eye_rot));
-                M4 eye_world = mul(mul(head_scene, fine), D);
+                // The separation adjusted (the wearer's eyes, not the factory's): each eye half of it outwards.
+                float adj = sbs ? (eye ? 0.5f : -0.5f) * g_app.ipd_adj_mm / 1000 : 0.0f;
+                M4 eye_world = mul(mul(head_scene, mul(fine, translate({adj, 0, 0}))), D);
                 eye_in_head[eye] = mul(rigid_inverse(head_scene), eye_world);
                 render_view(mul(perspective(g_app.vfov, vw / H, 0.05f, 50), rigid_inverse(eye_world)));
                 continue;
@@ -2023,8 +2222,8 @@ int main(int argc, char** argv) {
                 g_app.stats.lead_ms = lh.empty() ? 0 : (float)lh[lh.size() / 2];
                 lead_hist.clear();
             }
-            static float saved[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-            float cur[8] = {g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm, g_app.eye_dz_cm, g_app.yaw_deg, g_app.predict_ms};
+            static float saved[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+            float cur[9] = {g_app.vfov, g_app.ipd_mm, g_app.floor_m, g_app.pitch_deg, g_app.eye_dy_cm, g_app.eye_dz_cm, g_app.yaw_deg, g_app.predict_ms, g_app.ipd_adj_mm};
             if (memcmp(saved, cur, sizeof cur)) { memcpy(saved, cur, sizeof cur); save_settings(); }
             auto pct = [](std::vector<double> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, (size_t)(p * v.size()))]; };
             long updates = g_pose_updates - last_updates;
@@ -2096,6 +2295,7 @@ int main(int argc, char** argv) {
                 };
                 if (room::g.dbg_version != v3_ev_version) { v3_ev_version = room::g.dbg_version; upload(room::g.dbg_evidence, v3_ev_vb, v3_ev_count); }
                 if (room::g.live_version != v3_live_version) { v3_live_version = room::g.live_version; upload(room::g.dbg_live, v3_live_vb, v3_live_count); }
+                if (room::g.dense_version != v3_dense_version) { v3_dense_version = room::g.dense_version; upload(room::g.dbg_dense, v3_dense_vb, v3_dense_count); }
             }
             if (g_app.v3_follow) { g_app.v3_target[0] = p.x; g_app.v3_target[1] = p.y; g_app.v3_target[2] = p.z; }
             V3 tg = {g_app.v3_target[0], g_app.v3_target[1], g_app.v3_target[2]};
@@ -2154,12 +2354,10 @@ int main(int argc, char** argv) {
                 ctx->PSSetShader(ps, nullptr, 0);
             };
             float fy3 = std::isnan(walk_floor) ? p.y - g_app.floor_m : walk_floor;
-            // A 1 m grid on the floor (the guess from the eye height while none is found).
-            for (int gx = -3; gx <= 3; gx++) for (int gz = -3; gz <= 3; gz++)
-                d3(grid_vb, (UINT)grid.size(), D3D11_PRIMITIVE_TOPOLOGY_LINELIST, mul(translate({floorf(p.x / 4) * 4 + gx * 4.0f, fy3 - 0.002f, floorf(p.z / 4) * 4 + gz * 4.0f}), scale(1.0f)), 0.18f, 0.2f, 0.25f, false);
             if (g_app.v3_voxels) pts3(inst_vb, inst_count, room::VOX * 0.8f);
             if (g_app.v3_evidence) pts3(v3_ev_vb, v3_ev_count, room::EV * 0.6f);
             if (g_app.v3_live) pts3(v3_live_vb, v3_live_count, 0.012f);
+            if (g_app.v3_dense) pts3(v3_dense_vb, v3_dense_count, 0.018f);
             if (g_app.v3_mesh && mesh_count) d3(mesh_vb, mesh_count, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, identity(), 0.5f, 0.55f, 0.65f, true);
             if (g_app.v3_walk && line_count) d3(line_vb, line_count, D3D11_PRIMITIVE_TOPOLOGY_LINELIST, identity(), 0.25f, 0.95f, 1.0f, false);
             // Head (a small box, its view frustum to 0.6 m), the trail, the human's path, the gaze.
@@ -2248,18 +2446,33 @@ int main(int argc, char** argv) {
             // The glasses change resolution: wait for Windows, then follow with the window.
             int want = g_app.display_request;
             g_app.display_request = 0;
-            int rc = vio::set_display_mode(want == 3 ? vio::MODE_3D : vio::MODE_2D);
-            printf("display %dD -> %d\n", want, rc);
+            int rc = vio::set_display_mode(want == 4 ? vio::MODE_3D_90 : want == 3 ? vio::MODE_3D : vio::MODE_2D);
+            printf("display %s -> %d\n", want == 4 ? "3D 90 Hz" : want == 3 ? "3D" : "2D", rc);
             if (rc == 0) {
-                for (int i = 0; i < 40; i++) { Sleep(150); glasses_monitor(mon); if ((width(mon.rect) >= 3000) == (want == 3)) break; }
+                auto hz = [&]() { DEVMODEW dm{}; dm.dmSize = sizeof dm; return EnumDisplaySettingsW(mon.gdi.c_str(), ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmDisplayFrequency : 0; };
+                for (int i = 0; i < 40; i++) {
+                    Sleep(150); glasses_monitor(mon);
+                    bool wide = width(mon.rect) >= 3000, ok = wide == (want >= 3);
+                    if (want == 4) ok = ok && hz() >= 85;
+                    if (want == 3) ok = ok && hz() < 75;
+                    if (ok) break;
+                }
+                g_app.screen_hz = hz();
+                hands::logf("display: %dx%d at %d Hz\n", width(mon.rect), height(mon.rect), g_app.screen_hz);
                 W = width(mon.rect); H = height(mon.rect);
                 SetWindowPos(hwnd, nullptr, mon.rect.left, mon.rect.top, W, H, SWP_NOZORDER | SWP_NOACTIVATE);
                 ctx->OMSetRenderTargets(0, nullptr, nullptr);
                 if (FAILED(make_targets())) { fprintf(stderr, "resize failed\n"); break; }
                 g_app.screen_w = W; g_app.screen_h = H;
-                switched = want == 3;
+                switched = want >= 3;
             }
         }
+        // The screen's brightness, the film, the tracking cameras' exposure (engine / MCU).
+        if (g_app.brightness_request >= 0) { int rc = vio::set_brightness(g_app.brightness_request); hands::logf("brightness %d -> %d\n", g_app.brightness_request, rc); if (rc == 0) g_app.brightness = g_app.brightness_request; g_app.brightness_request = -1; }
+        if (g_app.film_request >= 0) { int rc = vio::set_film(g_app.film_request == 1); hands::logf("film %d -> %d\n", g_app.film_request, rc); if (rc == 0) g_app.film_dark = g_app.film_request == 1; g_app.film_request = -1; }
+        if (g_app.expo_request >= 0) { int rc = vio::set_exposure_fixed(g_app.expo_request == 1); hands::logf("tracking exposure %s -> %d\n", g_app.expo_request ? "fixed" : "auto", rc); if (rc >= 0) g_app.expo_fixed = g_app.expo_request == 1; g_app.expo_request = -1; }
+        { double p = g_vsync_period; g_app.vsync_hz = p > 0 ? (float)(1.0 / p) : 0.0f; }
+        if (!g_app.screen_hz) { DEVMODEW dm{}; dm.dmSize = sizeof dm; if (EnumDisplaySettingsW(mon.gdi.c_str(), ENUM_CURRENT_SETTINGS, &dm)) g_app.screen_hz = (int)dm.dmDisplayFrequency; }
 
         if (run_seconds > 0 && qpc_ms(qpc_now() - frame_t0) > run_seconds * 1000) g_quit = true;
         if (record_s > 0) {
@@ -2274,7 +2487,7 @@ int main(int argc, char** argv) {
     // Whatever hangs on the way out (engine, camera, GPU), the process ends.
     CreateThread(nullptr, 0, [](LPVOID) -> DWORD { Sleep(6000); fflush(stdout); TerminateProcess(GetCurrentProcess(), 0); return 0; }, nullptr, 0, nullptr);
     rec::stop();
-    semseg::stop();
+    dany::stop();
     room::stop();
     mcp::stop();
     vhands::stop();

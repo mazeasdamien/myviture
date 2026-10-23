@@ -63,8 +63,8 @@ inline double header_number(HINTERNET req, const wchar_t* name) {
 
 enum class Kind { vision, transcription, speech };
 
-/** POST JSON to /orange/v1/<route>; accounts the cost. Returns the HTTP status (0: no connection). */
-inline int post(const std::string& route, const std::string& body, Kind kind, std::string* response = nullptr) {
+/** POST to /orange/v1/<route> (JSON unless told); accounts the cost. Returns the HTTP status (0: no connection). */
+inline int post(const std::string& route, const std::string& body, Kind kind, std::string* response = nullptr, const std::string& content_type = "application/json") {
     URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc;
     wchar_t host[256], path[1024];
     uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 1024;
@@ -75,7 +75,7 @@ inline int post(const std::string& route, const std::string& body, Kind kind, st
     HINTERNET r = c ? WinHttpOpenRequest(c, L"POST", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
     int status = 0;
     if (r) {
-        std::wstring headers = L"content-type: application/json\r\naccept: application/json\r\nx-orange-auth: " + widen(g_secret) + L"\r\n";
+        std::wstring headers = L"content-type: " + widen(content_type) + L"\r\naccept: application/json\r\nx-orange-auth: " + widen(g_secret) + L"\r\n";
         if (WinHttpSendRequest(r, headers.c_str(), (DWORD)-1, (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0) && WinHttpReceiveResponse(r, nullptr)) {
             DWORD code = 0, len = sizeof code;
             WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX);

@@ -23,24 +23,26 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <random>
 #include <unordered_map>
+#include <memory>
 #include <unordered_set>
 #include <vector>
 
 #include "depth.hpp"
 #include "hands.hpp"
-#include "semseg.hpp"
+#include "dense.hpp"
 #include "state.hpp"
 
 namespace room {
 
 constexpr float VOX = 0.025f;
-constexpr int CONFIRM = 5;          // observations a voxel needs, from VIEWS different viewpoints
-constexpr int VIEWS = 3;
+constexpr int CONFIRM = 3;          // observations a voxel needs, from VIEWS different viewpoints
+constexpr int VIEWS = 2;
 constexpr size_t MAX_VOXELS = 400000;
 constexpr size_t MAX_MESH_VERTS = 300000;   // nearest first, within MESH_RANGE of the head
 constexpr float MESH_RANGE = 4.5f;
@@ -49,15 +51,7 @@ constexpr float WALK_CELL = 0.10f;          // walkable grid (m)
 constexpr float HUMAN_RADIUS = 0.22f;       // kept away from obstacles (m)
 
 /** A voxel: mean of the points seen in it, how often, from how many viewpoints; misses when a ray passed through it. */
-struct Voxel { float sum[3] = {0, 0, 0}; uint16_t n = 0; uint8_t misses = 0; uint32_t last_frame = 0; uint32_t views[4] = {}; uint8_t nviews = 0; uint8_t cat = 0, cat_n = 0; };
-
-/** A running majority (Boyer-Moore) of the categories seen at a place: cat wins while cat_n > 0. */
-inline void vote(uint8_t& cat, uint8_t& n, uint8_t c) {
-    if (!c) return;
-    if (cat == c) { if (n < 250) n++; }
-    else if (n == 0) { cat = c; n = 1; }
-    else n--;
-}
+struct Voxel { float sum[3] = {0, 0, 0}; uint16_t n = 0; uint8_t misses = 0; uint32_t last_frame = 0; uint32_t views[4] = {}; uint8_t nviews = 0; };
 inline bool confirmed(const Voxel& v) { return v.n >= CONFIRM && v.nviews >= VIEWS; }
 
 struct Plane {
@@ -70,7 +64,7 @@ struct Plane {
     float nx = 0, nz = 0, d = 0, t0 = 0, t1 = 0, top = 0;
 };
 
-struct Anchor { int id; float p[3]; };
+struct Anchor { int id; float p[3]; std::string label; };
 
 /** Walkable grid on the floor (tracking frame, 10 cm cells): 0 unknown, 1 walkable, 2 blocked. */
 struct WalkGrid {
@@ -84,10 +78,7 @@ struct WalkGrid {
 };
 
 /** Plane evidence in a 5 cm cell: points on a level or an upright surface, and their summed normal. */
-struct Evid { float sum[3] = {0, 0, 0}; float nx = 0, nz = 0; uint16_t n = 0; uint8_t cat = 0, cat_n = 0; };
-
-/** A door or a window seen in a wall: along the wall (t) and in height (tracking frame). */
-struct Opening { int kind; int wall; float t0, t1, y0, y1; };  // kind: semseg::DOOR or WINDOW; wall: index in planes
+struct Evid { float sum[3] = {0, 0, 0}; float nx = 0, nz = 0; uint16_t n = 0; };
 
 /** head -> tracking-frame pose at a time (QPC s), row-major 4x4; false if none. */
 using PoseFn = std::function<bool(double, float*)>;
@@ -95,6 +86,7 @@ using PoseFn = std::function<bool(double, float*)>;
 struct Shared {
     std::mutex mu;
     std::vector<float> points;      // confirmed voxels for drawing: x y z r g b, newest snapshot
+    std::shared_ptr<const std::unordered_set<uint64_t>> solid;  // every confirmed voxel's key (physics)
     std::vector<Plane> planes;
     std::vector<Anchor> anchors;
     std::vector<float> depth;       // last depth map (W*H), for the dashboard
@@ -106,13 +98,13 @@ struct Shared {
     float floor_y = 0;
     WalkGrid walk;
     uint32_t walk_version = 0;
-    std::vector<Opening> openings;
-    size_t labelled = 0;            // plane evidence cells with a category (semantic segmentation)
     std::string floor_source;
+    bool floor_locked = false;      // calibrated (and then kept)
+    std::string floor_cal;          // the calibration's state, for the dashboard and the MCP
     // For the 3D debug view, x y z r g b each (tracking frame): the plane evidence (level
     // green, upright orange, refreshed every 2 s) and the last depth map's points (white).
-    std::vector<float> dbg_evidence, dbg_live;
-    uint32_t dbg_version = 0, live_version = 0;
+    std::vector<float> dbg_evidence, dbg_live, dbg_dense;  // dense: Depth Anything's points (category colours, else violet)
+    uint32_t dbg_version = 0, live_version = 0, dense_version = 0;
     float valid_ratio = 0, rate = 0, ms = 0;
     size_t voxels = 0;
     std::string status = "démarrage…";
@@ -122,8 +114,20 @@ struct Shared {
 inline Shared g;
 inline std::atomic<bool> g_stop{false}, g_scan{true};
 inline std::atomic<int> g_request{0};  // 1: anchor at the gaze, 2: clear
+inline std::atomic<float> g_eye_height{1.6f};  // the wearer's eyes above the floor when standing (the app's setting)
+inline std::atomic<int> g_stand{0};             // 1: the wearer stands now, 2: sits now (the floor is searched under the head from here)
+// The floor, calibrated in one gesture (Ctrl+F, the dashboard or the MCP): looking at one's
+// feet it is measured; otherwise it is the standing eyes' height under the head. Then locked.
+inline std::atomic<int> g_floor_request{0};
+/** The work zone: a disc on the floor (tracking frame) where the human may walk. */
+struct Zone { bool on = false; float x = 0, z = 0, r = 2.5f; };
+inline std::mutex g_zone_mu;
+inline Zone g_zone;
+constexpr float SEATED_EYES = 1.2f;             // eyes above the floor on a chair (m)
 inline std::thread g_thread;
 inline std::string g_anchor_path;
+inline std::mutex g_label_mu;
+inline std::string g_anchor_label;  // the name of the next anchor at the gaze
 
 inline uint64_t key(int x, int y, int z) { return ((uint64_t)(x + 0x100000) << 42) | ((uint64_t)(y + 0x100000) << 21) | (uint64_t)(z + 0x100000); }
 
@@ -131,7 +135,7 @@ inline void save_anchors() {
     if (g_anchor_path.empty()) return;
     FILE* f = fopen(g_anchor_path.c_str(), "w");
     if (!f) return;
-    for (auto& a : g.anchors) fprintf(f, "%d %.4f %.4f %.4f\n", a.id, a.p[0], a.p[1], a.p[2]);
+    for (auto& a : g.anchors) fprintf(f, "%d %.4f %.4f %.4f %s\n", a.id, a.p[0], a.p[1], a.p[2], a.label.c_str());
     fclose(f);
 }
 
@@ -246,8 +250,44 @@ inline std::vector<Plane> find_walls(const std::unordered_map<uint64_t, Voxel>& 
 
 inline uint64_t ekey(float x, float y, float z) { return key((int)std::floor(x / EV), (int)std::floor(y / EV), (int)std::floor(z / EV)); }
 
+/**
+ * Plane evidence from a grid of world points (NaN: none): the normal at each point from its
+ * neighbours K cells right and down (same surface: distance within 4 cm + 3 %), facing the
+ * eye; level (n.y > 0.96) or upright (|n.y| < 0.15), into 5 cm cells. Points farther than max_d are left out (their normals are mostly noise).
+ */
+inline void add_evidence(const float* P, int GW, int GH, int K, const float eye[3], float max_d,
+                         std::unordered_map<uint64_t, Evid>& level, std::unordered_map<uint64_t, Evid>& upright) {
+    const float fx = eye[0], fy = eye[1], fz = eye[2];
+    for (int j = 0; j + K < GH; j++) for (int i = 0; i + K < GW; i++) {
+        const float* a = &P[(j * GW + i) * 3];
+        const float* b = &P[(j * GW + i + K) * 3];
+        const float* c2 = &P[((j + K) * GW + i) * 3];
+        if (std::isnan(a[0]) || std::isnan(b[0]) || std::isnan(c2[0])) continue;
+        float da = std::sqrt((a[0] - fx) * (a[0] - fx) + (a[1] - fy) * (a[1] - fy) + (a[2] - fz) * (a[2] - fz));
+        if (da > max_d) continue;
+        float db = std::sqrt((b[0] - fx) * (b[0] - fx) + (b[1] - fy) * (b[1] - fy) + (b[2] - fz) * (b[2] - fz));
+        float dc = std::sqrt((c2[0] - fx) * (c2[0] - fx) + (c2[1] - fy) * (c2[1] - fy) + (c2[2] - fz) * (c2[2] - fz));
+        float tol = 0.04f + 0.03f * da;
+        if (std::fabs(db - da) > tol || std::fabs(dc - da) > tol) continue;
+        float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c2[0] - a[0], c2[1] - a[1], c2[2] - a[2]};
+        float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (nl < 1e-8f) continue;
+        for (float& x : n) x /= nl;
+        if (n[0] * (fx - a[0]) + n[1] * (fy - a[1]) + n[2] * (fz - a[2]) < 0) for (float& x : n) x = -x;
+        std::unordered_map<uint64_t, Evid>* dst = n[1] > 0.96f ? &level : std::fabs(n[1]) < 0.15f ? &upright : nullptr;
+        if (!dst || dst->size() > 300000) continue;
+        Evid& e = (*dst)[ekey(a[0], a[1], a[2])];
+        if (e.n >= 2000) continue;
+        for (int q = 0; q < 3; q++) e.sum[q] += a[q];
+        e.nx += n[0]; e.nz += n[2]; e.n++;
+    }
+}
+
 /** Result of the room model. */
-struct Model { std::vector<Plane> planes; bool has_floor = false; float floor_y = 0; WalkGrid walk; std::vector<Opening> openings; size_t labelled = 0; std::string floor_source; };
+struct Model {
+    std::vector<Plane> planes; bool has_floor = false; float floor_y = 0; WalkGrid walk; std::string floor_source;
+};
 
 /**
  * The room from the plane evidence: floor (lowest strong level, well under the head),
@@ -258,52 +298,52 @@ struct Model { std::vector<Plane> planes; bool has_floor = false; float floor_y 
  * a table or a wall, kept HUMAN_RADIUS away from them.
  */
 inline Model room_model(const std::unordered_map<uint64_t, Evid>& level, const std::unordered_map<uint64_t, Evid>& upright,
-                        const std::unordered_map<uint64_t, Voxel>& map, float head_min_y) {
+                        const std::unordered_map<uint64_t, Voxel>& map, float head_min_y, float head_max_y, const std::vector<float>& gaze_floor, float head_x, float head_z,
+                        float locked_floor = NAN, Zone zone = Zone{}) {
     Model m;
-    using namespace semseg;
-    struct P { float x, y, z; int n; uint8_t cat; };
+    if (!std::isnan(locked_floor)) { m.floor_y = locked_floor; m.has_floor = true; m.floor_source = "calé"; }
+    struct P { float x, y, z; int n; };
     std::vector<P> lv;
-    for (auto& [k, e] : level) if (e.n >= 3) lv.push_back({e.sum[0] / e.n, e.sum[1] / e.n, e.sum[2] / e.n, e.n, e.cat_n ? e.cat : (uint8_t)NONE});
-    for (auto& p : lv) m.labelled += p.cat != NONE;
-    for (auto& [k, e] : upright) m.labelled += e.n >= 3 && e.cat_n;
-    // Seen as floor by the segmentation: the floor is their median height (a bit of rug or
-    // floor seen is enough, and a desk cannot pass for it).
-    {
-        std::vector<float> fy;
-        for (auto& p : lv) if (p.cat == FLOOR && p.y < head_min_y - 0.5f) fy.push_back(p.y);
-        if (fy.size() >= 15) {
-            std::sort(fy.begin(), fy.end());
-            float med = fy[fy.size() / 2];
-            double sy = 0; int n = 0;
-            for (float y : fy) if (std::fabs(y - med) < 0.04f) { sy += y; n++; }
-            m.floor_y = (float)(sy / n); m.has_floor = true; m.floor_source = "segmentation";
-        }
-    }
-    if (lv.size() < 150 && !m.has_floor) return m;
-    // Level surfaces the segmentation calls furniture, a table or a screen are not the floor.
-    std::vector<P> lv_floor;
-    for (auto& p : lv) if (p.cat != TABLE && p.cat != FURNITURE && p.cat != SCREEN && p.cat != CEILING) lv_floor.push_back(p);
+    for (auto& [k, e] : level) if (e.n >= 3) lv.push_back({e.sum[0] / e.n, e.sum[1] / e.n, e.sum[2] / e.n, e.n});
+    const std::vector<P>& lv_floor = lv;
     float ymin = 1e9, ymax = -1e9;
     for (auto& p : lv) { ymin = std::min(ymin, p.y); ymax = std::max(ymax, p.y); }
+    if (lv.empty()) ymin = ymax = m.floor_y;
     const float BIN = 0.02f;
     int nb = (int)((ymax - ymin) / BIN) + 3;
     std::vector<int> hist(nb, 0);
     for (auto& p : lv) hist[(int)((p.y - ymin) / BIN) + 1]++;
     auto around = [&](int b) { return hist[b] + (b ? hist[b - 1] : 0) + (b + 1 < nb ? hist[b + 1] : 0); };
-    // Floor: the lowest bin, a local peak with 2 % of the level cells (at least 30), 95 cm
-    // under the lowest head (seated, the eyes are 1.1 m or more above the floor; a desk is
-    // about 0.5 m under them, a low table 0.75 m).
-    std::vector<int> fhist(nb, 0);
-    for (auto& p : lv_floor) fhist[(int)((p.y - ymin) / BIN) + 1]++;
-    auto faround = [&](int b) { return fhist[b] + (b ? fhist[b - 1] : 0) + (b + 1 < nb ? fhist[b + 1] : 0); };
-    for (int b = 1; b + 1 < nb && !m.has_floor; b++) {
-        float y = ymin + (b - 1 + 0.5f) * BIN;
-        if (y > head_min_y - 0.95f) break;
-        if (fhist[b] < fhist[b - 1] || fhist[b] < fhist[b + 1] || faround(b) < std::max(30, (int)(0.02f * lv_floor.size()))) continue;
-        double sy = 0, sw = 0;
-        for (auto& p : lv_floor) if (std::fabs(p.y - y) < 0.04f) { sy += p.y * p.n; sw += p.n; }
-        m.floor_y = (float)(sy / sw); m.has_floor = true; m.floor_source = "hauteurs";
-        break;
+    // Floor: the lowest level holding 3 % of the level cells (at least 25), climbed to its
+    // peak: nothing real lies under the floor, so the lowest strong surface is it (a desk or a
+    // sofa seat is higher). Under the highest head by 0.7 m at least (or the lowest by 0.5 m).
+    {
+        float limit = head_max_y > -1e8f ? head_max_y - 0.7f : head_min_y - 0.5f;
+        int need = std::max(25, (int)(0.03f * lv_floor.size()));
+        for (int b = 1; b + 1 < nb && !m.has_floor; b++) {
+            float y = ymin + (b - 1 + 0.5f) * BIN;
+            if (y > limit) break;
+            if (around(b) < need) continue;
+            int pk = b;
+            while (pk + 2 < nb && pk < b + 5 && hist[pk + 1] >= hist[pk]) pk++;
+            float yp = ymin + (pk - 1 + 0.5f) * BIN;
+            double sy = 0, sw = 0;
+            for (auto& p : lv_floor) if (std::fabs(p.y - yp) < 0.04f) { sy += p.y * p.n; sw += p.n; }
+            if (sw > 0) { m.floor_y = (float)(sy / sw); m.has_floor = true; m.floor_source = "surface la plus basse"; }
+        }
+    }
+    // Else measured while looking at one's feet (5 looks that agree): after the lowest
+    // surface, since seated or lying the look down finds the bed or the seat.
+    if (gaze_floor.size() >= 5 && !m.has_floor) {
+        std::vector<float> g2 = gaze_floor;
+        std::sort(g2.begin(), g2.end());
+        float med = g2[g2.size() / 2];
+        int agree = 0; double sy = 0;
+        for (float y : g2) if (std::fabs(y - med) < 0.05f) { agree++; sy += y; }
+        // Not a desk looked down at: 0.7 m at least under the highest head (lying on a bed,
+        // the eyes are about 0.9 m above the floor).
+        float gy = (float)(sy / std::max(1, agree));
+        if (agree >= 5 && (head_max_y < -1e8f || gy < head_max_y - 0.7f)) { m.floor_y = gy; m.has_floor = true; m.floor_source = "regard vers le sol"; }
     }
     if (!m.has_floor) {
         // Why not: the three strongest levels, for the log.
@@ -313,167 +353,29 @@ inline Model room_model(const std::unordered_map<uint64_t, Evid>& level, const s
         char buf[160]; int n = snprintf(buf, sizeof buf, "room: no floor yet (head lowest %.2f m); strongest levels:", head_min_y);
         for (size_t i = 0; i < std::min<size_t>(3, top.size()); i++) n += snprintf(buf + n, sizeof buf - n, " %.2f m (%d)", top[i].second, top[i].first);
         hands::logf("%s\n", buf);
-        // Walls and table tops still, above a guessed floor (1.6 m under the lowest head);
-        // no floor plane and no walkable grid until the floor is seen.
-        m.floor_y = head_min_y - 1.6f;
     }
     if (m.has_floor) {
         Plane fl{0, m.floor_y, 1e9f, -1e9f, 1e9f, -1e9f, 0};
         for (auto& p : lv) if (std::fabs(p.y - m.floor_y) < 0.05f) { fl.minx = std::min(fl.minx, p.x); fl.maxx = std::max(fl.maxx, p.x); fl.minz = std::min(fl.minz, p.z); fl.maxz = std::max(fl.maxz, p.z); fl.count++; }
         m.planes.push_back(fl);
     }
-    // Table tops: peaks 30 cm to 1.5 m above the floor, then connected pieces in 10 cm cells.
-    for (int b = 1; b + 1 < nb; b++) {
-        float y = ymin + (b - 1 + 0.5f) * BIN;
-        if (y < m.floor_y + 0.3f || y > m.floor_y + 1.5f) continue;
-        if (hist[b] < hist[b - 1] || hist[b] < hist[b + 1] || around(b) < 25) continue;
-        std::unordered_map<uint64_t, std::array<float, 2>> cells;  // 10 cm cell -> sum y, count
-        for (auto& p : lv) if (std::fabs(p.y - y) < 0.03f && (p.cat == NONE || p.cat == TABLE || p.cat == OTHER)) {
-            auto& cc = cells[key((int)std::floor(p.x / 0.1f), 0, (int)std::floor(p.z / 0.1f))];
-            cc[0] += p.y; cc[1] += 1;
-        }
-        std::unordered_set<uint64_t> seen;
-        for (auto& [k0, v0] : cells) {
-            if (seen.count(k0)) continue;
-            std::vector<uint64_t> stack{k0}, comp;
-            seen.insert(k0);
-            while (!stack.empty()) {
-                uint64_t k = stack.back(); stack.pop_back(); comp.push_back(k);
-                int x = (int)((k >> 42) & 0x1FFFFF) - 0x100000, z = (int)(k & 0x1FFFFF) - 0x100000;
-                for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
-                    uint64_t nk = key(x + dx, 0, z + dz);
-                    if (cells.count(nk) && !seen.count(nk)) { seen.insert(nk); stack.push_back(nk); }
-                }
-            }
-            if (comp.size() < 10) continue;
-            Plane pl{1, 0, 1e9f, -1e9f, 1e9f, -1e9f, (int)comp.size()};
-            double sy = 0, sn = 0;
-            for (uint64_t k : comp) {
-                int x = (int)((k >> 42) & 0x1FFFFF) - 0x100000, z = (int)(k & 0x1FFFFF) - 0x100000;
-                pl.minx = std::min(pl.minx, x * 0.1f); pl.maxx = std::max(pl.maxx, (x + 1) * 0.1f);
-                pl.minz = std::min(pl.minz, z * 0.1f); pl.maxz = std::max(pl.maxz, (z + 1) * 0.1f);
-                sy += cells[k][0]; sn += cells[k][1];
-            }
-            pl.y = (float)(sy / sn);
-            bool dup = false;  // the same top from a neighbouring bin
-            for (auto& o : m.planes) if (o.kind == 1 && std::fabs(o.y - pl.y) < 0.06f && pl.minx < o.maxx && o.minx < pl.maxx && pl.minz < o.maxz && o.minz < pl.maxz) dup = true;
-            if (!dup) m.planes.push_back(pl);
-        }
-    }
-    // Walls.
-    struct U { float x, y, z, th; int n; bool used; uint8_t cat; };
-    std::vector<U> up;
-    for (auto& [k, e] : upright) {
-        if (e.n < 3) continue;
-        uint8_t ec = e.cat_n ? e.cat : (uint8_t)NONE;
-        if (ec != NONE && ec != WALL && ec != DOOR && ec != WINDOW) continue;  // furniture, screens, people: not walls
-        float y = e.sum[1] / e.n;
-        if (y < m.floor_y + 0.05f || y > m.floor_y + 2.6f) continue;
-        if (e.nx * e.nx + e.nz * e.nz < 1e-6f) continue;
-        up.push_back({e.sum[0] / e.n, y, e.sum[2] / e.n, std::atan2(e.nz, e.nx), e.n, false, ec});
-    }
-    const float PI = 3.14159265f;
-    auto angdiff = [&](float a, float b) { float d = std::fmod(a - b, 2 * PI); if (d > PI) d -= 2 * PI; if (d < -PI) d += 2 * PI; return std::fabs(d); };
-    if (up.size() >= 40) {
-        // The room's axes: the strongest direction modulo 90 degrees.
-        float h90[90] = {};
-        for (auto& u : up) { float a = std::fmod(u.th + 4 * PI, PI / 2) * 180 / PI; h90[std::min(89, (int)a)] += (float)u.n; }
-        int best = 0; float bv = -1;
-        for (int i = 0; i < 90; i++) { float v = 0; for (int d = -2; d <= 2; d++) v += h90[(i + d + 90) % 90]; if (v > bv) { bv = v; best = i; } }
-        float psi = (best + 0.5f) * PI / 180;
-        for (auto& u : up) {
-            float k = std::round((u.th - psi) / (PI / 2)), sn = psi + k * PI / 2;
-            if (angdiff(u.th, sn) < 12 * PI / 180) u.th = sn;
-        }
-        for (int wall = 0; wall < 16; wall++) {
-            std::unordered_map<uint64_t, float> acc;
-            for (auto& u : up) if (!u.used) {
-                int ti = (int)std::floor((u.th + PI) / (3 * PI / 180)), di = (int)std::floor((std::cos(u.th) * u.x + std::sin(u.th) * u.z) / 0.04f);
-                acc[key(ti, 0, di)] += (float)u.n;
-            }
-            uint64_t bk = 0; float bw = 0;
-            for (auto& [k, w] : acc) if (w > bw) { bw = w; bk = k; }
-            if (bw < 60) break;
-            int ti = (int)((bk >> 42) & 0x1FFFFF) - 0x100000, di = (int)(bk & 0x1FFFFF) - 0x100000;
-            float th = (ti + 0.5f) * 3 * PI / 180 - PI, d0 = (di + 0.5f) * 0.04f;
-            float nx = std::cos(th), nz = std::sin(th);
-            std::vector<size_t> in;
-            for (size_t i = 0; i < up.size(); i++) {
-                auto& u = up[i];
-                if (u.used || angdiff(u.th, th) > 10 * PI / 180) continue;
-                if (std::fabs(nx * u.x + nz * u.z - d0) < 0.12f) in.push_back(i);
-            }
-            int wsum = 0; for (size_t i : in) wsum += up[i].n;
-            for (size_t i : in) up[i].used = true;
-            if (wsum < 60) continue;
-            // Direction: the members' mean (snapped ones agree exactly); distance: the median.
-            float sx = 0, sz = 0;
-            for (size_t i : in) { sx += std::cos(up[i].th) * up[i].n; sz += std::sin(up[i].th) * up[i].n; }
-            float nl = std::sqrt(sx * sx + sz * sz); nx = sx / nl; nz = sz / nl;
-            std::vector<float> ds, ts, ys;
-            for (size_t i : in) { ds.push_back(nx * up[i].x + nz * up[i].z); ts.push_back(-nz * up[i].x + nx * up[i].z); ys.push_back(up[i].y); }
-            std::sort(ds.begin(), ds.end()); std::sort(ts.begin(), ts.end()); std::sort(ys.begin(), ys.end());
-            Plane pl{2, ys[ys.size() * 3 / 100], 0, 0, 0, 0, wsum};
-            pl.top = ys[ys.size() * 97 / 100];
-            pl.t0 = ts[ts.size() * 3 / 100]; pl.t1 = ts[ts.size() * 97 / 100];
-            pl.nx = nx; pl.nz = nz; pl.d = ds[ds.size() / 2];
-            // A wall, not a screen or a desk's front: 80 cm long and 60 cm high at least.
-            if (pl.t1 - pl.t0 < 0.8f || pl.top - pl.y < 0.6f) continue;
-            float ttx = -nz, ttz = nx;
-            pl.minx = std::min(pl.d * nx + ttx * pl.t0, pl.d * nx + ttx * pl.t1); pl.maxx = std::max(pl.d * nx + ttx * pl.t0, pl.d * nx + ttx * pl.t1);
-            pl.minz = std::min(pl.d * nz + ttz * pl.t0, pl.d * nz + ttz * pl.t1); pl.maxz = std::max(pl.d * nz + ttz * pl.t0, pl.d * nz + ttz * pl.t1);
-            // The same wall again (the depth's noise spreads it over 20 cm): merged into the
-            // stronger one when parallel, facing the same way, within 30 cm and overlapping.
-            bool merged = false;
-            for (auto& o : m.planes) {
-                if (o.kind != 2 || o.nx * nx + o.nz * nz < 0.985f || std::fabs(o.d - pl.d) > 0.3f) continue;
-                if (pl.t0 > o.t1 + 0.3f || o.t0 > pl.t1 + 0.3f) continue;
-                o.t0 = std::min(o.t0, pl.t0); o.t1 = std::max(o.t1, pl.t1); o.y = std::min(o.y, pl.y); o.top = std::max(o.top, pl.top); o.count += pl.count;
-                float tx2 = -o.nz, tz2 = o.nx;
-                o.minx = std::min(o.d * o.nx + tx2 * o.t0, o.d * o.nx + tx2 * o.t1); o.maxx = std::max(o.d * o.nx + tx2 * o.t0, o.d * o.nx + tx2 * o.t1);
-                o.minz = std::min(o.d * o.nz + tz2 * o.t0, o.d * o.nz + tz2 * o.t1); o.maxz = std::max(o.d * o.nz + tz2 * o.t0, o.d * o.nz + tz2 * o.t1);
-                merged = true;
-                break;
-            }
-            if (!merged) m.planes.push_back(pl);
-        }
-        // Doors and windows: the cells labelled so on each wall, in pieces along it (a gap of
-        // 25 cm starts a new one), at least 30 cm wide.
-        for (size_t wi = 0; wi < m.planes.size(); wi++) {
-            const Plane& w = m.planes[wi];
-            if (w.kind != 2) continue;
-            for (uint8_t kind : {(uint8_t)DOOR, (uint8_t)WINDOW}) {
-                std::vector<std::array<float, 2>> ty;
-                for (auto& u : up) {
-                    if (u.cat != kind || std::cos(u.th) * w.nx + std::sin(u.th) * w.nz < 0.9f) continue;
-                    if (std::fabs(w.nx * u.x + w.nz * u.z - w.d) > 0.15f) continue;
-                    float t = -w.nz * u.x + w.nx * u.z;
-                    if (t > w.t0 - 0.1f && t < w.t1 + 0.1f) ty.push_back({t, u.y});
-                }
-                std::sort(ty.begin(), ty.end());
-                size_t a = 0;
-                for (size_t i = 1; i <= ty.size(); i++) {
-                    if (i < ty.size() && ty[i][0] - ty[i - 1][0] < 0.25f) continue;
-                    if (i - a >= 4 && ty[i - 1][0] - ty[a][0] >= 0.3f) {
-                        float y0 = 1e9f, y1 = -1e9f;
-                        for (size_t k = a; k < i; k++) { y0 = std::min(y0, ty[k][1]); y1 = std::max(y1, ty[k][1]); }
-                        if (kind == DOOR) y0 = std::min(y0, m.floor_y);
-                        m.openings.push_back({kind, (int)wi, ty[a][0], ty[i - 1][0], y0, y1 + EV});
-                    }
-                    a = i;
-                }
-            }
-        }
-    }
-    // Walkable grid over the floor seen.
-    if (!m.has_floor) return m;
-    const Plane fl = m.planes[0];
+    // Walkable grid: the floor seen (by the stereo or the dense depth), small holes filled;
+    // with a work zone, only its part inside the zone. Never where the floor was not seen:
+    // an unscanned wall (behind the wearer) would be walked through.
     WalkGrid& g = m.walk;
-    float w = std::min(14.0f, fl.maxx - fl.minx + 0.4f), h = std::min(14.0f, fl.maxz - fl.minz + 0.4f);
-    g.x0 = std::max(fl.minx - 0.2f, (fl.minx + fl.maxx) / 2 - 7); g.z0 = std::max(fl.minz - 0.2f, (fl.minz + fl.maxz) / 2 - 7);
-    g.nx = std::max(1, (int)std::ceil(w / g.cell)); g.nz = std::max(1, (int)std::ceil(h / g.cell));
-    g.c.assign((size_t)g.nx * g.nz, 0);
     auto cell_of = [&](float x, float z, int& i, int& j) { i = (int)std::floor((x - g.x0) / g.cell); j = (int)std::floor((z - g.z0) / g.cell); return i >= 0 && j >= 0 && i < g.nx && j < g.nz; };
+    if (!m.has_floor) return m;
+    if (zone.on) {
+        g.x0 = zone.x - zone.r; g.z0 = zone.z - zone.r;
+        g.nx = g.nz = std::max(1, (int)std::ceil(2 * zone.r / g.cell));
+    } else {
+        if (m.planes.empty() || m.planes[0].kind != 0 || m.planes[0].count == 0) return m;
+        const Plane fl = m.planes[0];
+        float w = std::min(14.0f, fl.maxx - fl.minx + 0.4f), h = std::min(14.0f, fl.maxz - fl.minz + 0.4f);
+        g.x0 = std::max(fl.minx - 0.2f, (fl.minx + fl.maxx) / 2 - 7); g.z0 = std::max(fl.minz - 0.2f, (fl.minz + fl.maxz) / 2 - 7);
+        g.nx = std::max(1, (int)std::ceil(w / g.cell)); g.nz = std::max(1, (int)std::ceil(h / g.cell));
+    }
+    g.c.assign((size_t)g.nx * g.nz, 0);
     for (auto& p : lv) { int i, j; if (std::fabs(p.y - m.floor_y) < 0.05f && cell_of(p.x, p.z, i, j)) g.c[j * g.nx + i] = 1; }
     // Small holes in the floor seen (under-sampled): filled when most neighbours are floor.
     for (int pass = 0; pass < 2; pass++) {
@@ -486,6 +388,14 @@ inline Model room_model(const std::unordered_map<uint64_t, Evid>& level, const s
         }
         g.c.swap(c2);
     }
+    if (zone.on) {
+        for (int j = 0; j < g.nz; j++) for (int i = 0; i < g.nx; i++) {
+            float dx = g.x0 + (i + 0.5f) * g.cell - zone.x, dz = g.z0 + (j + 0.5f) * g.cell - zone.z;
+            if (dx * dx + dz * dz > zone.r * zone.r) g.c[j * g.nx + i] = 0;
+        }
+        Plane fl{0, m.floor_y, g.x0, g.x0 + g.nx * g.cell, g.z0, g.z0 + g.nz * g.cell, 1};
+        if (!m.planes.empty() && m.planes[0].kind == 0) m.planes[0] = fl; else m.planes.insert(m.planes.begin(), fl);
+    }
     std::vector<uint8_t> obst(g.c.size(), 0), hits(g.c.size(), 0);
     for (auto& [k, v] : map) {
         if (!confirmed(v)) continue;
@@ -495,6 +405,15 @@ inline Model room_model(const std::unordered_map<uint64_t, Evid>& level, const s
         if (cell_of(v.sum[0] / v.n, v.sum[2] / v.n, i, j) && hits[j * g.nx + i] < 255) hits[j * g.nx + i]++;
     }
     for (size_t i = 0; i < hits.size(); i++) if (hits[i] >= 2) obst[i] = 1;
+    // Upright surfaces seen (walls, cupboards: the stereo's and the dense depth's), 15 cm to
+    // 2.2 m above the floor: nobody walks through them.
+    for (auto& [k, e] : upright) {
+        if (e.n < 3) continue;
+        float y = e.sum[1] / e.n;
+        if (y < m.floor_y + 0.15f || y > m.floor_y + 2.2f) continue;
+        int i, j;
+        if (cell_of(e.sum[0] / e.n, e.sum[2] / e.n, i, j)) obst[j * g.nx + i] = 1;
+    }
     for (auto& p : m.planes) {
         if (p.kind == 1) {
             for (float x = p.minx; x <= p.maxx; x += g.cell / 2) for (float z = p.minz; z <= p.maxz; z += g.cell / 2) { int i, j; if (cell_of(x, z, i, j)) obst[j * g.nx + i] = 1; }
@@ -514,6 +433,32 @@ inline Model room_model(const std::unordered_map<uint64_t, Evid>& level, const s
             int a = i + di, b = j + dj;
             if (a < 0 || b < 0 || a >= g.nx || b >= g.nz || di * di + dj * dj > r * r) continue;
             if (g.c[b * g.nx + a] == 1) g.c[b * g.nx + a] = 2;
+        }
+    }
+    // Only what can be reached on foot from the zone's centre (the wearer at calibration):
+    // past a wall, the disc is another room.
+    if (zone.on) {
+        int ci, cj;
+        if (cell_of(zone.x, zone.z, ci, cj)) {
+            std::vector<uint8_t> seen(g.c.size(), 0);
+            std::vector<int> st;
+            // From the nearest walkable cell to the centre (the wearer stands on it).
+            int start = -1; float bd = 1e9f;
+            for (int j = std::max(0, cj - 8); j < std::min(g.nz, cj + 9); j++) for (int i = std::max(0, ci - 8); i < std::min(g.nx, ci + 9); i++)
+                if (g.c[j * g.nx + i] == 1) { float d = (float)((i - ci) * (i - ci) + (j - cj) * (j - cj)); if (d < bd) { bd = d; start = j * g.nx + i; } }
+            if (start >= 0) { st.push_back(start); seen[start] = 1; }
+            while (!st.empty()) {
+                int c0 = st.back(); st.pop_back();
+                int i = c0 % g.nx, j = c0 / g.nx;
+                const int D[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (auto& d : D) {
+                    int a = i + d[0], b = j + d[1];
+                    if (a < 0 || b < 0 || a >= g.nx || b >= g.nz) continue;
+                    int n = b * g.nx + a;
+                    if (!seen[n] && g.c[n] == 1) { seen[n] = 1; st.push_back(n); }
+                }
+            }
+            for (size_t i = 0; i < g.c.size(); i++) if (g.c[i] == 1 && !seen[i]) g.c[i] = 0;
         }
     }
     return m;
@@ -619,21 +564,88 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
     std::vector<uint8_t> img[2];
     int w = 0, h = 0;
     double last_planes = 0, last_mesh = 0, rate_t0 = hands::qpc_s(); int frames = 0;
-    float head_min_y = 1e9;
+    float head_min_y = 1e9, head_max_y = -1e9;
     depth::Frame df;
     std::unordered_map<uint64_t, Evid> level, upright;  // plane evidence
     Model model;
     // The mesh is built on its own thread (over a second): depth keeps coming meanwhile.
     std::thread mesher;
     std::atomic<bool> meshing{false};
-    std::vector<float> wpts((size_t)(depth::W / 2) * (depth::H / 2) * 3);  // world points, every 2nd pixel
-    std::vector<uint8_t> wcat((size_t)(depth::W / 2) * (depth::H / 2));      // their category
-    semseg::Map sem; double sem_got = 0;  // the newest labelled RGB image, and when it came
+    constexpr int ST = depth::W / 160, GW = depth::W / ST, GH = depth::H / ST;  // the depth sampled on a 160 x 120 grid
+    std::vector<float> wpts((size_t)GW * GH * 3);  // world points of that grid
+    std::vector<float> gaze_floor;        // floor heights measured while looking down
+    float locked_floor = NAN;             // the calibrated floor (tracking frame)
+    double cal_until = 0;                 // > 0: calibrating until then (QPC s)
+    std::vector<float> cal_y;             // floor points seen meanwhile (heights)
+    auto set_cal = [&](const std::string& st) { std::lock_guard<std::mutex> l(g.mu); g.floor_cal = st; };
 
+    uint32_t dense_seen = 0;
     while (!g_stop) {
+        // The dense depth (Depth Anything, metric, world): plane evidence; its normals are
+        // smoother than the stereo's, up to 5 m.
+        if (g_scan) {
+            dense::Frame df2;
+            {
+                std::lock_guard<std::mutex> l(dense::g_mu);
+                if (dense::g_frame.seq != dense_seen) { dense_seen = dense::g_frame.seq; df2 = dense::g_frame; }
+            }
+            if (!df2.pts.empty()) {
+                std::vector<float> dbg;
+                for (int i = 0; i < df2.w * df2.h; i += 3) {
+                    const float* q = &df2.pts[(size_t)i * 3];
+                    if (!std::isnan(q[0])) dbg.insert(dbg.end(), {q[0], q[1], q[2], 0.75f, 0.55f, 1.0f});
+                }
+                add_evidence(df2.pts.data(), df2.w, df2.h, 2, df2.eye, 5.0f, level, upright);
+                // The room's map is made of its points only, up to 4 m: it sees what the stereo
+                // cannot (uniform floors and walls), and its scale comes from the stereo. A voxel
+                // needs several viewpoints to count (place to 10 cm, heading to 15 degrees), which
+                // keeps out a frame whose scale was off; the voxels its rays pass are emptied.
+                frame_id++;
+                float gyaw = 0;
+                {
+                    const float* qc = &df2.pts[((size_t)(df2.h / 2) * df2.w + df2.w / 2) * 3];
+                    if (!std::isnan(qc[0])) gyaw = std::atan2(qc[0] - df2.eye[0], qc[2] - df2.eye[2]);
+                }
+                uint32_t view = (uint32_t)(((int)std::floor(df2.eye[0] / 0.1f) & 1023) | (((int)std::floor(df2.eye[1] / 0.1f) & 1023) << 10) | (((int)std::floor(df2.eye[2] / 0.1f) & 1023) << 20)) ^ ((uint32_t)((int)std::floor(gyaw / 0.26f) & 31) << 27);
+                for (int i = 0; i < df2.w * df2.h; i += 4) {
+                    const float* q = &df2.pts[(size_t)i * 3];
+                    if (std::isnan(q[0])) continue;
+                    float ex = q[0] - df2.eye[0], ey = q[1] - df2.eye[1], ez = q[2] - df2.eye[2], len = std::sqrt(ex * ex + ey * ey + ez * ez);
+                    if (len > 4) continue;
+                    for (float st = 0.3f; st < len - 0.08f; st += 0.05f) {
+                        auto it = map.find(key((int)std::floor((df2.eye[0] + ex * st / len) / VOX), (int)std::floor((df2.eye[1] + ey * st / len) / VOX), (int)std::floor((df2.eye[2] + ez * st / len) / VOX)));
+                        if (it == map.end() || it->second.last_frame == frame_id) continue;
+                        if (++it->second.misses >= 3 && it->second.misses > it->second.n) map.erase(it);
+                    }
+                }
+                for (int i = 0; i < df2.w * df2.h; i += 2) {
+                    const float* q = &df2.pts[(size_t)i * 3];
+                    if (std::isnan(q[0])) continue;
+                    float ex = q[0] - df2.eye[0], ey = q[1] - df2.eye[1], ez = q[2] - df2.eye[2];
+                    if (ex * ex + ey * ey + ez * ez > 16) continue;
+                    uint64_t k = key((int)std::floor(q[0] / VOX), (int)std::floor(q[1] / VOX), (int)std::floor(q[2] / VOX));
+                    auto it = map.find(k);
+                    if (it == map.end()) {
+                        if (map.size() >= MAX_VOXELS) continue;
+                        it = map.emplace(k, Voxel{}).first;
+                    }
+                    Voxel& vx = it->second;
+                    if (vx.last_frame == frame_id) continue;
+                    vx.last_frame = frame_id;
+                    if (vx.n < 60000) { for (int a = 0; a < 3; a++) vx.sum[a] += q[a]; vx.n++; }
+                    if (vx.misses) vx.misses--;
+                    bool known = false;
+                    for (int a = 0; a < vx.nviews; a++) if (vx.views[a] == view) known = true;
+                    if (!known && vx.nviews < 4) vx.views[vx.nviews++] = view;
+                }
+                std::lock_guard<std::mutex> l(g.mu);
+                g.dbg_dense.swap(dbg); g.dense_version++;
+            }
+        }
         int req = g_request.exchange(0);
         if (req == 2) {
             map.clear(); level.clear(); upright.clear(); model = Model{};
+            locked_floor = NAN; { std::lock_guard<std::mutex> l(g_zone_mu); g_zone.on = false; }
             std::lock_guard<std::mutex> l(g.mu);
             g.points.clear(); g.planes.clear(); g.anchors.clear(); g.voxels = 0; g.version++;
             g.mesh.clear(); g.mesh_version++; g.mesh_tris = 0;
@@ -651,8 +663,58 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         if (!t_img || w != 640 || h != 480) { Sleep(3); continue; }
         float head[16];
         if (!pose_at(t_img, head)) continue;
-        head_min_y = std::min(head_min_y, head[7]);
+        if (g_floor_request.exchange(0)) { cal_until = hands::qpc_s() + 3.0; cal_y.clear(); set_cal("regarde le sol à tes pieds…"); }
+        if (cal_until > 0) {
+            // While calibrating: every floor point under the gaze when it looks down (the stereo's).
+            bool down = -head[6] < -0.6f;
+            if (hands::qpc_s() > cal_until) {
+                cal_until = 0;
+                float fy = NAN;
+                char b[120];
+                // The floor is the lowest surface seen (the legs and the feet, above it, are
+                // more points): the lowest 2 cm level with 15 % of the strongest one's points.
+                if (cal_y.size() >= 80) {
+                    std::map<int, int> hb;
+                    for (float y : cal_y) hb[(int)std::floor(y / 0.02f)]++;
+                    int top = 0;
+                    for (auto& [bb, n] : hb) top = std::max(top, n);
+                    for (auto& [bb, n] : hb) {
+                        int nn = n + (hb.count(bb + 1) ? hb[bb + 1] : 0);
+                        if (nn < std::max(40, (int)(0.15f * top))) continue;
+                        double sy = 0; int k = 0;
+                        for (float y : cal_y) if (std::fabs(y - (bb + 1) * 0.02f) < 0.04f) { sy += y; k++; }
+                        fy = (float)(sy / k);
+                        break;
+                    }
+                }
+                // The points are 0.6 m under the eyes at least (not the legs, a bed or a desk seen
+                // from a chair): standing, seated or lying, what remains is the floor.
+                if (std::isnan(fy)) {
+                    snprintf(b, sizeof b, "sol pas vu (%zu points) : regarde le sol à 1 m devant toi, puis recommence", cal_y.size());
+                    hands::logf("room: floor calibration failed: %s\n", b);
+                } else {
+                    snprintf(b, sizeof b, "sol mesuré à %.2f m sous les yeux (%zu points)", head[7] - fy, cal_y.size());
+                    locked_floor = fy;
+                    { std::lock_guard<std::mutex> l(g_zone_mu); g_zone.on = true; g_zone.x = head[3]; g_zone.z = head[11]; }
+                    hands::logf("room: floor calibrated: %s, zone %.1f m around (%.2f, %.2f)\n", b, (float)g_zone.r, head[3], head[11]);
+                }
+                set_cal(b);
+            }
+        }
+        if (int st = g_stand.exchange(0)) {
+            // Standing: the eyes are g_eye_height above the floor; seated, SEATED_EYES: the
+            // standing head would be higher by the difference.
+            head_max_y = head[7] + (st == 2 ? g_eye_height - SEATED_EYES : 0.0f);
+        }
+        head_min_y = std::min(head_min_y, head[7]); head_max_y = std::max(head_max_y, head[7]);
 
+        // MYVITURE_STEREO_DUMP=<dir>: 20 raw image pairs (640x480 left then right), one a second, for offline comparisons.
+        static const char* dump_dir = getenv("MYVITURE_STEREO_DUMP");
+        static int dumped = 0; static double dump_t = 0;
+        if (dump_dir && dumped < 20 && hands::qpc_s() - dump_t > 1 && w == depth::SRC_W && h == depth::SRC_H) {
+            char fn[512]; snprintf(fn, sizeof fn, "%s/pair%02d.raw", dump_dir, dumped);
+            if (FILE* fp = fopen(fn, "wb")) { fwrite(img[0].data(), 1, (size_t)w * h, fp); fwrite(img[1].data(), 1, (size_t)w * h, fp); fclose(fp); dumped++; dump_t = hands::qpc_s(); }
+        }
         double t0 = hands::qpc_s();
         if (!stereo.compute(img[0].data(), img[1].data(), df)) continue;
         df.t = t_img;
@@ -673,83 +735,45 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
 
         if (g_scan) {
             frame_id++;
-            // Viewpoint: head position to 10 cm and heading to 15 deg; a voxel counts as
-            // confirmed only when seen from several, so one viewpoint's noise does not stay.
-            double hx = head[3], hy = head[7], hz = head[11], hyaw = std::atan2(-head[2], -head[10]);
-            uint32_t view = (uint32_t)(((int)std::floor(hx / 0.1) & 1023) | (((int)std::floor(hy / 0.1) & 1023) << 10) | (((int)std::floor(hz / 0.1) & 1023) << 20)) ^ ((uint32_t)((int)std::floor(hyaw / 0.26) & 31) << 27);
-            double o[3] = {hx, hy, hz};
-            const int GW = depth::W / 2;
+            // The stereo's points (world): the floor, the planes and Depth Anything's scale.
+            double hx = head[3], hy = head[7], hz = head[11];
             std::fill(wpts.begin(), wpts.end(), NAN);
-            std::fill(wcat.begin(), wcat.end(), (uint8_t)0);
-            {
-                std::lock_guard<std::mutex> l(semseg::g_mu);
-                if (semseg::g_map.seq != sem.seq) { sem = semseg::g_map; sem_got = hands::qpc_s(); }
-            }
-            bool sem_ok = !sem.cat.empty() && hands::qpc_s() - sem_got < 1.5;
-            for (int v = 0; v < depth::H; v += 2) for (int u = 0; u < depth::W; u += 2) {
+            for (int v = 0; v < depth::H; v += ST) for (int u = 0; u < depth::W; u += ST) {
                 float z = df.depth[v * depth::W + u];
                 if (!(z > 0.3f && z < 3.0f)) continue;
                 double ph[3], pw[3];
                 df.point(u, v, z, ph);
                 if (!hand_pts.empty() && near_hand(ph)) continue;
                 for (int i = 0; i < 3; i++) pw[i] = head[i * 4] * ph[0] + head[i * 4 + 1] * ph[1] + head[i * 4 + 2] * ph[2] + head[i * 4 + 3];
-                float* wp = &wpts[((v / 2) * GW + u / 2) * 3];
+                float* wp = &wpts[((v / ST) * GW + u / ST) * 3];
                 wp[0] = (float)pw[0]; wp[1] = (float)pw[1]; wp[2] = (float)pw[2];
-                uint8_t pc = sem_ok ? (uint8_t)sem.at(wp) : 0;
-                wcat[(v / 2) * GW + u / 2] = pc;
-                // Free space: voxels on the ray before the surface were seen through.
-                double dx = pw[0] - o[0], dy = pw[1] - o[1], dz = pw[2] - o[2];
-                double len = std::sqrt(dx * dx + dy * dy + dz * dz);
-                for (double s = 0.3; s < len - 0.06; s += 0.05) {
-                    auto it = map.find(key((int)std::floor((o[0] + dx * s / len) / VOX), (int)std::floor((o[1] + dy * s / len) / VOX), (int)std::floor((o[2] + dz * s / len) / VOX)));
-                    if (it == map.end() || it->second.last_frame == frame_id) continue;
-                    if (++it->second.misses >= 4 && it->second.misses > it->second.n) map.erase(it);
-                }
-                uint64_t k = key((int)std::floor(pw[0] / VOX), (int)std::floor(pw[1] / VOX), (int)std::floor(pw[2] / VOX));
-                auto it = map.find(k);
-                if (it == map.end()) {
-                    if (map.size() >= MAX_VOXELS) continue;
-                    it = map.emplace(k, Voxel{}).first;
-                }
-                Voxel& vx = it->second;
-                if (vx.last_frame == frame_id) continue;  // once per frame
-                vx.last_frame = frame_id;
-                if (vx.n < 60000) { for (int i = 0; i < 3; i++) vx.sum[i] += (float)pw[i]; vx.n++; }
-                vote(vx.cat, vx.cat_n, pc);
-                if (vx.misses) vx.misses--;
-                bool known = false;
-                for (int i = 0; i < vx.nviews; i++) if (vx.views[i] == view) known = true;
-                if (!known && vx.nviews < 4) vx.views[vx.nviews++] = view;
             }
-            // Plane evidence: the normal at each point from its neighbours 4 px right and
-            // down (same surface: depth within 4 cm + 3 %), facing the camera; level
-            // (n.y > 0.96) or upright (|n.y| < 0.15). Under 2.8 m: farther normals are noise.
-            const int GH = depth::H / 2, K = 2;
-            float fx = (float)hx, fy = (float)hy, fz = (float)hz;
-            for (int j = 0; j + K < GH; j++) for (int i = 0; i + K < GW; i++) {
-                const float* a = &wpts[(j * GW + i) * 3];
-                const float* b = &wpts[(j * GW + i + K) * 3];
-                const float* c2 = &wpts[((j + K) * GW + i) * 3];
-                if (std::isnan(a[0]) || std::isnan(b[0]) || std::isnan(c2[0])) continue;
-                float da = std::sqrt((a[0] - fx) * (a[0] - fx) + (a[1] - fy) * (a[1] - fy) + (a[2] - fz) * (a[2] - fz));
-                if (da > 2.8f) continue;
-                float db = std::sqrt((b[0] - fx) * (b[0] - fx) + (b[1] - fy) * (b[1] - fy) + (b[2] - fz) * (b[2] - fz));
-                float dc = std::sqrt((c2[0] - fx) * (c2[0] - fx) + (c2[1] - fy) * (c2[1] - fy) + (c2[2] - fz) * (c2[2] - fz));
-                float tol = 0.04f + 0.03f * da;
-                if (std::fabs(db - da) > tol || std::fabs(dc - da) > tol) continue;
-                float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c2[0] - a[0], c2[1] - a[1], c2[2] - a[2]};
-                float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
-                float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-                if (nl < 1e-8f) continue;
-                for (float& x : n) x /= nl;
-                if (n[0] * (fx - a[0]) + n[1] * (fy - a[1]) + n[2] * (fz - a[2]) < 0) for (float& x : n) x = -x;
-                std::unordered_map<uint64_t, Evid>* dst = n[1] > 0.96f ? &level : std::fabs(n[1]) < 0.15f ? &upright : nullptr;
-                if (!dst || dst->size() > 300000) continue;
-                Evid& e = (*dst)[ekey(a[0], a[1], a[2])];
-                if (e.n >= 2000) continue;
-                for (int q = 0; q < 3; q++) e.sum[q] += a[q];
-                e.nx += n[0]; e.nz += n[2]; e.n++;
-                vote(e.cat, e.cat_n, wcat[j * GW + i]);
+            // Plane evidence from the stereo, under 2.8 m (farther normals are noise).
+            float eye[3] = {(float)hx, (float)hy, (float)hz};
+            add_evidence(wpts.data(), GW, GH, 2, eye, 2.8f, level, upright);
+            if (cal_until > 0 && -head[6] < -0.6f) {
+                for (int j = GH / 4; j < GH * 3 / 4; j++) for (int i = GW / 4; i < GW * 3 / 4; i++) {
+                    const float* q = &wpts[(j * GW + i) * 3];
+                    // Off one's own body: 0.3 to 1.5 m from the head, along the floor.
+                    if (std::isnan(q[0]) || q[1] > hy - 0.6) continue;
+                    double rr = (q[0] - hx) * (q[0] - hx) + (q[2] - hz) * (q[2] - hz);
+                    if (rr > 0.09 && rr < 2.25) cal_y.push_back(q[1]);
+                }
+            }
+            // Looking at one's feet (the gaze 48 degrees or more down): the stereo points at the
+            // centre of the view are the floor. Their median height, kept over the last 30 looks.
+            if (-head[6] < -0.75f) {
+                std::vector<float> ys;
+                for (int j = GH / 2 - 12; j < GH / 2 + 12; j++) for (int i = GW / 2 - 16; i < GW / 2 + 16; i++) {
+                    const float* q = &wpts[(j * GW + i) * 3];
+                    if (!std::isnan(q[0]) && q[1] < hy - 0.5) ys.push_back(q[1]);
+                }
+                if (ys.size() >= 40) {
+                    std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
+                    gaze_floor.push_back(ys[ys.size() / 2]);
+                    if (gaze_floor.size() > 30) gaze_floor.erase(gaze_floor.begin());
+                    hands::logf("room: looking down, floor under the gaze at %.2f m (%zu points, head %.2f)\n", ys[ys.size() / 2], ys.size(), hy);
+                }
             }
         }
 
@@ -765,8 +789,10 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
                     if (it != map.end() && confirmed(it->second)) { hit = true; for (int i = 0; i < 3; i++) hp[i] = it->second.sum[i] / it->second.n; }
                 }
             }
+            std::string label;
+            { std::lock_guard<std::mutex> l2(g_label_mu); label = g_anchor_label; }
             std::lock_guard<std::mutex> l(g.mu);
-            if (hit) { g.anchors.push_back({g.next_anchor++, {(float)hp[0], (float)hp[1], (float)hp[2]}}); save_anchors(); g.status = ""; }
+            if (hit) { g.anchors.push_back({g.next_anchor++, {(float)hp[0], (float)hp[1], (float)hp[2]}, label}); save_anchors(); g.status = ""; }
             else g.status = "ancre : rien de scanné dans cette direction";
         }
 
@@ -776,6 +802,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         bool remesh = refresh && now - last_mesh > 4 && !meshing;
         std::vector<Plane> planes;
         std::vector<float> pts;
+        std::shared_ptr<std::unordered_set<uint64_t>> solid;
         size_t purged = 0;
         if (refresh) {
             last_planes = now;
@@ -786,7 +813,8 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
                 if (!confirmed(it->second) && frame_id - it->second.last_frame > 40) { it = map.erase(it); purged++; }
                 else ++it;
             }
-            model = room_model(level, upright, map, head_min_y);
+            Zone zone; { std::lock_guard<std::mutex> l(g_zone_mu); zone = g_zone; }
+            model = room_model(level, upright, map, head_min_y, head_max_y, gaze_floor, head[3], head[11], locked_floor, zone);
             planes = model.planes;
             if (remesh) {
                 // Confirmed voxels within MESH_RANGE, nearest first, off the floor and the walls
@@ -823,22 +851,21 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
             double tr1 = hands::qpc_s();
             // Drawing snapshot: confirmed voxels, coloured by height, at most 120k.
             size_t n_conf = 0;
-            for (auto& [k, v] : map) if (confirmed(v)) n_conf++;
+            solid = std::make_shared<std::unordered_set<uint64_t>>();
+            for (auto& [k, v] : map) if (confirmed(v)) { n_conf++; solid->insert(k); }
             int step = (int)std::max<size_t>(1, n_conf / 40000);
             int i = 0;
             float floor_y = model.floor_y;
-            // Coloured by category where the segmentation saw it, else by height.
+            // Coloured by height above the floor.
             for (auto& [k, v] : map) {
                 if (!confirmed(v) || (i++ % step)) continue;
                 float x = v.sum[0] / v.n, y = v.sum[1] / v.n, z = v.sum[2] / v.n;
-                if (v.cat_n && v.cat) { auto& cc = semseg::CAT_COLOR[v.cat]; pts.insert(pts.end(), {x, y, z, cc[0], cc[1], cc[2]}); continue; }
                 float t = std::clamp((y - floor_y) / 2.0f, 0.0f, 1.0f);
                 pts.insert(pts.end(), {x, y, z, 0.2f + 0.8f * t, 0.5f + 0.3f * (1 - t), 1.0f - 0.7f * t});
             }
             int walls = 0, tables = 0; for (auto& p : planes) { walls += p.kind == 2; tables += p.kind == 1; }
-            hands::logf("room: %zu voxels (%zu forgotten), evidence %zu level %zu upright, floor %s %.2f m %s(head %.2f), %d tables, %d walls, %zu openings, %zu labelled, walkable %d cells, %.0f ms, snapshot %.0f ms\n",
+            hands::logf("room: %zu voxels (%zu forgotten), evidence %zu level %zu upright, floor %s %.2f m %s(head %.2f), %d tables, %d walls, walkable %d cells, %.0f ms, snapshot %.0f ms\n",
                         map.size(), purged, level.size(), upright.size(), model.has_floor ? "at" : "not seen, guessed at", model.floor_y, model.floor_source.c_str(), head[7], tables, walls,
-                        model.openings.size(), model.labelled,
                         (int)std::count(model.walk.c.begin(), model.walk.c.end(), (uint8_t)1), (tr1 - tr0) * 1000, (hands::qpc_s() - tr1) * 1000);
         }
         std::vector<float> live;
@@ -847,9 +874,8 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         }
         std::vector<float> ev;
         if (refresh) {
-            auto col = [](const Evid& e, float r, float g2, float b) { if (e.cat_n && e.cat) { auto& cc = semseg::CAT_COLOR[e.cat]; return std::array<float, 3>{cc[0], cc[1], cc[2]}; } return std::array<float, 3>{r, g2, b}; };
-            for (auto& [k, e] : level) if (e.n >= 3) { auto cc = col(e, 0.2f, 0.9f, 0.3f); ev.insert(ev.end(), {e.sum[0] / e.n, e.sum[1] / e.n, e.sum[2] / e.n, cc[0], cc[1], cc[2]}); }
-            for (auto& [k, e] : upright) if (e.n >= 3) { auto cc = col(e, 1.0f, 0.55f, 0.15f); ev.insert(ev.end(), {e.sum[0] / e.n, e.sum[1] / e.n, e.sum[2] / e.n, cc[0], cc[1], cc[2]}); }
+            for (auto& [k, e] : level) if (e.n >= 3) ev.insert(ev.end(), {e.sum[0] / e.n, e.sum[1] / e.n, e.sum[2] / e.n, 0.2f, 0.9f, 0.3f});
+            for (auto& [k, e] : upright) if (e.n >= 3) ev.insert(ev.end(), {e.sum[0] / e.n, e.sum[1] / e.n, e.sum[2] / e.n, 1.0f, 0.55f, 0.15f});
         }
         std::lock_guard<std::mutex> l(g.mu);
         if (!live.empty()) { g.dbg_live.swap(live); g.live_version++; }
@@ -860,9 +886,9 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         g.voxels = map.size();
         if (now - rate_t0 > 1) { g.rate = (float)(frames / (now - rate_t0)); frames = 0; rate_t0 = now; }
         if (refresh) {
-            g.planes = planes; g.points = std::move(pts); g.version++;
+            g.planes = planes; g.points = std::move(pts); g.solid = solid; g.version++;
             g.has_floor = model.has_floor; g.floor_y = model.floor_y; g.walk = model.walk; g.walk_version++;
-            g.openings = model.openings; g.labelled = model.labelled; g.floor_source = model.floor_source;
+            g.floor_source = model.floor_source; g.floor_locked = !std::isnan(locked_floor);
         }
     }
     if (mesher.joinable()) mesher.join();

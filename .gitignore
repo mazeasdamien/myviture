@@ -28,6 +28,7 @@ native/myviture_rgb.txt
 native/myviture_robot_frame.txt
 native/myviture_anchors.txt
 native/viture_cam_param.yaml
-native/models/segformer/*.onnx
 native/models/human_*.jpg
 native/models/human_*.png
+native/models/depthanything/*.onnx
+native/*.wav

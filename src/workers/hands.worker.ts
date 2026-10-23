@@ -36,7 +36,7 @@ export type ToHands =
   | { type: 'rgb'; bitmap: ImageBitmap; pose: ImagePose };
 
 export type FromHands =
-  | { type: 'hands'; hands: Hand[]; rate: number; source: 'stereo' | 'rgb'; ms?: { convert: number; detect: number } }
+  | { type: 'hands'; hands: Hand[]; rate: number; source: 'stereo' | 'rgb'; ms?: { waited: number; convert: number; detect: number; posted: number } }
   | { type: 'status'; text: string }
   | { type: 'idle' };
 
@@ -97,12 +97,14 @@ function run() {
     const s = nextStereo;
     nextStereo = null;
     const t0 = performance.now();
+    // Time the pair spent between its arrival and here (absolute clocks).
+    const waited = performance.timeOrigin + t0 - s.pose.stamp;
     const li = toImage(0, s.left), ri = toImage(1, s.right);
     const t1 = performance.now();
     const hands = stereoHands.detect(li, ri, { w: s.w, h: s.h }, rig, worldTransform(s.pose));
     const t2 = performance.now();
     for (const h of hands) h.stamp = s.pose.stamp;
-    post({ type: 'hands', hands, rate: stereoHands.rate.value, source: 'stereo', ms: { convert: t1 - t0, detect: t2 - t1 } });
+    post({ type: 'hands', hands, rate: stereoHands.rate.value, source: 'stereo', ms: { waited, convert: t1 - t0, detect: t2 - t1, posted: performance.timeOrigin + performance.now() } });
     device?.postMessage('ready');
   }
   if (wantRgb && nextRgb) {

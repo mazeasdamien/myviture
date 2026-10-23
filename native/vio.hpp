@@ -68,24 +68,46 @@ inline uint16_t crc16_xmodem(const unsigned char* p, int n) {
     return crc;
 }
 
-enum DisplayMode : unsigned char { MODE_2D = 0x41, MODE_3D = 0x42 };
+// Display modes (the SDK's codes): 3840x1200 side by side at 60 or 90 Hz.
+enum DisplayMode : unsigned char { MODE_2D = 0x41, MODE_3D = 0x42, MODE_3D_90 = 0x45 };
+enum McuMsg : uint16_t { MSG_BRIGHTNESS = 6, MSG_DISPLAY_MODE = 8, MSG_FILM = 14 };
 
-/** 0 on success, libusb error otherwise. */
-inline int set_display_mode(DisplayMode mode) {
+/** One MCU message with a payload of n bytes; 0 on success, libusb error otherwise. */
+inline int mcu_send(uint16_t msg, const unsigned char* payload, int n) {
     void* h = usb_handle_slot ? *usb_handle_slot : nullptr;
-    if (!h || !usb_bulk) return -100;
+    if (!h || !usb_bulk || n > 512 - 18) return -100;
     unsigned char f[512] = {};
-    const uint16_t len = 12 + 1;
+    const uint16_t len = (uint16_t)(12 + n);
     f[0] = 0xff; f[1] = 0xfe;
     f[4] = len & 0xff; f[5] = len >> 8;
-    f[14] = 8;
-    f[18] = mode;
+    f[14] = msg & 0xff; f[15] = msg >> 8;
+    memcpy(f + 18, payload, n);
     uint16_t crc = crc16_xmodem(f + 4, len + 2);
     f[2] = crc & 0xff; f[3] = crc >> 8;
     int sent = 0;
     int rc = usb_bulk(h, 0x06, f, sizeof f, &sent, 1000);
     return rc ? rc : (sent == (int)sizeof f ? 0 : -101);
 }
+
+inline int set_display_mode(DisplayMode mode) { unsigned char m = mode; return mcu_send(MSG_DISPLAY_MODE, &m, 1); }
+/** The electrochromic film: 1 dark, 0 clear (binary on the Luma series). */
+inline int set_film(bool dark) { unsigned char v = dark ? 1 : 0; return mcu_send(MSG_FILM, &v, 1); }
+
+// The engine's own exports, undocumented (signatures read from their code), behind SEH.
+typedef int (*SetLevelFn)(unsigned char);
+typedef int (*VoidFn)();
+typedef void (*RenderParaFn)(void*, void*);
+inline int seh_level(SetLevelFn f, unsigned char v) { __try { return f(v); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1000; } }
+inline int seh_void(VoidFn f) { __try { return f(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1000; } }
+inline int seh_render(RenderParaFn f, void* a, void* b) { __try { f(a, b); return 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return -1000; } }
+inline FARPROC engine_fn(const char* name) { HMODULE m = GetModuleHandleA("carina_vio.dll"); return m ? GetProcAddress(m, name) : nullptr; }
+
+/** The screen's brightness level (the SDK's 0..8). */
+inline int set_brightness(int level) { auto f = (SetLevelFn)engine_fn("carina_a1088_set_display_level"); return f ? seh_level(f, (unsigned char)level) : -100; }
+/** The tracking cameras' exposure: frozen where it is (fixed) or automatic again. */
+inline int set_exposure_fixed(bool fixed) { auto f = (VoidFn)engine_fn(fixed ? "jcx_pause_auto_exposure" : "jcx_resume_auto_exposure"); return f ? seh_void(f) : -100; }
+/** carina_get_render_para: 48 and 128 bytes of the engine's render parameters. */
+inline int get_render_para(unsigned char a[48], unsigned char b[128]) { auto f = (RenderParaFn)engine_fn("carina_get_render_para"); return f ? seh_render(f, a, b) : -100; }
 
 // ------------------------------------------------------------------ start / stop
 
