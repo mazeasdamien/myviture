@@ -11,6 +11,13 @@ A technician assistant for the **VITURE Luma Ultra** optical see-through AR glas
   <img src="docs/images/stereo-depth.jpg" width="49%" alt="Stereo depth: tracking camera, census, SGM">
 </p>
 
+## Dashboard
+
+The desktop dashboard drives everything while you wear the glasses: the 3D view of the room map, the virtual human and your head, and the diagnostics (frame timing, prediction, IMU, tracking cameras, RGB camera).
+
+![Dashboard, 3D scene tab](docs/images/dashboard-3d.jpg)
+![Dashboard, diagnostics tab](docs/images/dashboard-diagnostics.jpg)
+
 ## What it does
 
 The native Windows app (`native/`, C++ / Direct3D 11):
