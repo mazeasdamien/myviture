@@ -47,6 +47,10 @@ native\myviture.exe
 
 Microsoft Rocketbox avatars (MIT), Depth Anything V2 Small (Apache 2.0), ONNX Runtime and DirectML (MIT), Dear ImGui (MIT), MediaPipe hand models via opencv_zoo (Apache 2.0). VITURE's runtime is proprietary and not part of this repository.
 
+## License
+
+[MIT](LICENSE), for the code of this repository (third-party parts keep their own licenses).
+
 ---
 
 ## Français
@@ -86,3 +90,7 @@ native\myviture.exe
 ## Crédits
 
 Avatars Microsoft Rocketbox (MIT), Depth Anything V2 Small (Apache 2.0), ONNX Runtime et DirectML (MIT), Dear ImGui (MIT), modèles des mains MediaPipe via opencv_zoo (Apache 2.0). Le runtime de VITURE est propriétaire et ne fait pas partie de ce dépôt.
+
+## Licence
+
+[MIT](LICENSE), pour le code de ce dépôt (les parties tierces gardent leurs propres licences).
