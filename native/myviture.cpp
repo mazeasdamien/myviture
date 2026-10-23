@@ -362,6 +362,33 @@ float4 ps_inst(VSOutC i) : SV_Target {
 }
 )";
 
+/** Open cylinder, radius 1, from z = 0 to z = 1, `n` sides (the hands' bones). */
+static std::vector<Vertex> cylinder_vertices(int n = 14) {
+    std::vector<Vertex> v;
+    for (int i = 0; i < n; i++) {
+        float a0 = 6.2831853f * i / n, a1 = 6.2831853f * (i + 1) / n;
+        float x0 = cosf(a0), y0 = sinf(a0), x1 = cosf(a1), y1 = sinf(a1);
+        Vertex p00{x0, y0, 0, x0, y0, 0}, p10{x1, y1, 0, x1, y1, 0}, p01{x0, y0, 1, x0, y0, 0}, p11{x1, y1, 1, x1, y1, 0};
+        v.insert(v.end(), {p00, p10, p11, p00, p11, p01});
+    }
+    return v;
+}
+
+/** Sphere, radius 1 (the hands' joints and tips). */
+static std::vector<Vertex> sphere_vertices(int seg = 14, int rings = 8) {
+    std::vector<Vertex> v;
+    auto pt = [&](int i, int j) {
+        float th = 3.14159265f * j / rings, ph = 6.2831853f * i / seg;
+        float x = sinf(th) * cosf(ph), y = sinf(th) * sinf(ph), z = cosf(th);
+        return Vertex{x, y, z, x, y, z};
+    };
+    for (int j = 0; j < rings; j++) for (int i = 0; i < seg; i++) {
+        Vertex a = pt(i, j), b = pt(i + 1, j), c2 = pt(i + 1, j + 1), d = pt(i, j + 1);
+        v.insert(v.end(), {a, b, c2, a, c2, d});
+    }
+    return v;
+}
+
 static std::vector<Vertex> cube_vertices() {
     std::vector<Vertex> v;
     const float n[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
@@ -525,6 +552,11 @@ int main(int argc, char** argv) {
             }
             memcpy(g_app.eye_l, D[0].m, sizeof D[0].m); memcpy(g_app.eye_r, D[1].m, sizeof D[1].m);
             g_app.have_vendor_eyes = true;
+            // The RGB camera's default orientation: the eyes' (same front, same tilt).
+            double Rc[9];
+            for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) Rc[a * 3 + b] = (D[0](b, a) + D[1](b, a)) / 2;  // head -> camera: transposed
+            rgbcal::set_default(Rc);
+            printf("RGB camera default tilt from the engine eyes: %.1f deg\n", std::atan2(Rc[5], Rc[4]) * 57.2958);
             printf("engine eyes: left %.1f %.1f %.1f cm, right %.1f %.1f %.1f cm (IPD %.1f mm)\n", D[0](0, 3) * 100, D[0](1, 3) * 100, D[0](2, 3) * 100,
                    D[1](0, 3) * 100, D[1](1, 3) * 100, D[1](2, 3) * 100, std::hypot(D[1](0, 3) - D[0](0, 3), D[1](1, 3) - D[0](1, 3)) * 1000);
         } else printf("engine eyes: not available, manual display model\n");
@@ -697,6 +729,17 @@ int main(int argc, char** argv) {
     Com<ID3D11Buffer> cube_vb, grid_vb, cb;
     CHECK(make_vb(cube, &cube_vb));
     CHECK(make_vb(grid, &grid_vb));
+    // The hands as hands: bones as rounded cylinders, joints as spheres, a palm.
+    auto cyl = cylinder_vertices(), sph = sphere_vertices();
+    Com<ID3D11Buffer> cyl_vb, sph_vb, palm_vb;
+    CHECK(make_vb(cyl, &cyl_vb));
+    CHECK(make_vb(sph, &sph_vb));
+    const UINT PALM_VERTS = 2 * 2 * 6 * 3;  // 2 hands, 2 faces, 6 triangles
+    {
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = PALM_VERTS * sizeof(Vertex); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        bd.Usage = D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        CHECK(dev->CreateBuffer(&bd, nullptr, &palm_vb));
+    }
     // Hand bones: rewritten every frame.
     const UINT BONE_VERTS = 2 * hands::N_BONES * 2;
     Com<ID3D11Buffer> bone_vb;
@@ -711,6 +754,16 @@ int main(int argc, char** argv) {
     Com<ID3D11RasterizerState> rs; CHECK(dev->CreateRasterizerState(&rd, &rs));
     D3D11_DEPTH_STENCIL_DESC dsd{}; dsd.DepthEnable = TRUE; dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dsd.DepthFunc = D3D11_COMPARISON_LESS;
     Com<ID3D11DepthStencilState> dss; CHECK(dev->CreateDepthStencilState(&dsd, &dss));
+    // Depth only (no colour): the room mesh, so real surfaces hide the virtual behind them.
+    Com<ID3D11BlendState> no_color;
+    { D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].RenderTargetWriteMask = 0; CHECK(dev->CreateBlendState(&bd, &no_color)); }
+    Com<ID3D11Buffer> mesh_vb;
+    {
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = (UINT)(room::MAX_MESH_VERTS * sizeof(Vertex)); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        CHECK(dev->CreateBuffer(&bd, nullptr, &mesh_vb));
+    }
+    UINT mesh_count = 0;
+    uint32_t mesh_version = 0;
 
     // Dashboard on the PC's screen (primary monitor, or any that is not the glasses').
     {
@@ -751,6 +804,10 @@ int main(int argc, char** argv) {
             std::string yaml = cfg && cfg() ? cfg() : "";
             std::string d8(dir.begin(), dir.end());
             if (FILE* f = fopen((d8 + "viture_config.yaml").c_str(), "w")) { fputs(yaml.c_str(), f); fclose(f); }
+            // The engine's camera parameters (a YAML text), kept for reference.
+            typedef const char* (*CamParamFn)();
+            if (auto cp = (CamParamFn)GetProcAddress(GetModuleHandleA("carina_vio.dll"), "carina_a1088_viture_get_cam_param"))
+                if (const char* txt = cp()) if (FILE* f = fopen((d8 + "viture_cam_param.yaml").c_str(), "w")) { fputs(txt, f); fclose(f); }
             if (!g_no_vhands) vhands::start(sdk, yaml, d8 + "vhands_raw.csv");
         }
         if (rig.ok) {
@@ -937,6 +994,15 @@ int main(int argc, char** argv) {
                 for (int side = 0; side < 2; side++) {
                     float w[21][3];
                     if (!vhands::hand_world(vo.data, side, w)) { pinch_state[side] = false; continue; }
+                    // Smoothed per joint on the answers' own times (VITURE's joints come raw).
+                    static vhands::OneEuro filt[2][hands::N_JOINTS][3];
+                    static uint32_t filt_seq[2] = {0, 0};
+                    static float smoothed[2][hands::N_JOINTS][3];
+                    if (filt_seq[side] != vo.seq) {
+                        filt_seq[side] = vo.seq;
+                        for (int k = 0; k < hands::N_JOINTS; k++) for (int a = 0; a < 3; a++) smoothed[side][k][a] = (float)filt[side][k][a].apply(w[k][a], vo.t);
+                    }
+                    memcpy(w, smoothed[side], sizeof w);
                     SceneHand sh{side == 1, false, 0, {}};
                     for (int k = 0; k < hands::N_JOINTS; k++) {
                         const float* q = w[k];
@@ -970,6 +1036,15 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> l(room::g.mu);
             planes = room::g.planes;
             anchors = room::g.anchors;
+            if (room::g.mesh_version != mesh_version) {
+                mesh_version = room::g.mesh_version;
+                D3D11_MAPPED_SUBRESOURCE m;
+                if (SUCCEEDED(ctx->Map(mesh_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                    mesh_count = (UINT)std::min(room::MAX_MESH_VERTS, room::g.mesh.size() / 6);
+                    memcpy(m.pData, room::g.mesh.data(), (size_t)mesh_count * sizeof(Vertex));
+                    ctx->Unmap(mesh_vb, 0);
+                }
+            }
             if (room::g.version != inst_version && !room::g.points.empty()) {
                 inst_version = room::g.version;
                 D3D11_MAPPED_SUBRESOURCE m;
@@ -1042,6 +1117,32 @@ int main(int argc, char** argv) {
             test_panel.draw(ctx, "myViture · test des mains", lines, lit ? "touché !" : "touche-moi", lit);
         }
 
+        // Palms: the wrist and the knuckles as a fan, two faces 7 mm apart (some thickness).
+        UINT palm_count = 0;
+        {
+            std::vector<Vertex> pv;
+            for (auto& h : scene_hands) {
+                const int ring[6] = {0, 1, 5, 9, 13, 17};
+                V3 cen{0, 0, 0};
+                for (int k : ring) { cen.x += h.j[k].x / 6; cen.y += h.j[k].y / 6; cen.z += h.j[k].z / 6; }
+                V3 a{h.j[5].x - h.j[0].x, h.j[5].y - h.j[0].y, h.j[5].z - h.j[0].z}, b{h.j[17].x - h.j[0].x, h.j[17].y - h.j[0].y, h.j[17].z - h.j[0].z};
+                V3 n{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+                float nl = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+                if (nl < 1e-6f) continue;
+                n = {n.x / nl, n.y / nl, n.z / nl};
+                for (int side = -1; side <= 1; side += 2) {
+                    float o = 0.0035f * side;
+                    auto P = [&](const V3& p) { return Vertex{p.x + n.x * o, p.y + n.y * o, p.z + n.z * o, n.x * side, n.y * side, n.z * side}; };
+                    for (int i = 0; i < 6; i++) { pv.push_back(P(cen)); pv.push_back(P(h.j[ring[i]])); pv.push_back(P(h.j[ring[(i + 1) % 6]])); }
+                }
+            }
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (!pv.empty() && pv.size() <= PALM_VERTS && SUCCEEDED(ctx->Map(palm_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                memcpy(m.pData, pv.data(), pv.size() * sizeof(Vertex));
+                ctx->Unmap(palm_vb, 0);
+                palm_count = (UINT)pv.size();
+            }
+        }
         UINT bone_count = 0;
         if (!scene_hands.empty()) {
             D3D11_MAPPED_SUBRESOURCE m;
@@ -1085,19 +1186,54 @@ int main(int argc, char** argv) {
                 ctx->IASetPrimitiveTopology(topo);
                 ctx->Draw(n, 0);
             };
-            // Hands: joints as small cubes, bones as lines (left blue, right orange; white when pinching).
-            for (size_t hi = 0; hi < scene_hands.size(); hi++) {
-                auto& h = scene_hands[hi];
-                float r = h.pinching ? 1.0f : h.right ? 1.0f : 0.3f, g = h.pinching ? 1.0f : h.right ? 0.48f : 0.55f, b = h.pinching ? 1.0f : h.right ? 0.27f : 1.0f;
-                for (int k = 0; k < hands::N_JOINTS; k++) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[k]), scale(k % 4 == 0 ? 0.012f : 0.009f)), r, g, b, true);
+            // The room mesh first: drawn (dim, so it stays see-through in the glasses) or depth
+            // only, so the virtual behind a real surface is hidden.
+            if (mesh_count && (g_app.show_map || g_app.occlusion)) {
+                if (!g_app.show_map) ctx->OMSetBlendState(no_color, nullptr, 0xffffffff);
+                draw(mesh_vb, mesh_count, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, recenter, 0.22f, 0.30f, 0.42f, true);
+                if (!g_app.show_map) ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
             }
-            if (bone_count) {
-                Constants c{vpm, identity(), {0.9f, 0.9f, 0.9f, 1}, {0, 0, 0, 0}};
-                ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
-                ID3D11Buffer* vbs[] = {bone_vb};
-                ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-                ctx->Draw(bone_count, 0);
+            // Hands: skin-coloured bones (rounded cylinders) and a palm; lighter when pinching.
+            {
+                // Finger widths (radius, m): thumb to little, thinner towards the tips.
+                auto radius = [](int k) {
+                    static const float R[21] = {0.016f, 0.012f, 0.011f, 0.0095f, 0.0085f, 0.0105f, 0.0095f, 0.0085f, 0.0075f, 0.0105f, 0.0095f, 0.0085f, 0.0075f,
+                                                0.0100f, 0.0090f, 0.0080f, 0.0072f, 0.0090f, 0.0080f, 0.0072f, 0.0065f};
+                    return R[k];
+                };
+                auto bone_model = [](const V3& a, const V3& b, float r) {
+                    float wx = b.x - a.x, wy = b.y - a.y, wz = b.z - a.z, L = sqrtf(wx * wx + wy * wy + wz * wz);
+                    M4 m = identity();
+                    if (L < 1e-5f) { m(0, 0) = m(1, 1) = m(2, 2) = 0; return m; }
+                    wx /= L; wy /= L; wz /= L;
+                    // u: any unit vector across the bone, v = w x u.
+                    float ux = fabsf(wx) < 0.9f ? 0 : -wz, uy = fabsf(wx) < 0.9f ? -wz : 0, uz = fabsf(wx) < 0.9f ? wy : wx;
+                    float un = sqrtf(ux * ux + uy * uy + uz * uz); ux /= un; uy /= un; uz /= un;
+                    float vx = wy * uz - wz * uy, vy = wz * ux - wx * uz, vz = wx * uy - wy * ux;
+                    m(0, 0) = ux * r; m(1, 0) = uy * r; m(2, 0) = uz * r;
+                    m(0, 1) = vx * r; m(1, 1) = vy * r; m(2, 1) = vz * r;
+                    m(0, 2) = wx * L; m(1, 2) = wy * L; m(2, 2) = wz * L;
+                    m(0, 3) = a.x; m(1, 3) = a.y; m(2, 3) = a.z;
+                    return m;
+                };
+                for (auto& h : scene_hands) {
+                    float r = h.pinching ? 1.0f : 0.92f, g = h.pinching ? 0.86f : 0.68f, b = h.pinching ? 0.78f : 0.56f;
+                    for (auto& bn : hands::BONES) {
+                        if (bn[0] == 0 && bn[1] != 1) continue;  // wrist to the knuckles: the palm covers it
+                        float rb = std::min(radius(bn[0]), radius(bn[1]));
+                        draw(cyl_vb, (UINT)cyl.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, bone_model(h.j[bn[0]], h.j[bn[1]], rb), r, g, b, true);
+                    }
+                    for (int k = 1; k < hands::N_JOINTS; k++) draw(sph_vb, (UINT)sph.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[k]), scale(radius(k))), r, g, b, true);
+                    draw(sph_vb, (UINT)sph.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[0]), scale(0.017f)), r, g, b, true);
+                }
+                if (palm_count) {
+                    Constants c{vpm, identity(), {0.92f, 0.68f, 0.56f, 1}, {1, 0, 0, 0}};
+                    ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                    ID3D11Buffer* vbs[] = {palm_vb};
+                    ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx->Draw(palm_count, 0);
+                }
             }
             if (panel_ok && g_app.panel) {
                 Constants c{mul(vpm, translate(PANEL_AT)), translate(PANEL_AT), {1, 1, 1, 1}, {0, 0, 0, 0}};
@@ -1120,7 +1256,7 @@ int main(int argc, char** argv) {
             // Anchors: small cyan cubes on the real surfaces (tracking frame -> scene).
             for (auto& a : anchors) draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(mul(recenter, translate({a.p[0], a.p[1], a.p[2]})), scale(0.03f)), 0.3f, 1.0f, 1.0f, true);
             // The scanned room, one small cube per voxel.
-            if ((g_app.show_map || g_app.calage) && inst_count) {
+            if ((g_app.calage || (g_app.show_map && !mesh_count)) && inst_count) {
                 Constants c{mul(vpm, recenter), recenter, {1, 1, 1, 1}, {1, room::VOX * (g_app.calage ? 0.25f : 0.7f), 0, 0}};
                 ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
                 ID3D11Buffer* vbs[] = {cube_vb, inst_vb};
@@ -1381,8 +1517,19 @@ int main(int argc, char** argv) {
             stats_t0 = qpc_now();
         }
         if (dash_on) dash::frame(g_app);
-        if (snapshot_s > 0 && qpc_ms(qpc_now() - frame_t0) > snapshot_s * 1000) {
-            snapshot_s = 0;
+        // Tests: --snapshot N saves both tabs, dashboard_rgb.png then dashboard_diag.png.
+        {
+            static int snap_phase = 0;
+            double el = qpc_ms(qpc_now() - frame_t0) / 1000;
+            wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            std::wstring dir = exe; dir = dir.substr(0, dir.find_last_of(L'\\') + 1);
+            if (snapshot_s > 0 && snap_phase == 0 && el > snapshot_s) { g_app.tab_request = 0; snap_phase = 1; }
+            else if (snap_phase == 1 && el > snapshot_s + 1) { g_app.snapshot = true; snap_phase = 2; }
+            else if (snap_phase == 2 && el > snapshot_s + 2) { MoveFileExW((dir + L"dashboard.png").c_str(), (dir + L"dashboard_rgb.png").c_str(), MOVEFILE_REPLACE_EXISTING); g_app.tab_request = 1; snap_phase = 3; }
+            else if (snap_phase == 3 && el > snapshot_s + 3) { g_app.snapshot = true; snap_phase = 4; }
+            else if (snap_phase == 4 && el > snapshot_s + 4) { MoveFileExW((dir + L"dashboard.png").c_str(), (dir + L"dashboard_diag.png").c_str(), MOVEFILE_REPLACE_EXISTING); g_app.tab_request = 0; snap_phase = 5; snapshot_s = 0; }
+        }
+        if (false) {
             wchar_t exe[MAX_PATH];
             GetModuleFileNameW(nullptr, exe, MAX_PATH);
             std::wstring png = exe;

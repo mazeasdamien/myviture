@@ -282,59 +282,87 @@ inline void run(std::wstring model_dir, calib::Rig rig, PoseFn pose_at) {
             h.gesture = classify(h.joints, h.pinch_m < 0.025f, h.ext);
             double dt = vo.t - prev_t[side];
             if (prev_t[side] > 0 && dt > 0.005 && dt < 0.5) {
-                float mx = w[0][0] - prev_w[side][0], my = w[0][1] - prev_w[side][1], mz = w[0][2] - prev_w[side][2];
+                float mx = h.joints[0][0] - prev_w[side][0], my = h.joints[0][1] - prev_w[side][1], mz = h.joints[0][2] - prev_w[side][2];
                 h.speed = (float)(std::sqrt(mx * mx + my * my + mz * mz) / dt);
             } else h.speed = 1;
-            for (int a = 0; a < 3; a++) prev_w[side][a] = w[0][a];
+            for (int a = 0; a < 3; a++) prev_w[side][a] = h.joints[0][a];  // head frame: the RGB camera moves with the head
             prev_t[side] = vo.t;
             res.hands.push_back(h);
         }
 
         // RGB camera fit: still hands, at most 4 per second (2 once fitted).
         bool fitted = rgbcal::get().fitted;
+        if (fitted && rgbcal::g_frozen) {
+            double now = qpc_s();
+            if (now - rate_t0 >= 1) { rate = (float)(answers / (now - rate_t0)); answers = 0; rgb_runs = 0; rate_t0 = now; }
+            std::lock_guard<std::mutex> l(g_mu);
+            res.status = g_result.status; res.rate = rate; res.pose_fails = g_result.pose_fails;
+            g_result = std::move(res);
+            continue;
+        }
         bool any_still = false;
         for (auto& h : res.hands) if (h.speed < 0.15f) any_still = true;
         if (have_model && any_still && qpc_s() - last_rgb_t > (fitted ? 0.5 : 0.25)) {
             last_rgb_t = qpc_s();
-            Roi rois[2]; bool cropped[2] = {false, false};
-            std::vector<float> crops[2];
+            // The newest RGB frame and where the current camera model puts each still hand.
+            static std::vector<uint32_t> frame;
+            int fw = 0, fh = 0;
+            rgbcal::Cam cam;
             {
                 std::lock_guard<std::mutex> l(rgbcam::g_frame.mu);
                 auto& f = rgbcam::g_frame;
-                if (f.w && f.bgra.size() >= (size_t)f.w * f.h) {
-                    rgbcal::Cam cam = rgbcal::current(f.w, f.h);
-                    for (size_t i = 0; i < res.hands.size() && i < 2; i++) {
-                        if (res.hands[i].speed >= 0.15f) continue;
-                        float proj[N_JOINTS][2];
-                        bool ok = true;
-                        for (int k = 0; k < N_JOINTS && ok; k++) {
-                            double p[3] = {res.hands[i].joints[k][0], res.hands[i].joints[k][1], res.hands[i].joints[k][2]}, u, v;
-                            ok = rgbcal::project(cam, p, u, v);
-                            proj[k][0] = (float)u; proj[k][1] = (float)v;
-                        }
-                        if (!ok) continue;
-                        rois[i] = roi_from_landmarks(proj);
-                        rois[i].size *= cam.fitted ? 1.3 : 1.8;  // more margin before the first fit
-                        crops[i].resize(224 * 224 * 3);
-                        crop_bgra(f.bgra.data(), f.w, f.h, rois[i], 224, crops[i].data());
-                        cropped[i] = true;
-                    }
-                }
+                if (f.w && f.bgra.size() >= (size_t)f.w * f.h) { frame = f.bgra; fw = f.w; fh = f.h; cam = rgbcal::current(f.w, f.h); }
             }
             std::vector<rgbcal::Pair> pairs;
             double wrist[3] = {0, 0, 0};
-            for (size_t i = 0; i < res.hands.size() && i < 2; i++) {
-                if (!cropped[i]) continue;
+            static double last_log = 0;
+            float best_logged = 0;
+            for (size_t i = 0; fw && i < res.hands.size() && i < 2; i++) {
+                if (res.hands[i].speed >= 0.15f) continue;
+                float proj[N_JOINTS][2];
+                bool ok = true;
+                for (int k = 0; k < N_JOINTS && ok; k++) {
+                    double p[3] = {res.hands[i].joints[k][0], res.hands[i].joints[k][1], res.hands[i].joints[k][2]}, u, v;
+                    ok = rgbcal::project(cam, p, u, v);
+                    proj[k][0] = (float)u; proj[k][1] = (float)v;
+                }
+                if (!ok) continue;
+                Roi base = roi_from_landmarks(proj);
+                base.size *= cam.fitted ? 1.3 : 1.5;
+                // Before the first fit the model can be far off: look around the projection
+                // too (3 x 3 offsets of 60 % of the region), keep the most confident.
+                std::vector<Roi> tries;
+                if (cam.fitted) tries.push_back(base);
+                else for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) { Roi r = base; r.cx += dx * 0.6 * base.size; r.cy += dy * 0.6 * base.size; tries.push_back(r); }
+                float best = 0; float best_lm[N_JOINTS][2];
                 double t0 = qpc_s();
-                float pres, hand;
-                bool found = landmarks_run(M, crops[i], rois[i], res.hands[i].rgb, pres, hand) && pres >= 0.5f;
+                for (auto& r : tries) {
+                    crop_bgra(frame.data(), fw, fh, r, 224, crop_in.data());
+                    float pres, hand, lm[N_JOINTS][2];
+                    rgb_runs++;
+                    if (landmarks_run(M, crop_in, r, lm, pres, hand) && pres > best) { best = pres; memcpy(best_lm, lm, sizeof lm); }
+                }
+                // Refined once on the region the landmarks give (MediaPipe's own tracking).
+                if (best >= 0.5f) {
+                    Roi r = roi_from_landmarks(best_lm);
+                    crop_bgra(frame.data(), fw, fh, r, 224, crop_in.data());
+                    float pres, hand, lm[N_JOINTS][2];
+                    rgb_runs++;
+                    if (landmarks_run(M, crop_in, r, lm, pres, hand) && pres >= 0.5f) memcpy(best_lm, lm, sizeof lm);
+                }
                 res.rgb_ms = (float)((qpc_s() - t0) * 1000);
-                rgb_runs++;
-                if (!found) continue;
+                best_logged = std::max(best_logged, best);
+                if (best < 0.5f) continue;
+                memcpy(res.hands[i].rgb, best_lm, sizeof best_lm);
                 res.hands[i].rgb_seen = true;
                 for (int a = 0; a < 3; a++) wrist[a] = res.hands[i].joints[0][a];
                 for (int k = 0; k < N_JOINTS; k++)
-                    pairs.push_back({{res.hands[i].joints[k][0], res.hands[i].joints[k][1], res.hands[i].joints[k][2]}, res.hands[i].rgb[k][0], res.hands[i].rgb[k][1]});
+                    pairs.push_back({{res.hands[i].joints[k][0], res.hands[i].joints[k][1], res.hands[i].joints[k][2]}, best_lm[k][0], best_lm[k][1]});
+            }
+            if (qpc_s() - last_log > 2) {
+                last_log = qpc_s();
+                int frames_now, runs; double spread; { std::lock_guard<std::mutex> l(rgbcal::g_mu); frames_now = rgbcal::g_frames; spread = rgbcal::g_spread; runs = rgbcal::g_fit_runs; }
+                logf("rgb fit: still hand in RGB, best presence %.2f, %d poses so far, wrists spread %.0f cm, %d fits run%s\n", best_logged, frames_now, spread * 100, runs, cam.fitted ? " (fitted)" : "");
             }
             if (!pairs.empty()) {
                 static int logged = 0;

@@ -225,6 +225,31 @@ static void plot(const char* label, const std::vector<float>& v, float lo, float
     ImGui::PlotLines(label, v.empty() ? nullptr : v.data(), (int)v.size(), 0, overlay, lo, hi, ImVec2(-1, height));
 }
 
+/** A label above a full-width slider (narrow panels cut labels on the right). */
+static bool slider_f(const char* label, float* v, float lo, float hi, const char* fmt) {
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::PushID(label);
+    bool r = ImGui::SliderFloat("##v", v, lo, hi, fmt);
+    ImGui::PopID();
+    return r;
+}
+static bool slider_i(const char* label, int* v, int lo, int hi) {
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::PushID(label);
+    bool r = ImGui::SliderInt("##v", v, lo, hi);
+    ImGui::PopID();
+    return r;
+}
+
+/** The loaded or last fit's numbers (a reloaded fit has not run this session). */
+static void fit_numbers(double& rms, int& n) {
+    std::lock_guard<std::mutex> l(rgbcal::g_mu);
+    rms = rgbcal::g_fit.n ? rgbcal::g_fit.rms_px : rgbcal::g_loaded_rms;
+    n = rgbcal::g_fit.n ? rgbcal::g_fit.n : rgbcal::g_loaded_n;
+}
+
 /**
  * The RGB view in large: the RGB camera's picture with the virtual scene drawn from that
  * camera, and what to record it with.
@@ -237,6 +262,25 @@ static void rgb_view(AppState& s) {
     rec::Status rs; { std::lock_guard<std::mutex> l(rec::g_mu); rs = rec::g_status; }
 
     ImGui::BeginChild("big", ImVec2(a.x - side - sty.ItemSpacing.x, a.y), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    {
+        // What the view is made of: the camera, its mode, the frames that arrive, the fit.
+        static long last_n = 0; static double last_t = 0; static float fps = 0;
+        std::string name, mode, status; long n;
+        { std::lock_guard<std::mutex> l(rgbcam::g_frame.mu); name = rgbcam::g_frame.name; mode = rgbcam::g_frame.mode; status = rgbcam::g_frame.status; n = rgbcam::g_frame.count; }
+        double now = ImGui::GetTime();
+        if (now - last_t > 1) { fps = (float)((n - last_n) / (now - last_t)); last_n = n; last_t = now; }
+        rgbcal::Cam cam = rgbcal::get();
+        rgbcal::Fit fi; { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; }
+        if (!status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", status.c_str());
+        else {
+            ImGui::Text("%s · %s · reçues %.0f i/s · vue %dx%d · retard %.0f ms", name.c_str(), mode.c_str(), fps, s.mr_w, s.mr_h, s.rgb_latency_ms);
+            ImGui::SameLine();
+            double rms; int npts; fit_numbers(rms, npts);
+            if (cam.fitted && npts) ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.6f, 1), "· calée (écart %.1f px, focale %.0f px)", rms, cam.f);
+            else if (cam.fitted) ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.6f, 1), "· calée (calage enregistré, focale %.0f px)", cam.f);
+            else ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "· pas encore calée (focale par défaut %.0f px)", cam.f);
+        }
+    }
     if (s.mr_srv && s.mr_w) {
         ImVec2 b = ImGui::GetContentRegionAvail();
         float k = std::min(b.x / s.mr_w, b.y / s.mr_h);
@@ -264,7 +308,7 @@ static void rgb_view(AppState& s) {
     ImGui::PopStyleColor();
     ImGui::BeginDisabled(rs.on);
     ImGui::Checkbox("Avec le son (micro)", &s.rec_audio);
-    ImGui::SliderInt("qualité (Mbit/s)", &s.rec_mbps, 2, 30);
+    slider_i("qualité (Mbit/s)", &s.rec_mbps, 2, 30);
     ImGui::EndDisabled();
     ImGui::Checkbox("Virtuel par-dessus l'image", &s.rgb_overlay);
     if (ImGui::Button("Photo (PNG)")) s.photo_request = true;
@@ -279,17 +323,22 @@ static void rgb_view(AppState& s) {
     }
     if (!rs.path.empty()) ImGui::TextWrapped("%s %s", rs.on ? "vers" : "dernier :", rs.path.c_str());
     if (!rs.error.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", rs.error.c_str());
-    ImGui::TextDisabled("MP4 H.264 1280x720, son AAC · dossier Vidéos\\myViture");
+    ImGui::TextWrapped("MP4 H.264 %dx%d, son AAC · dossier Vidéos\\myViture", s.mr_w, s.mr_h);
 
     ImGui::SeparatorText("Superposition");
-    ImGui::SliderFloat("retard de l'image RGB (ms)", &s.rgb_latency_ms, 0, 200, "%.0f");
-    ImGui::TextWrapped("Tourne la tête : si le virtuel part en avance sur l'image, augmente ; s'il traîne derrière, diminue.");
+    slider_f("âge de l'image RGB à son arrivée (ms)", &s.rgb_latency_ms, 0, 200, "%.0f");
+    ImGui::TextWrapped("Le virtuel est dessiné avec la tête où elle était quand l'image a été prise. Tourne la tête : si le virtuel part en avance sur l'image, augmente ; s'il traîne derrière, diminue.");
     {
         rgbcal::Fit fi; bool fitted; size_t np;
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; np = (size_t)rgbcal::g_frames; }
-        if (fitted) ImGui::TextWrapped("Caméra RGB calée : écart %.1f px sur %d points, rotation %.1f°, focale ×%.2f", fi.rms_px, fi.n, fi.rot_deg, fi.f_rel);
+        double rms; int npts; fit_numbers(rms, npts);
+        if (fitted && npts) ImGui::TextWrapped("Caméra RGB calée : écart %.1f px sur %d points", rms, npts);
+        else if (fitted) ImGui::TextWrapped("Caméra RGB calée (calage enregistré)");
         else ImGui::TextWrapped("Caméra RGB pas encore calée (%zu/8 poses) : montre une main immobile, à plusieurs endroits.", np);
         if (ImGui::SmallButton("Oublier le calage RGB")) rgbcal::reset();
+        bool refine = !rgbcal::g_frozen;
+        if (fitted && ImGui::Checkbox("Continuer à affiner le calage", &refine)) rgbcal::g_frozen = !refine;
+        if (fitted) ImGui::TextDisabled(rgbcal::g_frozen ? "calage figé (gardé d'une session à l'autre)" : "affinage en cours : montre une main immobile");
     }
 
     ImGui::SeparatorText("Mains (VITURE)");
@@ -301,7 +350,8 @@ static void rgb_view(AppState& s) {
     }
     ImGui::Checkbox("Panneau de test", &s.panel);
     ImGui::SameLine();
-    ImGui::Checkbox("Nuage de la pièce", &s.show_map);
+    ImGui::Checkbox("Maillage de la pièce", &s.show_map);
+    ImGui::Checkbox("Occultation par la pièce (le réel cache le virtuel)", &s.occlusion);
     ImGui::EndChild();
 }
 
@@ -344,11 +394,12 @@ static void build(AppState& s) {
     ImGui::Separator();
 
     if (!ImGui::BeginTabBar("vues")) { ImGui::End(); return; }
-    if (ImGui::BeginTabItem("Vue RGB + virtuel")) { rgb_view(s); ImGui::EndTabItem(); }
-    if (!ImGui::BeginTabItem("Diagnostics")) { ImGui::EndTabBar(); ImGui::End(); return; }
+    int req = s.tab_request; s.tab_request = -1;
+    if (ImGui::BeginTabItem("Vue RGB + virtuel", nullptr, req == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { rgb_view(s); ImGui::EndTabItem(); }
+    if (!ImGui::BeginTabItem("Diagnostics", nullptr, req == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::EndTabBar(); ImGui::End(); return; }
 
     const float col = ImGui::GetContentRegionAvail().x / 3 - ImGui::GetStyle().ItemSpacing.x;
-    const float panel_h = ImGui::GetContentRegionAvail().y / 2 - ImGui::GetStyle().ItemSpacing.y;
+    const float panel_h = ImGui::GetContentRegionAvail().y * 0.58f - ImGui::GetStyle().ItemSpacing.y;  // the head panel's sliders fit
 
     // ---- rendering on the glasses
     ImGui::BeginChild("rendu", ImVec2(col, panel_h), ImGuiChildFlags_Borders);
@@ -361,8 +412,8 @@ static void build(AppState& s) {
     ImGui::TextDisabled("Prédiction utilisée : %.0f %% du mouvement", t.lead_used * 100);
     ImGui::Text("Corrections visuelles  %d en 2 s · %.2f° · %.1f mm", t.corrections, t.corr_deg, t.corr_mm);
     ImGui::Checkbox("Lisser les corrections (sinon elles sautent)", &s.smooth_corrections);
-    plot("##shake", tail(s.shake_history, 300), 0, 1.0f, 4 * em, "tremblement par image (0–1°)");
-    plot("##lat", tail(s.latency_history, 300), 0, 40, 3 * em, "pose → écran (0–40 ms)");
+    plot("##shake", tail(s.shake_history, 300), 0, 1.0f, 2.5f * em, "tremblement par image (0–1°)");
+    plot("##lat", tail(s.latency_history, 300), 0, 40, 2.5f * em, "pose → écran (0–40 ms)");
     ImGui::SeparatorText("Prédiction");
     ImGui::Checkbox("Rendu au dernier moment avant l'affichage", &s.late_latch);
     ImGui::TextDisabled("pose lue %.1f ms avant le vblank (marge auto) · prédiction totale %.1f ms", s.late_latch ? s.latch_margin_ms : 16.6f, s.stats.lead_ms);
@@ -387,9 +438,10 @@ static void build(AppState& s) {
     if (s.have_vendor_eyes) {
         const float* l = s.eye_l; const float* r = s.eye_r;
         char lbl[200];
-        snprintf(lbl, sizeof lbl, "Yeux du moteur VITURE (usine) : écart %.1f mm, %.1f cm plus bas, %.1f cm en arrière, %.1f° d'inclinaison",
+        snprintf(lbl, sizeof lbl, "écart %.1f mm, %.1f cm plus bas, %.1f cm en arrière, %.1f° d'inclinaison",
                  std::hypot(r[3] - l[3], r[7] - l[7]) * 1000, -(l[7] + r[7]) / 2 * 100, (l[11] + r[11]) / 2 * 100, std::atan2(l[9], l[5]) * 57.2958f);
-        ImGui::Checkbox(lbl, &s.vendor_eyes);
+        ImGui::Checkbox("Yeux du moteur VITURE (usine)", &s.vendor_eyes);
+        ImGui::TextDisabled("%s", lbl);
         if (s.vendor_eyes) ImGui::TextDisabled("écart des yeux et yeux par défaut remplacés ; les curseurs ci-dessous ajustent par-dessus");
     }
     if (!(s.vendor_eyes && s.have_vendor_eyes)) {
@@ -423,9 +475,9 @@ static void build(AppState& s) {
         auto& r = room::g;
         if (!r.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", r.status.c_str());
         ImGui::Text("%zu voxels · profondeur %.0f/s · %.0f %% mesurés · %.0f ms", r.voxels, r.rate, r.valid_ratio * 100, r.ms);
-        int tables = 0; float floor_y = NAN;
-        for (auto& p : r.planes) { if (p.kind == 0) floor_y = p.y; else tables++; }
-        if (!std::isnan(floor_y)) ImGui::Text("Sol trouvé à %.2f m sous l'origine · %d surface(s) horizontale(s)", -floor_y, tables);
+        int tables = 0, walls = 0; float floor_y = NAN;
+        for (auto& p : r.planes) { if (p.kind == 0) floor_y = p.y; else if (p.kind == 1) tables++; else walls++; }
+        if (!std::isnan(floor_y)) ImGui::Text("Sol à %.2f m sous l'origine · %d surface(s) horizontale(s) · %d mur(s) · maillage %zu triangles", -floor_y, tables, walls, r.mesh.size() / 18);
         // Depth under the gaze (median of the centre 20x20), to check against a tape measure.
         if (r.depth.size() == (size_t)depth::W * depth::H) {
             std::vector<float> c;
@@ -438,7 +490,9 @@ static void build(AppState& s) {
     }
     ImGui::Checkbox("Scanner", &s.scan);
     ImGui::SameLine();
-    ImGui::Checkbox("Afficher le nuage", &s.show_map);
+    ImGui::Checkbox("Afficher le maillage", &s.show_map);
+    ImGui::SameLine();
+    ImGui::Checkbox("Occultation par la pièce", &s.occlusion);
     ImGui::SameLine();
     ImGui::Checkbox("Objets posés sur les surfaces", &s.place_on_planes);
     if (ImGui::Button("Ancrer là où je regarde (A)")) s.room_request = 1;
@@ -537,7 +591,9 @@ static void build(AppState& s) {
     {
         rgbcal::Fit fi; bool fitted; size_t np;
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; np = (size_t)rgbcal::g_frames; }
-        if (fitted) ImGui::TextDisabled("calage RGB : écart %.1f px sur %d points · rotation %.1f° · décalage %.1f %.1f %.1f cm · focale ×%.2f", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
+        double rms; int npts; fit_numbers(rms, npts);
+        if (fitted && npts) ImGui::TextDisabled("calage RGB : écart %.1f px sur %d points", rms, npts);
+        else if (fitted) ImGui::TextDisabled("calage RGB : enregistré");
         else ImGui::TextDisabled("calage RGB : caméra par défaut · %zu/8 poses de main (immobile, à des endroits différents)%s", np, fi.n && !fi.ok ? " · dernier essai refusé" : "");
     }
     if (rgb.srv) {

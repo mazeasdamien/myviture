@@ -30,6 +30,12 @@ struct Cam {
     bool fitted = false;
 };
 
+/**
+ * The default orientation (rotation vector, head -> camera): the VITURE engine's eye
+ * tilt when known, the RGB camera being in the same front as the displays.
+ */
+inline double g_default_rv[3] = {0, 0, 0};
+
 inline double default_focal(int w) { return (w / 2.0) / std::tan(78.0 / 2 * 3.14159265 / 180); }  // 78 deg horizontal field
 
 /** Rodrigues: rotation vector -> row-major 3x3. */
@@ -72,7 +78,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     const double f0 = default_focal(cam.w);
     const double sig_px = 3, sig_rot = 6 * 3.14159265 / 180, sig_t = 0.04, sig_f = 0.15;
     const double k = 8 * std::sqrt(P.size() / 20.0);  // prior weight grows with the data, as the web fit
-    double x[8] = {0, 0, 0, 0, 0, 0, std::log(f0), 0};  // start from the default, not the current fit
+    double x[8] = {g_default_rv[0], g_default_rv[1], g_default_rv[2], 0, 0, 0, std::log(f0), 0};  // start from the default, not the current fit
     std::vector<char> use(P.size(), 1);
     auto residuals = [&](const double* q, std::vector<double>& r) {
         Cam t = cam;
@@ -86,7 +92,7 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
             r.push_back((u - P[i].u) / sig_px);
             r.push_back((v - P[i].v) / sig_px);
         }
-        for (int i = 0; i < 3; i++) r.push_back(k * q[i] / sig_rot);
+        for (int i = 0; i < 3; i++) r.push_back(k * (q[i] - g_default_rv[i]) / sig_rot);
         for (int i = 0; i < 3; i++) r.push_back(k * q[3 + i] / sig_t);
         r.push_back(k * (q[6] - std::log(f0)) / sig_f);
         r.push_back(k * q[7] / 0.15);
@@ -153,7 +159,9 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     }
     info.n = n;
     info.rms_px = n ? std::sqrt(e2 / n) : 1e9;
-    info.rot_deg = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]) * 180 / 3.14159265;
+    // Rotation away from the default (the eyes' tilt).
+    double dr[3] = {x[0] - g_default_rv[0], x[1] - g_default_rv[1], x[2] - g_default_rv[2]};
+    info.rot_deg = std::sqrt(dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2]) * 180 / 3.14159265;
     for (int i = 0; i < 3; i++) info.shift_cm[i] = x[3 + i] * 100;
     info.f_rel = t.f / f0;
     info.ok = n >= 100 && info.rms_px < 30 && info.rot_deg < 18 && std::fabs(x[3]) < 0.12 && std::fabs(x[4]) < 0.12 && std::fabs(x[5]) < 0.12 && info.f_rel > 0.6 && info.f_rel < 1.6;
@@ -161,10 +169,14 @@ inline bool fit(const std::vector<Pair>& P, Cam& cam, Fit& info) {
     return info.ok;
 }
 
-inline bool save(const std::string& path, const Cam& c) {
+/** The saved fit's quality (rms px, points), for the dashboard after a reload. */
+inline double g_loaded_rms = 0;
+inline int g_loaded_n = 0;
+
+inline bool save(const std::string& path, const Cam& c, double rms = 0, int n = 0) {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) return false;
-    fprintf(f, "%d %d %.6f %.9f %.9f %.9f %.9f %.9f %.9f %.9f\n", c.w, c.h, c.f, c.rv[0], c.rv[1], c.rv[2], c.c[0], c.c[1], c.c[2], c.k1);
+    fprintf(f, "%d %d %.6f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.2f %d\n", c.w, c.h, c.f, c.rv[0], c.rv[1], c.rv[2], c.c[0], c.c[1], c.c[2], c.k1, rms, n);
     fclose(f);
     return true;
 }
@@ -172,7 +184,7 @@ inline bool save(const std::string& path, const Cam& c) {
 inline bool load(const std::string& path, Cam& c) {
     FILE* f = fopen(path.c_str(), "r");
     if (!f) return false;
-    int n = fscanf(f, "%d %d %lf %lf %lf %lf %lf %lf %lf %lf", &c.w, &c.h, &c.f, &c.rv[0], &c.rv[1], &c.rv[2], &c.c[0], &c.c[1], &c.c[2], &c.k1);
+    int n = fscanf(f, "%d %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %d", &c.w, &c.h, &c.f, &c.rv[0], &c.rv[1], &c.rv[2], &c.c[0], &c.c[1], &c.c[2], &c.k1, &g_loaded_rms, &g_loaded_n);
     fclose(f);
     if (n == 9) c.k1 = 0;
     c.fitted = n >= 9;
@@ -188,6 +200,8 @@ inline Fit g_fit;
 inline int g_since_fit = 0;   // frames since the last fit
 inline int g_frames = 0;      // frames of pairs collected
 inline int g_fit_runs = 0;    // fits completed (for the log)
+inline std::atomic<bool> g_frozen{true};  // fitted: keep the model (refits move the virtual)
+inline double g_spread = 0;   // the wrists' extent so far (m), for the log
 inline double g_lo[3] = {1e9, 1e9, 1e9}, g_hi[3] = {-1e9, -1e9, -1e9};  // wrist positions' extent (m)
 inline std::string g_path;
 
@@ -197,7 +211,7 @@ inline Cam get() { std::lock_guard<std::mutex> l(g_mu); return g_cam; }
 /** The current model for an image of this size (default when none yet). */
 inline Cam current(int w, int h) {
     std::lock_guard<std::mutex> l(g_mu);
-    if (g_cam.w != w || g_cam.h != h) { g_cam = Cam(); g_cam.w = w; g_cam.h = h; g_cam.f = default_focal(w); }
+    if (g_cam.w != w || g_cam.h != h) { g_cam = Cam(); g_cam.w = w; g_cam.h = h; g_cam.f = default_focal(w); for (int i = 0; i < 3; i++) g_cam.rv[i] = g_default_rv[i]; }
     return g_cam;
 }
 
@@ -208,11 +222,13 @@ inline Cam current(int w, int h) {
  */
 inline void add(const std::vector<Pair>& pairs, const double wrist[3]) {
     std::lock_guard<std::mutex> l(g_mu);
+    if (g_cam.fitted && g_frozen) return;
     g_pairs.insert(g_pairs.end(), pairs.begin(), pairs.end());
     if (g_pairs.size() > 600) g_pairs.erase(g_pairs.begin(), g_pairs.begin() + (g_pairs.size() - 600));
     g_frames++; g_since_fit++;
     for (int i = 0; i < 3; i++) { g_lo[i] = std::min(g_lo[i], wrist[i]); g_hi[i] = std::max(g_hi[i], wrist[i]); }
     double spread = std::max(g_hi[0] - g_lo[0], std::max(g_hi[1] - g_lo[1], g_hi[2] - g_lo[2]));
+    g_spread = spread;
     // Enough spread to separate the focal from the position; with many frames, a little less.
     // The fit runs on its own thread (it takes ~100 ms and would stall the hands): every
     // 2 s while poor, every 15 s once good.
@@ -231,7 +247,7 @@ inline void add(const std::vector<Pair>& pairs, const double wrist[3]) {
             bool ok = fit(P, trial, info);
             {
                 std::lock_guard<std::mutex> l(g_mu);
-                if (ok) { g_cam = trial; if (!g_path.empty()) save(g_path, g_cam); }
+                if (ok) { g_cam = trial; if (!g_path.empty()) save(g_path, g_cam, info.rms_px, info.n); }
                 g_fit = info;
                 g_fit_runs++;
             }
@@ -246,7 +262,21 @@ inline void reset() {
     for (int i = 0; i < 3; i++) { g_lo[i] = 1e9; g_hi[i] = -1e9; }
     int w = g_cam.w, h = g_cam.h;
     g_cam = Cam(); g_cam.w = w; g_cam.h = h; g_cam.f = default_focal(w);
+    for (int i = 0; i < 3; i++) g_cam.rv[i] = g_default_rv[i];
     if (!g_path.empty()) remove(g_path.c_str());
+}
+
+/** Sets the default from a head -> camera rotation (row-major), unless already fitted. */
+inline void set_default(const double R[9]) {
+    double tr = R[0] + R[4] + R[8], a = std::acos(std::max(-1.0, std::min(1.0, (tr - 1) / 2)));
+    double rv[3] = {0, 0, 0};
+    if (a > 1e-9) {
+        double s = a / (2 * std::sin(a));
+        rv[0] = (R[7] - R[5]) * s; rv[1] = (R[2] - R[6]) * s; rv[2] = (R[3] - R[1]) * s;
+    }
+    std::lock_guard<std::mutex> l(g_mu);
+    for (int i = 0; i < 3; i++) g_default_rv[i] = rv[i];
+    if (!g_cam.fitted) for (int i = 0; i < 3; i++) g_cam.rv[i] = rv[i];
 }
 
 }  // namespace rgbcal

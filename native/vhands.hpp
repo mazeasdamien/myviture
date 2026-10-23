@@ -11,6 +11,7 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -77,6 +78,22 @@ inline bool hand_world(const float* data, int side, float out[21][3]) {
     }
     return true;
 }
+
+/** One Euro filter, per coordinate: smooth at rest, little lag when moving. */
+struct OneEuro {
+    double min_cutoff = 1.2, beta = 6, d_cutoff = 1;
+    double x = 0, dx = 0, t = -1;
+    static double alpha(double cutoff, double dt) { double tau = 1 / (2 * 3.14159265 * cutoff); return 1 / (1 + tau / dt); }
+    double apply(double v, double now) {
+        if (t < 0 || now - t > 0.3) { x = v; dx = 0; t = now; return v; }
+        double dt = std::max(1e-4, now - t);
+        double d = (v - x) / dt;
+        dx += alpha(d_cutoff, dt) * (d - dx);
+        x += alpha(min_cutoff + beta * std::fabs(dx), dt) * (v - x);
+        t = now;
+        return x;
+    }
+};
 
 inline double qpc_s() { LARGE_INTEGER f, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q); return (double)q.QuadPart / f.QuadPart; }
 

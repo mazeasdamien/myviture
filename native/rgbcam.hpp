@@ -9,7 +9,9 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 
+#include <algorithm>
 #include <atomic>
+#include <deque>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -33,6 +35,7 @@ struct Frame {
     long count = 0;
     double t = 0;  // QPC seconds when the newest frame arrived
     std::string name, status = "recherche de la caméra…";
+    std::string mode;  // the camera's mode in use: size, format, frame rate
 };
 inline Frame g_frame;
 inline std::atomic<bool> g_stop{false};
@@ -122,6 +125,11 @@ inline void run() {
             UINT32 bw = 1280, bh = 720;
             if (best) {
                 MFGetAttributeSize(best, MF_MT_FRAME_SIZE, &bw, &bh);
+                UINT32 num = 0, den = 1; MFGetAttributeRatio(best, MF_MT_FRAME_RATE, &num, &den);
+                GUID sub{}; best->GetGUID(MF_MT_SUBTYPE, &sub);
+                char m[64];
+                snprintf(m, sizeof m, "%ux%u %c%c%c%c %.0f i/s", bw, bh, (char)(sub.Data1 & 255), (char)((sub.Data1 >> 8) & 255), (char)((sub.Data1 >> 16) & 255), (char)(sub.Data1 >> 24), den ? (double)num / den : 0);
+                { std::lock_guard<std::mutex> l(g_frame.mu); g_frame.mode = m; }
                 reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, best);
                 best->Release();
             }
@@ -158,8 +166,16 @@ inline void run() {
                     // one delivers top-down rows with a positive stride.
                     memcpy(g_frame.bgra.data(), p, (size_t)w * h * 4);
                     g_frame.w = (int)w; g_frame.h = (int)h;
+                    // Capture time: the camera's own timestamp (regular), put on the QPC clock
+                    // with the smallest arrival - timestamp gap of the last 2 s (the least
+                    // delayed frames), so USB and decoding jitter does not shake the view.
                     LARGE_INTEGER qf, qn; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qn);
-                    g_frame.t = (double)qn.QuadPart / qf.QuadPart;
+                    double arrival = (double)qn.QuadPart / qf.QuadPart, cam_t = ts / 1e7;
+                    static std::deque<double> gaps;
+                    gaps.push_back(arrival - cam_t);
+                    if (gaps.size() > 60) gaps.pop_front();
+                    double gap = *std::min_element(gaps.begin(), gaps.end());
+                    g_frame.t = cam_t + gap;
                     g_frame.seq++; g_frame.count++;
                     buf->Unlock();
                 }

@@ -1,14 +1,18 @@
 // The room, scanned over time: every depth map (depth.hpp) is put into the VITURE
 // tracking frame with the head pose at the image's time and accumulated in a voxel map
-// (2.5 cm), which fills in as the wearer looks around. From it: the floor and the other
-// horizontal surfaces (tables, shelves), so virtual objects can rest on them, and
-// spatial anchors: a point on a real surface, kept in the tracking frame.
+// (2.5 cm), which fills in as the wearer looks around. From it: the floor, the other
+// horizontal surfaces (tables, shelves) and the walls, so virtual objects can rest on
+// them; a surface mesh (surface nets over the confirmed voxels), drawn or used only to
+// hide the virtual behind real things; and spatial anchors: a point on a real surface,
+// kept in the tracking frame.
 //
 // The tracking frame is the engine's: it does not drift and does not move on recentre,
 // but it starts anew at each launch. Anchors are written to myviture_anchors.txt for a
 // later relocalisation; they are not loaded back yet.
 
 #pragma once
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -16,7 +20,9 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "depth.hpp"
@@ -29,16 +35,20 @@ constexpr float VOX = 0.025f;
 constexpr int CONFIRM = 5;          // observations a voxel needs, from VIEWS different viewpoints
 constexpr int VIEWS = 3;
 constexpr size_t MAX_VOXELS = 400000;
+constexpr size_t MAX_MESH_VERTS = 900000;
 
 /** A voxel: mean of the points seen in it, how often, from how many viewpoints; misses when a ray passed through it. */
 struct Voxel { float sum[3] = {0, 0, 0}; uint16_t n = 0; uint8_t misses = 0; uint32_t last_frame = 0; uint32_t views[4] = {}; uint8_t nviews = 0; };
 inline bool confirmed(const Voxel& v) { return v.n >= CONFIRM && v.nviews >= VIEWS; }
 
 struct Plane {
-    int kind;                       // 0 floor, 1 horizontal surface
-    float y;                        // height (tracking frame)
+    int kind;                       // 0 floor, 1 horizontal surface, 2 wall
+    float y;                        // height (tracking frame); walls: their bottom
     float minx, maxx, minz, maxz;   // extent (5th..95th percentiles of its voxels)
     int count;
+    // Walls: n.(x, z) = d with n = (nx, nz) unit, from the room's side; along the wall
+    // (t = (-nz, nx)) from t0 to t1, from y (bottom) to top.
+    float nx = 0, nz = 0, d = 0, t0 = 0, t1 = 0, top = 0;
 };
 
 struct Anchor { int id; float p[3]; };
@@ -52,6 +62,8 @@ struct Shared {
     std::vector<Plane> planes;
     std::vector<Anchor> anchors;
     std::vector<float> depth;       // last depth map (W*H), for the dashboard
+    std::vector<float> mesh;        // triangles, per vertex x y z nx ny nz (tracking frame)
+    uint32_t mesh_version = 0;
     float valid_ratio = 0, rate = 0, ms = 0;
     size_t voxels = 0;
     std::string status = "démarrage…";
@@ -125,6 +137,154 @@ inline std::vector<Plane> find_planes(const std::unordered_map<uint64_t, Voxel>&
     return out;
 }
 
+/**
+ * Walls: vertical planes in the confirmed voxels between 40 cm above the floor and 2 m,
+ * found as lines in the top view (RANSAC, 3 cm), at least 80 cm long and 80 cm high.
+ * Their normal faces the head (the room's side).
+ */
+inline std::vector<Plane> find_walls(const std::unordered_map<uint64_t, Voxel>& map, float floor_y, const float head_xz[2]) {
+    std::vector<Plane> out;
+    std::vector<std::array<float, 3>> pts;
+    for (auto& [k, v] : map) {
+        if (!confirmed(v)) continue;
+        float y = v.sum[1] / v.n;
+        if (y > floor_y + 0.4f && y < floor_y + 2.0f) pts.push_back({v.sum[0] / v.n, y, v.sum[2] / v.n});
+    }
+    std::mt19937 rng(7);
+    if (pts.size() > 30000) { std::shuffle(pts.begin(), pts.end(), rng); pts.resize(30000); }
+    for (int wall = 0; wall < 8 && pts.size() > 300; wall++) {
+        std::uniform_int_distribution<size_t> pick(0, pts.size() - 1);
+        size_t best_n = 0; float bnx = 0, bnz = 0, bd = 0;
+        for (int it = 0; it < 400; it++) {
+            auto& a = pts[pick(rng)]; auto& b = pts[pick(rng)];
+            float dx = b[0] - a[0], dz = b[2] - a[2], len = std::sqrt(dx * dx + dz * dz);
+            if (len < 0.4f) continue;
+            float nx = -dz / len, nz = dx / len, d = nx * a[0] + nz * a[2];
+            size_t n = 0;
+            for (size_t i = 0; i < pts.size(); i += 4) if (std::fabs(nx * pts[i][0] + nz * pts[i][2] - d) < 0.03f) n++;
+            if (n > best_n) { best_n = n; bnx = nx; bnz = nz; bd = d; }
+        }
+        if (best_n * 4 < 300) break;
+        // Refit on the inliers (least squares in the top view), then the extent.
+        std::vector<std::array<float, 3>> in, rest;
+        for (auto& p : pts) (std::fabs(bnx * p[0] + bnz * p[2] - bd) < 0.03f ? in : rest).push_back(p);
+        double mx = 0, mz = 0;
+        for (auto& p : in) { mx += p[0]; mz += p[2]; }
+        mx /= in.size(); mz /= in.size();
+        double sxx = 0, sxz = 0, szz = 0;
+        for (auto& p : in) { double x = p[0] - mx, z = p[2] - mz; sxx += x * x; sxz += x * z; szz += z * z; }
+        double ang = 0.5 * std::atan2(2 * sxz, sxx - szz);  // direction of the line
+        float tx = (float)std::cos(ang), tz = (float)std::sin(ang);
+        bnx = -tz; bnz = tx; bd = (float)(bnx * mx + bnz * mz);
+        std::vector<float> ts, ys;
+        for (auto& p : in) { ts.push_back(tx * p[0] + tz * p[2]); ys.push_back(p[1]); }
+        std::sort(ts.begin(), ts.end()); std::sort(ys.begin(), ys.end());
+        Plane pl{2, ys[ys.size() / 20], 0, 0, 0, 0, (int)in.size()};
+        pl.top = ys[ys.size() * 19 / 20];
+        pl.t0 = ts[ts.size() / 20]; pl.t1 = ts[ts.size() * 19 / 20];
+        // Normal towards the head; t = (-nz, nx) with that normal.
+        if (bnx * head_xz[0] + bnz * head_xz[1] - bd < 0) { bnx = -bnx; bnz = -bnz; bd = -bd; }
+        float ttx = -bnz, ttz = bnx;
+        if (ttx * tx + ttz * tz < 0) { float a = -pl.t1, b = -pl.t0; pl.t0 = a; pl.t1 = b; }
+        pl.nx = bnx; pl.nz = bnz; pl.d = bd;
+        pl.minx = std::min(bd * bnx + ttx * pl.t0, bd * bnx + ttx * pl.t1); pl.maxx = std::max(bd * bnx + ttx * pl.t0, bd * bnx + ttx * pl.t1);
+        pl.minz = std::min(bd * bnz + ttz * pl.t0, bd * bnz + ttz * pl.t1); pl.maxz = std::max(bd * bnz + ttz * pl.t0, bd * bnz + ttz * pl.t1);
+        pts.swap(rest);
+        if (pl.t1 - pl.t0 >= 0.8f && pl.top - pl.y >= 0.8f) out.push_back(pl);
+    }
+    return out;
+}
+
+/**
+ * Surface mesh of the confirmed voxels (naive surface nets): one vertex per grid cell
+ * that has both filled and empty corners, at the mean of its crossing edges' midpoints,
+ * smoothed once; one quad per filled/empty voxel pair, across the 4 cells around it.
+ * Lone voxels (fewer than 2 filled neighbours) are left out. Triangles, x y z nx ny nz.
+ */
+inline std::vector<float> build_mesh(const std::unordered_map<uint64_t, Voxel>& map, size_t max_verts) {
+    auto unkey = [](uint64_t k, int& x, int& y, int& z) {
+        x = (int)((k >> 42) & 0x1FFFFF) - 0x100000; y = (int)((k >> 21) & 0x1FFFFF) - 0x100000; z = (int)(k & 0x1FFFFF) - 0x100000;
+    };
+    std::unordered_set<uint64_t> conf;
+    conf.reserve(map.size());
+    for (auto& [k, v] : map) if (confirmed(v)) conf.insert(k);
+    std::unordered_set<uint64_t> filled;
+    filled.reserve(conf.size());
+    for (uint64_t k : conf) {
+        int x, y, z; unkey(k, x, y, z);
+        int nb = 0;
+        for (int dx = -1; dx <= 1 && nb < 2; dx++) for (int dy = -1; dy <= 1 && nb < 2; dy++) for (int dz = -1; dz <= 1 && nb < 2; dz++)
+            if ((dx || dy || dz) && conf.count(key(x + dx, y + dy, z + dz))) nb++;
+        if (nb >= 2) filled.insert(k);
+    }
+    auto at = [&](int x, int y, int z) { return filled.count(key(x, y, z)) != 0; };
+    // Cell (x, y, z): corners (x..x+1, y..y+1, z..z+1). Its vertex, in voxel units.
+    std::unordered_map<uint64_t, std::array<float, 3>> cell;
+    cell.reserve(filled.size() * 3);
+    static const int E[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+    auto make_cell = [&](int x, int y, int z) {
+        uint64_t ck = key(x, y, z);
+        if (cell.count(ck)) return;
+        bool c[8]; int n = 0;
+        for (int i = 0; i < 8; i++) { c[i] = at(x + (i & 1), y + ((i >> 1) & 1), z + ((i >> 2) & 1)); n += c[i]; }
+        if (n == 0 || n == 8) return;
+        float s[3] = {0, 0, 0}; int m = 0;
+        for (auto& e : E) {
+            if (c[e[0]] == c[e[1]]) continue;
+            int a = e[0], b = e[1];
+            s[0] += x + ((a & 1) + (b & 1)) * 0.5f; s[1] += y + (((a >> 1) & 1) + ((b >> 1) & 1)) * 0.5f; s[2] += z + (((a >> 2) & 1) + ((b >> 2) & 1)) * 0.5f;
+            m++;
+        }
+        cell[ck] = {s[0] / m, s[1] / m, s[2] / m};
+    };
+    for (uint64_t k : filled) {
+        int x, y, z; unkey(k, x, y, z);
+        for (int i = 0; i < 8; i++) make_cell(x - (i & 1), y - ((i >> 1) & 1), z - ((i >> 2) & 1));
+    }
+    // One smoothing pass: each vertex towards its face neighbours.
+    std::unordered_map<uint64_t, std::array<float, 3>> smooth;
+    smooth.reserve(cell.size());
+    for (auto& [ck, p] : cell) {
+        int x, y, z; unkey(ck, x, y, z);
+        float s[3] = {p[0], p[1], p[2]}; int n = 1;
+        const int D[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (auto& d : D) {
+            auto it = cell.find(key(x + d[0], y + d[1], z + d[2]));
+            if (it != cell.end()) { for (int a = 0; a < 3; a++) s[a] += it->second[a]; n++; }
+        }
+        smooth[ck] = {s[0] / n, s[1] / n, s[2] / n};
+    }
+    // Quads: for a filled voxel and an empty neighbour along +/- axis a, the 4 cells
+    // around the edge between their centres. Facing the empty side.
+    std::vector<float> out;
+    auto vert = [&](const std::array<float, 3>& p, const float* n) {
+        // Grid point i is the centre of voxel i: ((i + 0.5) * VOX).
+        out.insert(out.end(), {(p[0] + 0.5f) * VOX, (p[1] + 0.5f) * VOX, (p[2] + 0.5f) * VOX, n[0], n[1], n[2]});
+    };
+    for (uint64_t k : filled) {
+        if (out.size() / 6 + 6 > max_verts) break;
+        int x, y, z; unkey(k, x, y, z);
+        for (int a = 0; a < 3; a++) for (int sgn = -1; sgn <= 1; sgn += 2) {
+            int q[3] = {x, y, z}; q[a] += sgn;
+            if (at(q[0], q[1], q[2])) continue;
+            int lo[3] = {x, y, z}; if (sgn < 0) lo[a] -= 1;  // the edge from lo to lo + e_a
+            int b = (a + 1) % 3, c2 = (a + 2) % 3;
+            std::array<float, 3> v4[4]; bool ok = true;
+            const int off[4][2] = {{0, 0}, {-1, 0}, {-1, -1}, {0, -1}};
+            for (int i = 0; i < 4 && ok; i++) {
+                int cc[3] = {lo[0], lo[1], lo[2]}; cc[b] += off[i][0]; cc[c2] += off[i][1];
+                auto it = smooth.find(key(cc[0], cc[1], cc[2]));
+                if (it == smooth.end()) ok = false; else v4[i] = it->second;
+            }
+            if (!ok) continue;
+            float n[3] = {0, 0, 0}; n[a] = (float)sgn;
+            vert(v4[0], n); vert(v4[1], n); vert(v4[2], n);
+            vert(v4[0], n); vert(v4[2], n); vert(v4[3], n);
+        }
+    }
+    return out;
+}
+
 inline void run(calib::Rig rig, PoseFn pose_at) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     depth::Stereo stereo(rig);
@@ -135,7 +295,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
     uint32_t seen = 0, frame_id = 0;
     std::vector<uint8_t> img[2];
     int w = 0, h = 0;
-    double last_planes = 0, rate_t0 = hands::qpc_s(); int frames = 0;
+    double last_planes = 0, last_mesh = 0, rate_t0 = hands::qpc_s(); int frames = 0;
     float head_min_y = 1e9;
     depth::Frame df;
 
@@ -145,6 +305,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
             map.clear();
             std::lock_guard<std::mutex> l(g.mu);
             g.points.clear(); g.planes.clear(); g.anchors.clear(); g.voxels = 0; g.version++;
+            g.mesh.clear(); g.mesh_version++;
             save_anchors();
         }
         double t_img = 0;
@@ -235,12 +396,18 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         frames++;
         double now = hands::qpc_s();
         bool refresh = now - last_planes > 2;
+        bool remesh = refresh && now - last_mesh > 4;
         std::vector<Plane> planes;
-        std::vector<float> pts;
+        std::vector<float> pts, mesh;
         if (refresh) {
             last_planes = now;
             double tr0 = hands::qpc_s();
             planes = find_planes(map, head_min_y);
+            if (!planes.empty() && planes[0].kind == 0) {
+                float hxz[2] = {head[3], head[11]};
+                for (auto& w : find_walls(map, planes[0].y, hxz)) planes.push_back(w);
+            }
+            if (remesh) { last_mesh = now; mesh = build_mesh(map, MAX_MESH_VERTS); }
             double tr1 = hands::qpc_s();
             // Drawing snapshot: confirmed voxels, coloured by height, at most 120k.
             size_t n_conf = 0;
@@ -254,7 +421,8 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
                 float t = std::clamp((y - floor_y) / 2.0f, 0.0f, 1.0f);
                 pts.insert(pts.end(), {x, y, z, 0.2f + 0.8f * t, 0.5f + 0.3f * (1 - t), 1.0f - 0.7f * t});
             }
-            hands::logf("room: refresh %zu voxels, planes %.0f ms, snapshot %.0f ms\n", map.size(), (tr1 - tr0) * 1000, (hands::qpc_s() - tr1) * 1000);
+            int walls = 0; for (auto& p : planes) walls += p.kind == 2;
+            hands::logf("room: refresh %zu voxels, %d walls, planes+mesh %.0f ms (%zu mesh vertices), snapshot %.0f ms\n", map.size(), walls, (tr1 - tr0) * 1000, mesh.size() / 6, (hands::qpc_s() - tr1) * 1000);
         }
         std::lock_guard<std::mutex> l(g.mu);
         g.depth = df.depth;
@@ -263,6 +431,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         g.voxels = map.size();
         if (now - rate_t0 > 1) { g.rate = (float)(frames / (now - rate_t0)); frames = 0; rate_t0 = now; }
         if (refresh) { g.planes = planes; g.points = std::move(pts); g.version++; }
+        if (remesh) { g.mesh = std::move(mesh); g.mesh_version++; }
     }
 }
 
