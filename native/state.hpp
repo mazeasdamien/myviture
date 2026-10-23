@@ -15,6 +15,7 @@ struct Stats {
     int corrections = 0;          // visual corrections of the engine in the last 2 s
     float corr_deg = 0, corr_mm = 0;  // their mean size
     float lead_ms = 0;          // prediction used: pose read -> vblank -> screen
+    float pred_err_still = 0, pred_err_moving = 0, pred_err_fast = 0;  // prediction error p95 (deg): head still, slow, fast
 };
 
 struct AppState {
@@ -38,6 +39,13 @@ struct AppState {
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;
+    bool real_hands = true;    // the realistic (skinned) hands, else bone volumes
+    bool sleeves = true;       // long sleeves, elbow to wrist
+    float sleeve_color[3] = {0.16f, 0.17f, 0.19f};
+    bool room_light = true;    // the virtual takes the room's light level and colour (RGB camera)
+    bool shadows = true;       // contact shadows under virtual objects and hands (RGB view)
+    bool camera_look = true;   // the RGB view's virtual softened and grained like the camera
+    float room_level = 0;      // the room's mean luminance (0..1), for the dashboard
     bool panel = true;         // the test text panel in front of the wearer
     bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
     float rgb_latency_ms = 50; // an RGB frame's age when it arrives: the virtual is drawn for that moment

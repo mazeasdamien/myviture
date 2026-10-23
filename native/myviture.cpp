@@ -21,6 +21,7 @@
 #include "roommap.hpp"
 #include "vhands.hpp"
 #include "recorder.hpp"
+#include "skinhands.hpp"
 #include "textpanel.hpp"
 #include "state.hpp"
 
@@ -351,6 +352,21 @@ SamplerState samp0 : register(s0);
 struct VSOutT { float4 pos : SV_Position; float2 uv : TEXCOORD; };
 VSOutT vs_tex(float3 p : POSITION, float3 n : NORMAL) { VSOutT o; o.pos = mul(mvp, float4(p, 1)); o.uv = n.xy; return o; }
 float4 ps_tex(VSOutT i) : SV_Target { return float4(tex0.Sample(samp0, i.uv).rgb, 1); }
+// Contact shadow: a soft dark disc (uv 0..1 across it), strength in color.x, premultiplied.
+float4 ps_shadow(VSOutT i) : SV_Target { float r = length(i.uv * 2 - 1); float a = color.x * saturate(1 - r); return float4(0, 0, 0, a * a); }
+// The RGB view: the camera frame (t0) under the virtual layer (t1, premultiplied), the layer
+// softened like the camera (3x3 blur over lit.xy) and given its grain (color.y, seed color.z).
+Texture2D tex1 : register(t1);
+float grain_hash(float2 p) { return frac(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453); }
+float4 ps_comp(VSOutT i) : SV_Target {
+  float3 bg = tex0.Sample(samp0, i.uv).rgb;
+  float2 px = lit.xy;
+  float4 v = tex1.Sample(samp0, i.uv) * 0.25;
+  v += (tex1.Sample(samp0, i.uv + float2(px.x, 0)) + tex1.Sample(samp0, i.uv - float2(px.x, 0)) + tex1.Sample(samp0, i.uv + float2(0, px.y)) + tex1.Sample(samp0, i.uv - float2(0, px.y))) * 0.125;
+  v += (tex1.Sample(samp0, i.uv + px) + tex1.Sample(samp0, i.uv - px) + tex1.Sample(samp0, i.uv + float2(px.x, -px.y)) + tex1.Sample(samp0, i.uv + float2(-px.x, px.y))) * 0.0625;
+  float g = (grain_hash(floor(i.uv * lit.zw) + color.z) - 0.5) * color.y;
+  return float4(bg * (1 - v.a) + v.rgb + g * v.a, 1);
+}
 // Instanced: one small cube per scanned voxel (position and colour per instance, size in lit.y).
 struct VSOutC { float4 pos : SV_Position; float3 n : NORMAL; float3 col : COLOR; };
 VSOutC vs_inst(float3 p : POSITION, float3 n : NORMAL, float3 ip : INSTPOS, float3 ic : INSTCOL) {
@@ -630,14 +646,19 @@ int main(int argc, char** argv) {
     Com<ID3D11ShaderResourceView> mr_srv;
     Com<ID3D11DepthStencilView> mr_dsv;
     Com<ID3D11Texture2D> rec_staging[3];     // RGB view -> CPU for the recorder, 2 frames behind
+    Com<ID3D11Texture2D> virt_tex;           // the virtual alone (premultiplied), before the composite
+    Com<ID3D11RenderTargetView> virt_rtv;
+    Com<ID3D11ShaderResourceView> virt_srv;
     auto drop = [](auto& c) { if (c.p) { c.p->Release(); c.p = nullptr; } };
     auto make_mr = [&](UINT w, UINT h) {
-        drop(mr_tex); drop(mr_depth); drop(mr_rtv); drop(mr_srv); drop(mr_dsv);
+        drop(mr_tex); drop(mr_depth); drop(mr_rtv); drop(mr_srv); drop(mr_dsv); drop(virt_tex); drop(virt_rtv); drop(virt_srv);
         for (auto& st : rec_staging) drop(st);
         D3D11_TEXTURE2D_DESC td{}; td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         bool ok = SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &mr_tex)) && SUCCEEDED(dev->CreateRenderTargetView(mr_tex, nullptr, &mr_rtv)) &&
                   SUCCEEDED(dev->CreateShaderResourceView(mr_tex, nullptr, &mr_srv));
+        ok = ok && SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &virt_tex)) && SUCCEEDED(dev->CreateRenderTargetView(virt_tex, nullptr, &virt_rtv)) &&
+             SUCCEEDED(dev->CreateShaderResourceView(virt_tex, nullptr, &virt_srv));
         D3D11_TEXTURE2D_DESC dd = td; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
         ok = ok && SUCCEEDED(dev->CreateTexture2D(&dd, nullptr, &mr_depth)) && SUCCEEDED(dev->CreateDepthStencilView(mr_depth, nullptr, &mr_dsv));
         D3D11_TEXTURE2D_DESC sd = td; sd.BindFlags = 0; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -686,6 +707,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     Com<ID3D11VertexShader> vs_tex; CHECK(dev->CreateVertexShader(vstb->GetBufferPointer(), vstb->GetBufferSize(), nullptr, &vs_tex));
+    Com<ID3D11PixelShader> ps_shadow, ps_comp;
+    {
+        Com<ID3DBlob> b1, b2;
+        if (FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "ps_shadow", "ps_5_0", 0, 0, &b1, &err)) ||
+            FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "ps_comp", "ps_5_0", 0, 0, &b2, &err))) {
+            fprintf(stderr, "shader: %s\n", err ? (const char*)err->GetBufferPointer() : "?");
+            return 1;
+        }
+        CHECK(dev->CreatePixelShader(b1->GetBufferPointer(), b1->GetBufferSize(), nullptr, &ps_shadow));
+        CHECK(dev->CreatePixelShader(b2->GetBufferPointer(), b2->GetBufferSize(), nullptr, &ps_comp));
+    }
     Com<ID3D11PixelShader> ps_tex; CHECK(dev->CreatePixelShader(pstb->GetBufferPointer(), pstb->GetBufferSize(), nullptr, &ps_tex));
     Com<ID3D11SamplerState> samp;
     { D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; CHECK(dev->CreateSamplerState(&sd, &samp)); }
@@ -705,6 +737,15 @@ int main(int argc, char** argv) {
         D3D11_SUBRESOURCE_DATA init{q.data()};
         CHECK(dev->CreateBuffer(&bd, &init, &screen_vb));
     }
+    // Realistic hands (the Rocketbox human's, skinned on the tracked joints).
+    skinhands::Renderer skin;
+    {
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring d = exe; d = d.substr(0, d.find_last_of(L'\\') + 1);
+        if (!skin.init(dev, d + L"models\\")) printf("realistic hands: %s\n", skin.error.c_str());
+    }
+    // The room's light (from the RGB camera): its level and colour tint the virtual.
+    float room_tint[3] = {1, 1, 1};
     panel::Panel test_panel;
     bool panel_ok = test_panel.init(dev);
     const V3 PANEL_AT = {0, -0.08f, -0.6f};  // scene: in front of the recentred head, a little low
@@ -754,6 +795,23 @@ int main(int argc, char** argv) {
     Com<ID3D11RasterizerState> rs; CHECK(dev->CreateRasterizerState(&rd, &rs));
     D3D11_DEPTH_STENCIL_DESC dsd{}; dsd.DepthEnable = TRUE; dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dsd.DepthFunc = D3D11_COMPARISON_LESS;
     Com<ID3D11DepthStencilState> dss; CHECK(dev->CreateDepthStencilState(&dsd, &dss));
+    // Contact shadows (the RGB view only): premultiplied blending, no depth writes, a disc.
+    Com<ID3D11BlendState> shadow_blend;
+    {
+        D3D11_BLEND_DESC bd{}; auto& r = bd.RenderTarget[0];
+        r.BlendEnable = TRUE; r.SrcBlend = D3D11_BLEND_ONE; r.DestBlend = D3D11_BLEND_INV_SRC_ALPHA; r.BlendOp = D3D11_BLEND_OP_ADD;
+        r.SrcBlendAlpha = D3D11_BLEND_ONE; r.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; r.BlendOpAlpha = D3D11_BLEND_OP_ADD; r.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        CHECK(dev->CreateBlendState(&bd, &shadow_blend));
+    }
+    Com<ID3D11DepthStencilState> dss_nowrite;
+    { D3D11_DEPTH_STENCIL_DESC d2 = dsd; d2.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; d2.DepthFunc = D3D11_COMPARISON_LESS_EQUAL; CHECK(dev->CreateDepthStencilState(&d2, &dss_nowrite)); }
+    Com<ID3D11Buffer> disc_vb;  // a unit square on the floor plane (y = 0), uv 0..1 in the normal slot
+    {
+        std::vector<Vertex> q = {{-1, 0, -1, 0, 0, 0}, {1, 0, -1, 1, 0, 0}, {1, 0, 1, 1, 1, 0}, {-1, 0, -1, 0, 0, 0}, {1, 0, 1, 1, 1, 0}, {-1, 0, 1, 0, 1, 0}};
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = (UINT)(q.size() * sizeof(Vertex)); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_IMMUTABLE;
+        D3D11_SUBRESOURCE_DATA init{q.data()};
+        CHECK(dev->CreateBuffer(&bd, &init, &disc_vb));
+    }
     // Depth only (no colour): the room mesh, so real surfaces hide the virtual behind them.
     Com<ID3D11BlendState> no_color;
     { D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].RenderTargetWriteMask = 0; CHECK(dev->CreateBlendState(&bd, &no_color)); }
@@ -830,6 +888,7 @@ int main(int argc, char** argv) {
     struct Pending { UINT present; int64_t pose_qpc; };
     std::vector<Pending> pending;
     std::vector<double> latencies, cpu_ms, jerk, gain;
+    std::vector<double> pred_err_still, pred_err_slow, pred_err_fast;  // degrees, head < 15, 15-60, > 60 deg/s
     long status_counts[10] = {};
     int corr_n = 0; float corr_deg = 0, corr_mm = 0;
     UINT last_refresh = 0, last_present_seen = 0;
@@ -893,6 +952,26 @@ int main(int argc, char** argv) {
                     gain.push_back(ang / (rate_dps * (target - base)));
                 }
             }
+        }
+        // Prediction error (the swim): what this frame predicted for its display time against
+        // the engine's estimate for that same time once it has passed (80 ms later, with the
+        // camera updates in). Degrees, by head speed, for the stats line.
+        {
+            struct Pred { double t; Q q; float rate; };
+            static std::deque<Pred> preds;
+            double target = device_now() + g_predict_ms / 1000.0;
+            if (have) preds.push_back({target, q, rate_dps});
+            double now_dev = device_now();
+            while (!preds.empty() && preds.front().t < now_dev - 0.08) {
+                M4 truth;
+                if (engine_pose(preds.front().t, truth)) {
+                    Q d = qmul(mat_q(truth), qconj(preds.front().q));
+                    float ang = 2 * atan2f(sqrtf(d.x * d.x + d.y * d.y + d.z * d.z), fabsf(d.w)) * 57.2958f;
+                    (preds.front().rate > 60 ? pred_err_fast : preds.front().rate > 15 ? pred_err_slow : pred_err_still).push_back(ang);
+                }
+                preds.pop_front();
+            }
+            if (preds.size() > 600) preds.clear();
         }
         // The engine's visual update (25 Hz) revises the pose it predicted from the IMU:
         // a step every camera frame, seen as a twitch. Asking again for last frame's
@@ -1177,8 +1256,30 @@ int main(int argc, char** argv) {
         const int views = sbs ? 2 : 1;
         const float ipd = g_app.ipd_mm / 1000.0f;
         // One view of the scene: hands (joints and bones) and, if on, the test objects.
+        bool rgb_pass = false;  // render_view for the RGB view: contact shadows too
         auto render_view = [&](const M4& vpm) {
+            // A soft shadow on the surface under a point (RGB view only: the glasses cannot
+            // darken the real world).
+            auto shadow = [&](float x, float y_surface, float z, float radius, float strength) {
+                if (!rgb_pass || !g_app.shadows || strength <= 0.01f) return;
+                M4 model = mul(translate({x, y_surface + 0.003f, z}), scale(radius));
+                Constants c{mul(vpm, model), model, {strength, 0, 0, 1}, {0, 0, 0, 0}};
+                ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                ID3D11Buffer* vbs[] = {disc_vb};
+                ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->VSSetShader(vs_tex, nullptr, 0);
+                ctx->PSSetShader(ps_shadow, nullptr, 0);
+                ctx->OMSetBlendState(shadow_blend, nullptr, 0xffffffff);
+                ctx->OMSetDepthStencilState(dss_nowrite, 0);
+                ctx->Draw(6, 0);
+                ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+                ctx->OMSetDepthStencilState(dss, 0);
+                ctx->VSSetShader(vs, nullptr, 0);
+                ctx->PSSetShader(ps, nullptr, 0);
+            };
             auto draw = [&](ID3D11Buffer* vb, UINT n, D3D11_PRIMITIVE_TOPOLOGY topo, const M4& model, float r, float g, float b, bool lit) {
+                if (lit) { r *= room_tint[0]; g *= room_tint[1]; b *= room_tint[2]; }
                 Constants c{mul(vpm, model), model, {r, g, b, 1}, {lit ? 1.0f : 0.0f, 0, 0, 0}};
                 ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
                 ID3D11Buffer* vbs[] = {vb};
@@ -1217,6 +1318,35 @@ int main(int argc, char** argv) {
                     return m;
                 };
                 for (auto& h : scene_hands) {
+                    float px = 0, py = 0, pz = 0;
+                    for (int k : {0, 5, 9, 13, 17}) { px += h.j[k].x / 5; py += h.j[k].y / 5; pz += h.j[k].z / 5; }
+                    float ys = surface_under(px, py, pz);
+                    if (!std::isnan(ys) && py - ys < 0.5f) shadow(px, ys, pz, 0.06f + 0.1f * (py - ys), 0.5f * (1 - (py - ys) / 0.5f));
+                }
+                if (skin.ok && g_app.real_hands) {
+                    V3 elbows[2], wrists[2]; float hand_size[2]; int n_arms = 0;
+                    for (auto& h : scene_hands) {
+                        float j[22][3];
+                        for (int k = 0; k < 21; k++) { j[k][0] = h.j[k].x; j[k][1] = h.j[k].y; j[k][2] = h.j[k].z; }
+                        skin.elbow(j, h.right, head_scene.m, j[21]);  // the forearm, by IK from an estimated shoulder
+                        float t[3] = {room_tint[0] * (h.pinching ? 1.15f : 1.0f), room_tint[1] * (h.pinching ? 1.15f : 1.0f), room_tint[2] * (h.pinching ? 1.15f : 1.0f)};
+                        skin.draw(ctx, vpm.m, j, h.right, t, g_app.sleeves ? g_app.sleeve_color : nullptr);
+                        if (n_arms < 2) {
+                            elbows[n_arms] = {j[21][0], j[21][1], j[21][2]}; wrists[n_arms] = h.j[0];
+                            float dx = h.j[9].x - h.j[0].x, dy = h.j[9].y - h.j[0].y, dz = h.j[9].z - h.j[0].z;
+                            hand_size[n_arms++] = sqrtf(dx * dx + dy * dy + dz * dz) / 0.096f;
+                        }
+                    }
+                    // Back to the scene's pipeline.
+                    ctx->IASetInputLayout(layout);
+                    ctx->VSSetShader(vs, nullptr, 0);
+                    ctx->PSSetShader(ps, nullptr, 0);
+                    ID3D11Buffer* cbs0[] = {cb};
+                    ctx->VSSetConstantBuffers(0, 1, cbs0);
+                    ctx->PSSetConstantBuffers(0, 1, cbs0);
+                }
+                for (auto& h : scene_hands) {
+                    if (skin.ok && g_app.real_hands) break;
                     float r = h.pinching ? 1.0f : 0.92f, g = h.pinching ? 0.86f : 0.68f, b = h.pinching ? 0.78f : 0.56f;
                     for (auto& bn : hands::BONES) {
                         if (bn[0] == 0 && bn[1] != 1) continue;  // wrist to the knuckles: the palm covers it
@@ -1226,7 +1356,7 @@ int main(int argc, char** argv) {
                     for (int k = 1; k < hands::N_JOINTS; k++) draw(sph_vb, (UINT)sph.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[k]), scale(radius(k))), r, g, b, true);
                     draw(sph_vb, (UINT)sph.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(h.j[0]), scale(0.017f)), r, g, b, true);
                 }
-                if (palm_count) {
+                if (palm_count && !(skin.ok && g_app.real_hands)) {
                     Constants c{vpm, identity(), {0.92f, 0.68f, 0.56f, 1}, {1, 0, 0, 0}};
                     ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
                     ID3D11Buffer* vbs[] = {palm_vb};
@@ -1279,13 +1409,17 @@ int main(int argc, char** argv) {
                 float hue = i / 8.0f;
                 float r = 0.5f + 0.5f * cosf(6.2832f * hue), g = 0.5f + 0.5f * cosf(6.2832f * (hue - 0.333f)), b = 0.5f + 0.5f * cosf(6.2832f * (hue - 0.667f));
                 V3 at = {sinf(a) * 0.9f, 0, -cosf(a) * 0.9f};
-                if (g_app.place_on_planes) { float y = surface_under(at.x, at.y, at.z); if (!std::isnan(y)) at.y = y + 0.06f; }
+                float ys = g_app.place_on_planes ? surface_under(at.x, at.y, at.z) : NAN;
+                if (!std::isnan(ys)) at.y = ys + 0.06f;
                 draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(at), scale(0.12f)), r, g, b, true);
+                if (!std::isnan(ys)) shadow(at.x, ys, at.z, 0.11f, 0.55f);
             }
             {
                 V3 at = {0, -0.1f, -1.0f};
-                if (g_app.place_on_planes) { float y = surface_under(at.x, at.y, at.z); if (!std::isnan(y)) at.y = y + 0.025f; }
+                float ys = g_app.place_on_planes ? surface_under(at.x, at.y, at.z) : NAN;
+                if (!std::isnan(ys)) at.y = ys + 0.025f;
                 draw(cube_vb, (UINT)cube.size(), D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, mul(translate(at), scale(0.05f)), 1, 1, 1, true);
+                if (!std::isnan(ys)) shadow(at.x, ys, at.z, 0.05f, 0.55f);
             }
             float floor_y = -g_app.floor_m;
             for (auto& p : planes) if (p.kind == 0) floor_y = p.y + y_shift;
@@ -1344,6 +1478,48 @@ int main(int argc, char** argv) {
                         td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE; td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
                         if (SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &rgb_in)) && SUCCEEDED(dev->CreateShaderResourceView(rgb_in, nullptr, &rgb_in_srv))) { rgb_in_w = f.w; rgb_in_h = f.h; }
                     }
+                    // The room's light: mean colour of the frame (every 16th pixel), as a level
+                    // (dim rooms make the virtual dimmer, so it does not glow) and a tint.
+                    {
+                        double sr = 0, sg = 0, sb = 0; int n = 0;
+                        for (int y = 8; y < f.h; y += 16) for (int x = 8; x < f.w; x += 16) {
+                            uint32_t p = f.bgra[(size_t)y * f.w + x];
+                            sr += (p >> 16) & 255; sg += (p >> 8) & 255; sb += p & 255; n++;
+                        }
+                        if (n) {
+                            sr /= n * 255.0; sg /= n * 255.0; sb /= n * 255.0;
+                            double lum = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb, mx = std::max(sr, std::max(sg, sb));
+                            double level = std::clamp(0.45 + 1.2 * lum, 0.45, 1.0);
+                            double t[3] = {sr, sg, sb};
+                            for (int i = 0; i < 3; i++) {
+                                double tint = mx > 1e-3 ? 0.6 + 0.4 * t[i] / mx : 1;  // half towards the room's colour
+                                double target = g_app.room_light ? level * tint : 1;
+                                room_tint[i] = (float)(0.9 * room_tint[i] + 0.1 * target);  // slow: no flicker
+                            }
+                            g_app.room_level = (float)lum;
+                            // Where the light comes from: the centroid of the brightest
+                            // pixels (above 1.5 x the mean), as a direction from the camera.
+                            double bx = 0, by = 0, bw = 0, thr = std::min(250.0, 1.5 * lum * 255);
+                            for (int y = 8; y < f.h; y += 16) for (int x = 8; x < f.w; x += 16) {
+                                uint32_t p = f.bgra[(size_t)y * f.w + x];
+                                double l = 0.2126 * ((p >> 16) & 255) + 0.7152 * ((p >> 8) & 255) + 0.0722 * (p & 255);
+                                if (l > thr) { double wgt = l - thr; bx += wgt * x; by += wgt * y; bw += wgt; }
+                            }
+                            rgbcal::Cam rc = rgbcal::get();
+                            if (bw > 0 && rc.f > 0) {
+                                double cx = (bx / bw - f.w / 2.0) / rc.f, cy = (by / bw - f.h / 2.0) / rc.f;
+                                double R[9]; rgbcal::rotation(rc.rv, R);
+                                // camera (x right, y down, z forward) -> head (GL) -> scene
+                                double c3[3] = {cx, -cy, -1}, hd[3];
+                                for (int i = 0; i < 3; i++) hd[i] = R[0 * 3 + i] * c3[0] + R[1 * 3 + i] * c3[1] + R[2 * 3 + i] * c3[2];
+                                double sd[3];
+                                for (int i = 0; i < 3; i++) sd[i] = head_scene(i, 0) * hd[0] + head_scene(i, 1) * hd[1] + head_scene(i, 2) * hd[2];
+                                sd[1] += 0.6;  // lights are mostly above: keep some top light
+                                double nl = std::sqrt(sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]);
+                                for (int i = 0; i < 3; i++) skin.light[i] = (float)(0.9 * skin.light[i] + 0.1 * sd[i] / nl);
+                            }
+                        }
+                    }
                     D3D11_MAPPED_SUBRESOURCE m;
                     if (rgb_in && SUCCEEDED(ctx->Map(rgb_in, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
                         for (int y = 0; y < f.h; y++) memcpy((uint8_t*)m.pData + y * m.RowPitch, f.bgra.data() + (size_t)y * f.w, (size_t)f.w * 4);
@@ -1357,30 +1533,16 @@ int main(int argc, char** argv) {
                 if (rec_on) fresh = false; else make_mr(rgb_in_w, rgb_in_h);
             }
             if (fresh && MR_W) {
-                ID3D11RenderTargetView* t[] = {mr_rtv};
-                ctx->OMSetRenderTargets(1, t, mr_dsv);
                 D3D11_VIEWPORT vp{0, 0, (float)MR_W, (float)MR_H, 0, 1};
                 ctx->RSSetViewports(1, &vp);
+                // The virtual alone, premultiplied (empty: transparent).
                 {
-                    Constants c{identity(), identity(), {1, 1, 1, 1}, {0, 0, 0, 0}};
-                    ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
-                    ID3D11Buffer* vbs[] = {screen_vb};
-                    ctx->IASetInputLayout(layout);
-                    ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
-                    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    ctx->VSSetShader(vs_tex, nullptr, 0);
-                    ctx->PSSetShader(ps_tex, nullptr, 0);
-                    ID3D11ShaderResourceView* srvs[] = {rgb_in_srv};
-                    ctx->PSSetShaderResources(0, 1, srvs);
-                    ID3D11SamplerState* ss[] = {samp};
-                    ctx->PSSetSamplers(0, 1, ss);
-                    ctx->Draw(6, 0);
-                    ID3D11ShaderResourceView* none[] = {nullptr};
-                    ctx->PSSetShaderResources(0, 1, none);
-                    ctx->VSSetShader(vs, nullptr, 0);
-                    ctx->PSSetShader(ps, nullptr, 0);
+                    ID3D11RenderTargetView* t[] = {virt_rtv};
+                    ctx->OMSetRenderTargets(1, t, mr_dsv);
+                    float clear0[4] = {0, 0, 0, 0};
+                    ctx->ClearRenderTargetView(virt_rtv, clear0);
+                    ctx->ClearDepthStencilView(mr_dsv, D3D11_CLEAR_DEPTH, 1, 0);
                 }
-                ctx->ClearDepthStencilView(mr_dsv, D3D11_CLEAR_DEPTH, 1, 0);
                 rgbcal::Cam cam = rgbcal::get();
                 if (g_app.rgb_overlay && cam.w > 0) {
                     // The head when the frame was taken: arrival minus the camera's delay.
@@ -1395,7 +1557,35 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) cam_head(i, j) = (float)R[j * 3 + i]; cam_head(i, 3) = (float)cam.c[i]; }
                     M4 cam_world = mul(head_then, cam_head);
                     float vfov = 2 * atanf((float)(cam.h / 2.0 / cam.f)) * 57.2958f;
+                    rgb_pass = true;
                     render_view(mul(perspective(vfov, (float)cam.w / cam.h, 0.05f, 50), rigid_inverse(cam_world)));
+                    rgb_pass = false;
+                }
+                // The composite: the frame, the virtual softened like the camera (blur about
+                // 1.3 px at 1080p) with its grain (stronger in a dim room, as the sensor's).
+                {
+                    ID3D11RenderTargetView* t[] = {mr_rtv};
+                    ctx->OMSetRenderTargets(1, t, nullptr);
+                    static float seed = 0; seed = fmodf(seed + 17.13f, 997.0f);
+                    float blur = g_app.camera_look ? 1.3f * MR_H / 1080.0f : 0.0f;
+                    float grain = g_app.camera_look ? 0.025f + 0.05f * (1 - std::min(1.0f, g_app.room_level * 2)) : 0.0f;
+                    Constants c{identity(), identity(), {0, grain, seed, 1}, {blur / MR_W, blur / MR_H, (float)MR_W, (float)MR_H}};
+                    ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                    ID3D11Buffer* vbs[] = {screen_vb};
+                    ctx->IASetInputLayout(layout);
+                    ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx->VSSetShader(vs_tex, nullptr, 0);
+                    ctx->PSSetShader(ps_comp, nullptr, 0);
+                    ID3D11ShaderResourceView* srvs[] = {rgb_in_srv, virt_srv};
+                    ctx->PSSetShaderResources(0, 2, srvs);
+                    ID3D11SamplerState* ss[] = {samp};
+                    ctx->PSSetSamplers(0, 1, ss);
+                    ctx->Draw(6, 0);
+                    ID3D11ShaderResourceView* none[] = {nullptr, nullptr};
+                    ctx->PSSetShaderResources(0, 2, none);
+                    ctx->VSSetShader(vs, nullptr, 0);
+                    ctx->PSSetShader(ps, nullptr, 0);
                 }
                 ctx->OMSetRenderTargets(0, nullptr, nullptr);
                 // Recording: copy now, read the copy made two frames ago (no GPU stall).
@@ -1511,6 +1701,13 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 10; k++) if (status_counts[k]) printf(" [%d]=%ld", k - 1, status_counts[k]);
                 printf("\n");
             }
+            if (!g_stats_paused && (pred_err_still.size() + pred_err_slow.size() + pred_err_fast.size())) {
+                printf("      prediction error (deg, p50/p95): still %.3f/%.3f (n %zu)  slow %.3f/%.3f (n %zu)  fast %.3f/%.3f (n %zu)\n",
+                       pct(pred_err_still, 0.5), pct(pred_err_still, 0.95), pred_err_still.size(), pct(pred_err_slow, 0.5), pct(pred_err_slow, 0.95), pred_err_slow.size(),
+                       pct(pred_err_fast, 0.5), pct(pred_err_fast, 0.95), pred_err_fast.size());
+                g_app.stats.pred_err_still = (float)pct(pred_err_still, 0.95); g_app.stats.pred_err_moving = (float)pct(pred_err_slow, 0.95); g_app.stats.pred_err_fast = (float)pct(pred_err_fast, 0.95);
+            }
+            pred_err_still.clear(); pred_err_slow.clear(); pred_err_fast.clear();
             gain.clear();
             for (long& c : status_counts) c = 0;
             latencies.clear(); cpu_ms.clear(); jerk.clear(); shown = 0; missed = 0; max_rate = 0; last_updates = g_pose_updates;

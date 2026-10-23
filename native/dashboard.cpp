@@ -348,6 +348,20 @@ static void rgb_view(AppState& s) {
         if (!st.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "VITURE : %s", st.c_str());
         else ImGui::TextDisabled("VITURE : gauche %s · droite %s", l ? "vue" : "—", r ? "vue" : "—");
     }
+    ImGui::Checkbox("Mains réalistes", &s.real_hands);
+    ImGui::SameLine();
+    ImGui::Checkbox("Manches", &s.sleeves);
+    if (s.sleeves) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(7 * ImGui::GetFontSize());
+        ImGui::ColorEdit3("##manche", s.sleeve_color, ImGuiColorEditFlags_NoInputs);
+    }
+    ImGui::Checkbox("Ombres de contact", &s.shadows);
+    ImGui::SameLine();
+    ImGui::Checkbox("Grain et flou de la caméra", &s.camera_look);
+    ImGui::Checkbox("Lumière de la pièce sur le virtuel", &s.room_light);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%.0f %%)", s.room_level * 100);
     ImGui::Checkbox("Panneau de test", &s.panel);
     ImGui::SameLine();
     ImGui::Checkbox("Maillage de la pièce", &s.show_map);
@@ -409,6 +423,7 @@ static void build(AppState& s) {
     ImGui::Text("Pose → écran  %.1f ms (p99 %.1f)", t.latency_p50, t.latency_p99);
     ImGui::Text("Pose %.0f Hz   CPU %.2f ms/image", t.pose_hz, t.cpu_ms);
     ImGui::Text("Tremblement %.2f° (p99 %.2f°)", t.shake_p50, t.shake_p99);
+    ImGui::Text("Flottement (erreur de prédiction p95) : %.2f° immobile · %.2f° lent · %.2f° rapide", t.pred_err_still, t.pred_err_moving, t.pred_err_fast);
     ImGui::TextDisabled("Prédiction utilisée : %.0f %% du mouvement", t.lead_used * 100);
     ImGui::Text("Corrections visuelles  %d en 2 s · %.2f° · %.1f mm", t.corrections, t.corr_deg, t.corr_mm);
     ImGui::Checkbox("Lisser les corrections (sinon elles sautent)", &s.smooth_corrections);
