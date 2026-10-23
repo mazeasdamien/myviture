@@ -2,6 +2,8 @@
 
 A technician assistant for the **VITURE Luma Ultra** optical see-through AR glasses: a virtual human who walks in your room, stands on the real floor and shows you where things are, driven by voice or by another program (MCP).
 
+![The VITURE Luma Ultra glasses: RGB camera on the front, tracking cameras, USB-C cable to the PC](docs/images/glasses.jpg)
+
 ![The dashboard: the virtual human in the room, seen through the glasses' RGB camera](docs/images/dashboard-human.jpg)
 
 <p align="center">
