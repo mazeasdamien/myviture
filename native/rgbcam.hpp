@@ -31,6 +31,7 @@ struct Frame {
     int w = 0, h = 0;
     uint32_t seq = 0;
     long count = 0;
+    double t = 0;  // QPC seconds when the newest frame arrived
     std::string name, status = "recherche de la caméra…";
 };
 inline Frame g_frame;
@@ -96,10 +97,38 @@ inline void run() {
         ra->Release();
         IMFMediaType* mt = nullptr;
         if (SUCCEEDED(hr)) {
+            // The camera's largest mode at 24 frames/s or more (else its largest): set as
+            // the source's own format, then RGB32 out of it at the same size.
+            IMFMediaType* best = nullptr;
+            UINT64 best_area = 0; bool best_fast = false;
+            static bool listed = false;
+            for (DWORD i = 0;; i++) {
+                IMFMediaType* nt = nullptr;
+                if (FAILED(reader->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nt))) break;
+                UINT32 nw = 0, nh = 0, num = 0, den = 1;
+                MFGetAttributeSize(nt, MF_MT_FRAME_SIZE, &nw, &nh);
+                MFGetAttributeRatio(nt, MF_MT_FRAME_RATE, &num, &den);
+                double fps = den ? (double)num / den : 0;
+                GUID sub{}; nt->GetGUID(MF_MT_SUBTYPE, &sub);
+                if (!listed) printf("rgb camera mode %u: %ux%u %.0f fps %c%c%c%c\n", (unsigned)i, nw, nh, fps, (char)(sub.Data1 & 255), (char)((sub.Data1 >> 8) & 255), (char)((sub.Data1 >> 16) & 255), (char)(sub.Data1 >> 24));
+                bool fast = fps >= 24;
+                UINT64 area = (UINT64)nw * nh;
+                if ((fast && !best_fast) || (fast == best_fast && area > best_area)) {
+                    if (best) best->Release();
+                    best = nt; best_area = area; best_fast = fast;
+                } else nt->Release();
+            }
+            listed = true;
+            UINT32 bw = 1280, bh = 720;
+            if (best) {
+                MFGetAttributeSize(best, MF_MT_FRAME_SIZE, &bw, &bh);
+                reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, best);
+                best->Release();
+            }
             MFCreateMediaType(&mt);
             mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
             mt->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-            MFSetAttributeSize(mt, MF_MT_FRAME_SIZE, 1280, 720);
+            MFSetAttributeSize(mt, MF_MT_FRAME_SIZE, bw, bh);
             hr = reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, mt);
             mt->Release();
         }
@@ -129,6 +158,8 @@ inline void run() {
                     // one delivers top-down rows with a positive stride.
                     memcpy(g_frame.bgra.data(), p, (size_t)w * h * 4);
                     g_frame.w = (int)w; g_frame.h = (int)h;
+                    LARGE_INTEGER qf, qn; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qn);
+                    g_frame.t = (double)qn.QuadPart / qf.QuadPart;
                     g_frame.seq++; g_frame.count++;
                     buf->Unlock();
                 }

@@ -38,10 +38,13 @@ struct AppState {
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;
-    int hand_source = 1;       // 0: ours (MediaPipe on the two cameras), 1: VITURE's (SpaceWalker's)
     bool panel = true;         // the test text panel in front of the wearer
-    bool hand_predict = false;  // extrapolate the hands' motion to the display time (felt worse: off)
     bool rgb_overlay = true;   // virtual hands and cubes drawn over the RGB view
+    float rgb_latency_ms = 50; // an RGB frame's age when it arrives: the virtual is drawn for that moment
+    int rec_request = 0;       // 1: start recording the RGB view, 2: stop
+    bool rec_audio = true;     // with the microphone
+    int rec_mbps = 8;
+    bool photo_request = false;
     bool rgb_reset = false;    // forget the RGB camera fit
     bool smooth_corrections = true;  // blend the engine's visual corrections instead of jumping
     bool scan = true;            // accumulate the room from the depth maps
@@ -61,7 +64,7 @@ struct AppState {
     Stats stats;
     float yaw = 0, pitch = 0, roll = 0, pos[3] = {}, rate_dps = 0;
     float head_scene[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // row-major
-    /** the virtual scene rendered from the RGB camera (BGRA, alpha 0 where empty), for the dashboard */
+    /** the RGB view: the newest RGB frame with the virtual scene over it (BGRA), for the dashboard */
     void* mr_srv = nullptr;
     int mr_w = 0, mr_h = 0;
     std::vector<float> shake_history;    // deg per frame, newest last

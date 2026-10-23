@@ -23,6 +23,7 @@
 #include "rgbcam.hpp"
 #include "hands.hpp"
 #include "vhands.hpp"
+#include "recorder.hpp"
 #include "rgbcal.hpp"
 #include "roommap.hpp"
 
@@ -224,6 +225,86 @@ static void plot(const char* label, const std::vector<float>& v, float lo, float
     ImGui::PlotLines(label, v.empty() ? nullptr : v.data(), (int)v.size(), 0, overlay, lo, hi, ImVec2(-1, height));
 }
 
+/**
+ * The RGB view in large: the RGB camera's picture with the virtual scene drawn from that
+ * camera, and what to record it with.
+ */
+static void rgb_view(AppState& s) {
+    const float em = ImGui::GetFontSize();
+    const ImGuiStyle& sty = ImGui::GetStyle();
+    const float side = 24 * em;
+    ImVec2 a = ImGui::GetContentRegionAvail();
+    rec::Status rs; { std::lock_guard<std::mutex> l(rec::g_mu); rs = rec::g_status; }
+
+    ImGui::BeginChild("big", ImVec2(a.x - side - sty.ItemSpacing.x, a.y), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    if (s.mr_srv && s.mr_w) {
+        ImVec2 b = ImGui::GetContentRegionAvail();
+        float k = std::min(b.x / s.mr_w, b.y / s.mr_h);
+        ImVec2 size(s.mr_w * k, s.mr_h * k);
+        ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + (b.x - size.x) / 2, ImGui::GetCursorPosY() + (b.y - size.y) / 2));
+        ImVec2 o = ImGui::GetCursorScreenPos();
+        ImGui::Image((ImTextureID)(intptr_t)s.mr_srv, size);
+        if (rs.on) {
+            // REC mark over the picture (not recorded: drawn by the dashboard only).
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            bool blink = fmod(ImGui::GetTime(), 1.0) < 0.6;
+            if (blink) dl->AddCircleFilled(ImVec2(o.x + 1.2f * em, o.y + 1.2f * em), 0.5f * em, IM_COL32(235, 50, 50, 255));
+            char t[48]; int sec = (int)rs.seconds;
+            snprintf(t, sizeof t, "REC %02d:%02d", sec / 60, sec % 60);
+            dl->AddText(ImVec2(o.x + 2.0f * em, o.y + 0.55f * em), IM_COL32(255, 255, 255, 230), t);
+        }
+    } else ImGui::TextDisabled("Pas encore d'image de la caméra RGB.");
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    ImGui::BeginChild("side", ImVec2(0, a.y), ImGuiChildFlags_Borders);
+    ImGui::SeparatorText("Enregistrement");
+    ImGui::PushStyleColor(ImGuiCol_Button, rs.on ? ImVec4(0.75f, 0.15f, 0.15f, 1) : ImVec4(0.20f, 0.25f, 0.32f, 1));
+    if (ImGui::Button(rs.on ? "■  Arrêter l'enregistrement" : "●  Enregistrer", ImVec2(-1, 2.2f * em))) s.rec_request = rs.on ? 2 : 1;
+    ImGui::PopStyleColor();
+    ImGui::BeginDisabled(rs.on);
+    ImGui::Checkbox("Avec le son (micro)", &s.rec_audio);
+    ImGui::SliderInt("qualité (Mbit/s)", &s.rec_mbps, 2, 30);
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Virtuel par-dessus l'image", &s.rgb_overlay);
+    if (ImGui::Button("Photo (PNG)")) s.photo_request = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Ouvrir le dossier")) ShellExecuteW(nullptr, L"open", rec::folder().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (rs.on) {
+        int sec = (int)rs.seconds;
+        ImGui::Text("%02d:%02d · %ld images%s", sec / 60, sec % 60, rs.frames, rs.dropped ? "" : "");
+        if (rs.dropped) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%ld images perdues (encodeur en retard)", rs.dropped);
+        if (rs.audio) ImGui::TextDisabled("son : %.1f s · %s", rs.audio_seconds, rs.mic.c_str());
+        else ImGui::TextDisabled("sans son");
+    }
+    if (!rs.path.empty()) ImGui::TextWrapped("%s %s", rs.on ? "vers" : "dernier :", rs.path.c_str());
+    if (!rs.error.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", rs.error.c_str());
+    ImGui::TextDisabled("MP4 H.264 1280x720, son AAC · dossier Vidéos\\myViture");
+
+    ImGui::SeparatorText("Superposition");
+    ImGui::SliderFloat("retard de l'image RGB (ms)", &s.rgb_latency_ms, 0, 200, "%.0f");
+    ImGui::TextWrapped("Tourne la tête : si le virtuel part en avance sur l'image, augmente ; s'il traîne derrière, diminue.");
+    {
+        rgbcal::Fit fi; bool fitted; size_t np;
+        { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; fitted = rgbcal::g_cam.fitted; np = (size_t)rgbcal::g_frames; }
+        if (fitted) ImGui::TextWrapped("Caméra RGB calée : écart %.1f px sur %d points, rotation %.1f°, focale ×%.2f", fi.rms_px, fi.n, fi.rot_deg, fi.f_rel);
+        else ImGui::TextWrapped("Caméra RGB pas encore calée (%zu/8 poses) : montre une main immobile, à plusieurs endroits.", np);
+        if (ImGui::SmallButton("Oublier le calage RGB")) rgbcal::reset();
+    }
+
+    ImGui::SeparatorText("Mains (VITURE)");
+    {
+        bool l, r; std::string st;
+        { std::lock_guard<std::mutex> lk(vhands::g_mu); st = vhands::g_out.status; l = vhands::g_out.data[0] != 0; r = vhands::g_out.data[vhands::PER_HAND] != 0; }
+        if (!st.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "VITURE : %s", st.c_str());
+        else ImGui::TextDisabled("VITURE : gauche %s · droite %s", l ? "vue" : "—", r ? "vue" : "—");
+    }
+    ImGui::Checkbox("Panneau de test", &s.panel);
+    ImGui::SameLine();
+    ImGui::Checkbox("Nuage de la pièce", &s.show_map);
+    ImGui::EndChild();
+}
+
 static void build(AppState& s) {
     const float em = ImGui::GetFontSize();
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -238,7 +319,7 @@ static void build(AppState& s) {
     bool sbs = s.screen_w >= 3000;
     char mode[48];
     snprintf(mode, sizeof mode, sbs ? "● 3D %dx%d" : "● 2D %dx%d", s.screen_w, s.screen_h);
-    const char* buttons[] = {sbs ? "Passer en 2D" : "Passer en 3D", "Recentrer", "Capture", "Quitter"};
+    const char* buttons[] = {sbs ? "Passer en 2D" : "Passer en 3D", "Recentrer", "Quitter"};
     const ImGuiStyle& sty = ImGui::GetStyle();
     float right_w = ImGui::CalcTextSize(mode).x;
     for (auto b : buttons) right_w += sty.ItemSpacing.x + ImGui::CalcTextSize(b).x + 2 * sty.FramePadding.x;
@@ -250,14 +331,21 @@ static void build(AppState& s) {
     ImGui::SameLine();
     if (ImGui::Button(buttons[1])) s.recenter = true;
     ImGui::SameLine();
-    if (ImGui::Button(buttons[2])) s.snapshot = true;
-    ImGui::SameLine();
-    if (ImGui::Button(buttons[3])) s.quit = true;
+    if (ImGui::Button(buttons[2])) s.quit = true;
+    if (s.notice_until < 0) s.notice_until = ImGui::GetTime() + 6;
+    {
+        rec::Status rs; { std::lock_guard<std::mutex> l(rec::g_mu); rs = rec::g_status; }
+        if (rs.on) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "● REC %02d:%02d", (int)rs.seconds / 60, (int)rs.seconds % 60); }
+    }
     if (!s.notice.empty() && ImGui::GetTime() < s.notice_until) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1, 0.6f, 1), "%s", s.notice.c_str());
     }
     ImGui::Separator();
+
+    if (!ImGui::BeginTabBar("vues")) { ImGui::End(); return; }
+    if (ImGui::BeginTabItem("Vue RGB + virtuel")) { rgb_view(s); ImGui::EndTabItem(); }
+    if (!ImGui::BeginTabItem("Diagnostics")) { ImGui::EndTabBar(); ImGui::End(); return; }
 
     const float col = ImGui::GetContentRegionAvail().x / 3 - ImGui::GetStyle().ItemSpacing.x;
     const float panel_h = ImGui::GetContentRegionAvail().y / 2 - ImGui::GetStyle().ItemSpacing.y;
@@ -329,7 +417,6 @@ static void build(AppState& s) {
     ImGui::SameLine();
     ImGui::Checkbox("Grille au sol", &s.floor_grid);
     if (ImGui::Button("Valeurs d'usine")) { s.vfov = 28.147f; s.ipd_mm = 63; s.floor_m = 1.6f; s.pitch_deg = 0; s.eye_dy_cm = 0; s.eye_dz_cm = 0; s.yaw_deg = 0; }
-    ImGui::Checkbox("Prédire le mouvement des mains", &s.hand_predict);
     ImGui::SeparatorText("Pièce (scan)");
     {
         std::lock_guard<std::mutex> l(room::g.mu);
@@ -391,32 +478,21 @@ static void build(AppState& s) {
     // Fixed height (three lines), so the images below never move.
     const float line = ImGui::GetTextLineHeightWithSpacing();
     ImGui::BeginChild("handinfo", ImVec2(0, 4 * line + sty.FramePadding.y * 2), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-    ImGui::Checkbox("Mains", &s.hands);
+    ImGui::Checkbox("Mains (VITURE)", &s.hands);
     hands::g_enabled = s.hands;
     ImGui::SameLine();
-    ImGui::TextDisabled("dans la scène :");
-    ImGui::SameLine();
-    ImGui::RadioButton("VITURE", &s.hand_source, 1);
-    ImGui::SameLine();
-    ImGui::RadioButton("les nôtres", &s.hand_source, 0);
     {
-        static long last_n = 0; static double last_t = 0; static float rate = 0;
-        long n; std::string st; bool l = false, r = false;
-        { std::lock_guard<std::mutex> lk(vhands::g_mu); n = vhands::g_out.count; st = vhands::g_out.status; l = vhands::g_out.data[0] != 0; r = vhands::g_out.data[vhands::PER_HAND] != 0; }
-        double now = ImGui::GetTime();
-        if (now - last_t > 1) { rate = (float)((n - last_n) / (now - last_t)); last_n = n; last_t = now; }
-        if (!st.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "VITURE : %s", st.c_str());
-        else ImGui::TextDisabled("VITURE : %.0f réponses/s · gauche %s · droite %s", rate, l ? "vue" : "—", r ? "vue" : "—");
+        std::string st;
+        { std::lock_guard<std::mutex> lk(vhands::g_mu); st = vhands::g_out.status; }
+        if (!st.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", st.c_str());
+        else if (!hr.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", hr.status.c_str());
+        else ImGui::TextDisabled("%.0f réponses/s · calage RGB %d/s (%.0f ms)", hr.rate, hr.rgb_runs, hr.rgb_ms);
     }
-    ImGui::TextDisabled("les nôtres :");
-    ImGui::SameLine();
-    if (!hr.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", hr.status.c_str());
-    else ImGui::TextDisabled("%.0f/s · %s · %.0f ms/paire · image → main %.0f ms", hr.rate, hr.device.c_str(), hr.ms_total, hr.latency_ms);
     for (int side = 0; side < 2; side++) {
         const hands::Hand* h = nullptr;
         for (auto& x : hr.hands) if (x.right == (side == 1)) h = &x;
-        if (h) ImGui::TextDisabled("%s : %s · pince %.1f cm · doigts %.1f %.1f %.1f %.1f %.1f · stéréo %.1f mm · échelle %.2f%s", side ? "droite" : "gauche",
-                                   hands::GESTURES[h->gesture], h->pinch_m * 100, h->ext[0], h->ext[1], h->ext[2], h->ext[3], h->ext[4], h->gap_mm, h->scale_ratio, h->held ? " · tenue" : "");
+        if (h) ImGui::TextDisabled("%s : %s · pince %.1f cm · doigts %.1f %.1f %.1f %.1f %.1f · %.2f m/s%s", side ? "droite" : "gauche",
+                                   hands::GESTURES[h->gesture], h->pinch_m * 100, h->ext[0], h->ext[1], h->ext[2], h->ext[3], h->ext[4], h->speed, h->rgb_seen ? " · vue en RGB" : "");
         else ImGui::TextDisabled("%s : —", side ? "droite" : "gauche");
     }
     ImGui::EndChild();
@@ -434,6 +510,7 @@ static void build(AppState& s) {
         ImGui::Image((ImTextureID)(intptr_t)cams[i].srv, ImVec2(cams[i].w * k, cams[i].h * k));
         ImDrawList* dl = ImGui::GetWindowDrawList();
         for (auto& h : hr.hands) {
+            if (!h.in_image[i]) continue;
             ImU32 col = h.right ? IM_COL32(255, 122, 69, 255) : IM_COL32(76, 141, 255, 255);
             for (auto& b : hands::BONES)
                 dl->AddLine(ImVec2(o.x + h.image[i][b[0]][0] * k, o.y + h.image[i][b[0]][1] * k), ImVec2(o.x + h.image[i][b[1]][0] * k, o.y + h.image[i][b[1]][1] * k), col, 2);
@@ -467,11 +544,9 @@ static void build(AppState& s) {
         ImVec2 a = ImGui::GetContentRegionAvail();
         float k = std::min(a.x / rgb.w, a.y / rgb.h);
         ImVec2 o = ImGui::GetCursorScreenPos();
-        ImGui::Image((ImTextureID)(intptr_t)rgb.srv, ImVec2(rgb.w * k, rgb.h * k));
+        // The composed view (video + virtual) when the render thread made one.
+        ImGui::Image((ImTextureID)(intptr_t)(s.mr_srv ? s.mr_srv : (void*)rgb.srv), ImVec2(rgb.w * k, rgb.h * k));
         if (s.rgb_overlay && s.mr_srv) {
-            // The virtual scene rendered from the fitted RGB camera, blended over the video.
-            ImGui::SetCursorScreenPos(o);
-            ImGui::Image((ImTextureID)(intptr_t)s.mr_srv, ImVec2(rgb.w * k, rgb.h * k));
             // Until the camera is fitted: where the hand model sees the hand in the RGB image.
             bool fitted; { std::lock_guard<std::mutex> l(rgbcal::g_mu); fitted = rgbcal::g_cam.fitted; }
             if (!fitted) {
@@ -506,6 +581,8 @@ static void build(AppState& s) {
     if (ImGui::Button(orange::g_busy ? "…" : "Actualiser (≈0,0005 c$)")) orange::refresh_spend();
     ImGui::EndChild();
 
+    ImGui::EndTabItem();
+    ImGui::EndTabBar();
     ImGui::End();
 }
 

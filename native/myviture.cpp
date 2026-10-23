@@ -20,6 +20,7 @@
 #include "rgbcal.hpp"
 #include "roommap.hpp"
 #include "vhands.hpp"
+#include "recorder.hpp"
 #include "textpanel.hpp"
 #include "state.hpp"
 
@@ -461,13 +462,14 @@ template <typename T> struct Com {
 int main(int argc, char** argv) {
     std::string sdk = "C:\\Program Files\\VITURE\\SpaceWalker";
     double run_seconds = 0;  // 0: until Esc
+    double record_s = 0;     // > 0: record the RGB view for that long, from 5 s after start (tests)
     bool probe_only = false;
     double snapshot_s = 0;  // > 0: save the dashboard as dashboard.png after that many seconds
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sdk") && i + 1 < argc) sdk = argv[++i];
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) run_seconds = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--record") && i + 1 < argc) record_s = atof(argv[++i]);
         else if (!strcmp(argv[i], "--probe")) probe_only = true;
-        else if (!strcmp(argv[i], "--hands-gpu")) hands::g_use_cpu = false;
         else if (!strcmp(argv[i], "--no-room")) g_no_room = true;
         else if (!strcmp(argv[i], "--no-rgb")) g_no_rgb = true;
         else if (!strcmp(argv[i], "--no-vhands")) g_no_vhands = true;
@@ -587,23 +589,37 @@ int main(int argc, char** argv) {
     };
     CHECK(make_targets());
 
-    // The virtual scene as the RGB camera sees it, drawn over the RGB video on the dashboard.
-    const UINT MR_W = 960, MR_H = 540;
+    // The RGB view: the RGB frame, then the virtual scene as the RGB camera saw it at that
+    // moment, in one picture (the dashboard's big view, recordings, photos).
+    // Its size follows the RGB camera's (made again when that changes).
+    UINT MR_W = 0, MR_H = 0;
     Com<ID3D11Texture2D> mr_tex, mr_depth;
     Com<ID3D11RenderTargetView> mr_rtv;
     Com<ID3D11ShaderResourceView> mr_srv;
     Com<ID3D11DepthStencilView> mr_dsv;
-    {
-        D3D11_TEXTURE2D_DESC td{}; td.Width = MR_W; td.Height = MR_H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    Com<ID3D11Texture2D> rec_staging[3];     // RGB view -> CPU for the recorder, 2 frames behind
+    auto drop = [](auto& c) { if (c.p) { c.p->Release(); c.p = nullptr; } };
+    auto make_mr = [&](UINT w, UINT h) {
+        drop(mr_tex); drop(mr_depth); drop(mr_rtv); drop(mr_srv); drop(mr_dsv);
+        for (auto& st : rec_staging) drop(st);
+        D3D11_TEXTURE2D_DESC td{}; td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        CHECK(dev->CreateTexture2D(&td, nullptr, &mr_tex));
-        CHECK(dev->CreateRenderTargetView(mr_tex, nullptr, &mr_rtv));
-        CHECK(dev->CreateShaderResourceView(mr_tex, nullptr, &mr_srv));
-        D3D11_TEXTURE2D_DESC dd{}; dd.Width = MR_W; dd.Height = MR_H; dd.MipLevels = 1; dd.ArraySize = 1; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.SampleDesc.Count = 1; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-        CHECK(dev->CreateTexture2D(&dd, nullptr, &mr_depth));
-        CHECK(dev->CreateDepthStencilView(mr_depth, nullptr, &mr_dsv));
-        g_app.mr_srv = mr_srv.p; g_app.mr_w = MR_W; g_app.mr_h = MR_H;
-    }
+        bool ok = SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &mr_tex)) && SUCCEEDED(dev->CreateRenderTargetView(mr_tex, nullptr, &mr_rtv)) &&
+                  SUCCEEDED(dev->CreateShaderResourceView(mr_tex, nullptr, &mr_srv));
+        D3D11_TEXTURE2D_DESC dd = td; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        ok = ok && SUCCEEDED(dev->CreateTexture2D(&dd, nullptr, &mr_depth)) && SUCCEEDED(dev->CreateDepthStencilView(mr_depth, nullptr, &mr_dsv));
+        D3D11_TEXTURE2D_DESC sd = td; sd.BindFlags = 0; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        for (auto& st : rec_staging) ok = ok && SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &st));
+        MR_W = ok ? w : 0; MR_H = ok ? h : 0;
+        g_app.mr_srv = ok ? mr_srv.p : nullptr; g_app.mr_w = MR_W; g_app.mr_h = MR_H;
+        printf("RGB view %ux%u%s\n", w, h, ok ? "" : " FAILED");
+        return ok;
+    };
+    Com<ID3D11Texture2D> rgb_in;             // the newest RGB frame, uploaded
+    Com<ID3D11ShaderResourceView> rgb_in_srv;
+    int rgb_in_w = 0, rgb_in_h = 0;
+    int64_t rec_stamp[3] = {};
+    long rec_k = 0;
 
     Com<ID3DBlob> vsb, psb, err;
     if (FAILED(D3DCompile(SHADER, strlen(SHADER), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsb, &err)) ||
@@ -649,6 +665,13 @@ int main(int argc, char** argv) {
         D3D11_BUFFER_DESC bd{}; bd.ByteWidth = (UINT)(q.size() * sizeof(Vertex)); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_IMMUTABLE;
         D3D11_SUBRESOURCE_DATA init{q.data()};
         CHECK(dev->CreateBuffer(&bd, &init, &quad_vb));
+    }
+    Com<ID3D11Buffer> screen_vb;  // a quad over the whole target (identity transform), uv in the normal slot
+    {
+        std::vector<Vertex> q = {{-1, -1, 0, 0, 1, 0}, {1, -1, 0, 1, 1, 0}, {1, 1, 0, 1, 0, 0}, {-1, -1, 0, 0, 1, 0}, {1, 1, 0, 1, 0, 0}, {-1, 1, 0, 0, 0, 0}};
+        D3D11_BUFFER_DESC bd{}; bd.ByteWidth = (UINT)(q.size() * sizeof(Vertex)); bd.BindFlags = D3D11_BIND_VERTEX_BUFFER; bd.Usage = D3D11_USAGE_IMMUTABLE;
+        D3D11_SUBRESOURCE_DATA init{q.data()};
+        CHECK(dev->CreateBuffer(&bd, &init, &screen_vb));
     }
     panel::Panel test_panel;
     bool panel_ok = test_panel.init(dev);
@@ -731,7 +754,7 @@ int main(int argc, char** argv) {
             if (!g_no_vhands) vhands::start(sdk, yaml, d8 + "vhands_raw.csv");
         }
         if (rig.ok) {
-            hands::start(dir + L"models\\", rig);
+            hands::start(dir + L"models\\", rig, [](double t, float* out) { M4 r; if (!engine_pose(t, r)) return false; memcpy(out, r.m, sizeof r.m); return true; });
             if (!g_no_room) room::start(rig, [](double t, float* out) { M4 r; if (!engine_pose(t, r)) return false; memcpy(out, r.m, sizeof r.m); return true; },
                         std::string(dir.begin(), dir.end()) + "myviture_anchors.txt");
         }
@@ -901,43 +924,7 @@ int main(int argc, char** argv) {
         // engine's pose at that same time (no extrapolation yet).
         struct SceneHand { bool right, pinching; int gesture; V3 j[hands::N_JOINTS]; };
         std::vector<SceneHand> scene_hands;
-        hands::Result hr;
-        { std::lock_guard<std::mutex> l(hands::g_mu); if (qpc_now() / qpc_freq() - hands::g_result.t < 0.25) hr.hands = hands::g_result.hands; hr.t = hands::g_result.t; hr.seq = hands::g_result.seq; }
-        // Side by side, for VITURE's joint frame: our hands (head frame) with the engine's pose
-        // at their image, and VITURE's latest raw answer (vhands_pairs.csv).
-        if (vhands::g_on && !hr.hands.empty()) {
-            static uint32_t logged_seq = 0;
-            static FILE* pairs = nullptr;
-            static int rows = 0;
-            vhands::Out vo;
-            { std::lock_guard<std::mutex> l(vhands::g_mu); vo = vhands::g_out; }
-            M4 at;
-            if (hr.seq != logged_seq && rows < 4000 && (vo.data[0] != 0 || vo.data[vhands::PER_HAND] != 0) && std::fabs(vo.t - hr.t) < 0.2 && engine_pose(hr.t, at)) {
-                logged_seq = hr.seq;
-                if (!pairs) {
-                    char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
-                    std::string d = exe; d = d.substr(0, d.find_last_of('\\') + 1);
-                    pairs = fopen((d + "vhands_pairs.csv").c_str(), "w");
-                }
-                if (pairs) {
-                    fprintf(pairs, "%.4f,%.4f", hr.t, vo.t);
-                    for (int i = 0; i < 16; i++) fprintf(pairs, ",%.5f", at.m[i]);
-                    for (int hh = 0; hh < 2; hh++) {
-                        const hands::Hand* h = hh < (int)hr.hands.size() ? &hr.hands[hh] : nullptr;
-                        fprintf(pairs, ",%d", h ? (h->right ? 1 : 0) : -1);
-                        for (int k = 0; k < hands::N_JOINTS; k++) for (int a = 0; a < 3; a++) fprintf(pairs, ",%.4f", h ? h->joints[k][a] : 0.f);
-                    }
-                    for (int hh = 0; hh < 2; hh++) {
-                        const float* v = vo.data + hh * vhands::PER_HAND;
-                        fprintf(pairs, ",%g", v[0]);
-                        for (int k = 0; k < vhands::JOINTS; k++) for (int a = 0; a < 3; a++) fprintf(pairs, ",%.4f", v[1 + k * vhands::STRIDE + a]);
-                    }
-                    fprintf(pairs, "\n");
-                    if (++rows % 50 == 0) fflush(pairs);
-                }
-            }
-        }
-        if (g_app.hands && g_app.hand_source == 1 && vhands::g_on) {
+        if (g_app.hands && vhands::g_on) {
             // VITURE's hands: already in the engine's world, so only the recentring remains.
             vhands::Out vo;
             { std::lock_guard<std::mutex> l(vhands::g_mu); vo = vhands::g_out; }
@@ -969,41 +956,6 @@ int main(int argc, char** argv) {
                         if (count[side] >= 3 || g == 1) shown[side] = g;
                     }
                     sh.gesture = shown[side];
-                    scene_hands.push_back(sh);
-                }
-            }
-        } else if (g_app.hands) {
-            M4 at;
-            if (!hr.hands.empty() && engine_pose(hr.t, at)) {
-                M4 to_scene = mul(recenter, at);
-                // Motion of each joint in the scene, from one measurement to the next, to
-                // bring the ~55 ms old hands to the moment this frame is shown.
-                static V3 prev[2][hands::N_JOINTS], vel[2][hands::N_JOINTS];
-                static double prev_t[2] = {0, 0};
-                static uint32_t prev_seq = 0;
-                bool fresh = hr.seq != prev_seq;
-                prev_seq = hr.seq;
-                double lead = std::clamp(qpc_now() / qpc_freq() + g_predict_ms / 1000.0 - hr.t, 0.0, 0.12);
-                for (auto& h : hr.hands) {
-                    SceneHand sh{h.right, h.pinching, h.gesture, {}};
-                    int s = h.right ? 1 : 0;
-                    double dt = hr.t - prev_t[s];
-                    for (int k = 0; k < hands::N_JOINTS; k++) {
-                        const float* q = h.joints[k];
-                        V3 p = {to_scene(0, 0) * q[0] + to_scene(0, 1) * q[1] + to_scene(0, 2) * q[2] + to_scene(0, 3),
-                                to_scene(1, 0) * q[0] + to_scene(1, 1) * q[1] + to_scene(1, 2) * q[2] + to_scene(1, 3),
-                                to_scene(2, 0) * q[0] + to_scene(2, 1) * q[1] + to_scene(2, 2) * q[2] + to_scene(2, 3)};
-                        if (fresh) {
-                            if (dt > 0.005 && dt < 0.15) {
-                                V3 raw = {(float)((p.x - prev[s][k].x) / dt), (float)((p.y - prev[s][k].y) / dt), (float)((p.z - prev[s][k].z) / dt)};
-                                vel[s][k] = {0.5f * vel[s][k].x + 0.5f * raw.x, 0.5f * vel[s][k].y + 0.5f * raw.y, 0.5f * vel[s][k].z + 0.5f * raw.z};
-                            } else vel[s][k] = {0, 0, 0};
-                            prev[s][k] = p;
-                        }
-                        if (g_app.hand_predict) p = {p.x + vel[s][k].x * (float)lead, p.y + vel[s][k].y * (float)lead, p.z + vel[s][k].z * (float)lead};
-                        sh.j[k] = p;
-                    }
-                    if (fresh) prev_t[s] = hr.t;
                     scene_hands.push_back(sh);
                 }
             }
@@ -1238,29 +1190,111 @@ int main(int argc, char** argv) {
 
         sc->Present(1, 0);
 
-        // The same scene from the RGB camera (its fitted model), into the dashboard's texture.
-        if (have && g_app.rgb_overlay) {
-            rgbcal::Cam cam = rgbcal::get();
-            if (cam.w > 0) {
-                double R[9];
-                rgbcal::rotation(cam.rv, R);
-                // Camera -> head: R(rv)^T and the camera centre (the renderer's camera looks
-                // down -z with y up, which is what R(rv) maps the head to).
-                M4 cam_head = identity();
-                for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) cam_head(i, j) = (float)R[j * 3 + i]; cam_head(i, 3) = (float)cam.c[i]; }
-                M4 cam_world = mul(head_scene, cam_head);
-                float vfov = 2 * atanf((float)(cam.h / 2.0 / cam.f)) * 57.2958f;
+        // The RGB view, once per new RGB frame: the frame, then the virtual scene from the
+        // fitted RGB camera with the head where it was when the frame was taken.
+        {
+            static uint32_t rgb_seen = 0;
+            bool fresh = false;
+            double t_rgb = 0;
+            {
+                std::lock_guard<std::mutex> l(rgbcam::g_frame.mu);
+                auto& f = rgbcam::g_frame;
+                if (f.seq != rgb_seen && f.w && f.bgra.size() >= (size_t)f.w * f.h) {
+                    rgb_seen = f.seq; t_rgb = f.t;
+                    if (!rgb_in || rgb_in_w != f.w || rgb_in_h != f.h) {
+                        if (rgb_in.p) { rgb_in.p->Release(); rgb_in.p = nullptr; }
+                        if (rgb_in_srv.p) { rgb_in_srv.p->Release(); rgb_in_srv.p = nullptr; }
+                        D3D11_TEXTURE2D_DESC td{}; td.Width = f.w; td.Height = f.h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+                        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE; td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                        if (SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &rgb_in)) && SUCCEEDED(dev->CreateShaderResourceView(rgb_in, nullptr, &rgb_in_srv))) { rgb_in_w = f.w; rgb_in_h = f.h; }
+                    }
+                    D3D11_MAPPED_SUBRESOURCE m;
+                    if (rgb_in && SUCCEEDED(ctx->Map(rgb_in, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                        for (int y = 0; y < f.h; y++) memcpy((uint8_t*)m.pData + y * m.RowPitch, f.bgra.data() + (size_t)y * f.w, (size_t)f.w * 4);
+                        ctx->Unmap(rgb_in, 0);
+                        fresh = true;
+                    }
+                }
+            }
+            if (fresh && ((UINT)rgb_in_w != MR_W || (UINT)rgb_in_h != MR_H)) {
+                bool rec_on; { std::lock_guard<std::mutex> l(rec::g_mu); rec_on = rec::g_status.on; }
+                if (rec_on) fresh = false; else make_mr(rgb_in_w, rgb_in_h);
+            }
+            if (fresh && MR_W) {
                 ID3D11RenderTargetView* t[] = {mr_rtv};
                 ctx->OMSetRenderTargets(1, t, mr_dsv);
-                float clear0[4] = {0, 0, 0, 0};
-                ctx->ClearRenderTargetView(mr_rtv, clear0);
-                ctx->ClearDepthStencilView(mr_dsv, D3D11_CLEAR_DEPTH, 1, 0);
                 D3D11_VIEWPORT vp{0, 0, (float)MR_W, (float)MR_H, 0, 1};
                 ctx->RSSetViewports(1, &vp);
-                render_view(mul(perspective(vfov, (float)cam.w / cam.h, 0.05f, 50), rigid_inverse(cam_world)));
+                {
+                    Constants c{identity(), identity(), {1, 1, 1, 1}, {0, 0, 0, 0}};
+                    ctx->UpdateSubresource(cb, 0, nullptr, &c, 0, 0);
+                    ID3D11Buffer* vbs[] = {screen_vb};
+                    ctx->IASetInputLayout(layout);
+                    ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
+                    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx->VSSetShader(vs_tex, nullptr, 0);
+                    ctx->PSSetShader(ps_tex, nullptr, 0);
+                    ID3D11ShaderResourceView* srvs[] = {rgb_in_srv};
+                    ctx->PSSetShaderResources(0, 1, srvs);
+                    ID3D11SamplerState* ss[] = {samp};
+                    ctx->PSSetSamplers(0, 1, ss);
+                    ctx->Draw(6, 0);
+                    ID3D11ShaderResourceView* none[] = {nullptr};
+                    ctx->PSSetShaderResources(0, 1, none);
+                    ctx->VSSetShader(vs, nullptr, 0);
+                    ctx->PSSetShader(ps, nullptr, 0);
+                }
+                ctx->ClearDepthStencilView(mr_dsv, D3D11_CLEAR_DEPTH, 1, 0);
+                rgbcal::Cam cam = rgbcal::get();
+                if (g_app.rgb_overlay && cam.w > 0) {
+                    // The head when the frame was taken: arrival minus the camera's delay.
+                    double t_dev = device_now() - (qpc_now() / qpc_freq() - t_rgb) - g_app.rgb_latency_ms / 1000.0;
+                    M4 at, head_then = head_scene;
+                    if (t_dev > 0 && engine_pose(t_dev, at)) head_then = mul(recenter, at);
+                    double R[9];
+                    rgbcal::rotation(cam.rv, R);
+                    // Camera -> head: R(rv)^T and the camera centre (the renderer's camera looks
+                    // down -z with y up, which is what R(rv) maps the head to).
+                    M4 cam_head = identity();
+                    for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) cam_head(i, j) = (float)R[j * 3 + i]; cam_head(i, 3) = (float)cam.c[i]; }
+                    M4 cam_world = mul(head_then, cam_head);
+                    float vfov = 2 * atanf((float)(cam.h / 2.0 / cam.f)) * 57.2958f;
+                    render_view(mul(perspective(vfov, (float)cam.w / cam.h, 0.05f, 50), rigid_inverse(cam_world)));
+                }
                 ctx->OMSetRenderTargets(0, nullptr, nullptr);
+                // Recording: copy now, read the copy made two frames ago (no GPU stall).
+                bool rec_on; { std::lock_guard<std::mutex> l(rec::g_mu); rec_on = rec::g_status.on; }
+                if (rec_on) {
+                    int k = rec_k % 3;
+                    ctx->CopyResource(rec_staging[k], mr_tex);
+                    rec_stamp[k] = (int64_t)(t_rgb * qpc_freq());
+                    if (rec_k >= 2) {
+                        int r = (rec_k - 2) % 3;
+                        D3D11_MAPPED_SUBRESOURCE m;
+                        if (SUCCEEDED(ctx->Map(rec_staging[r], 0, D3D11_MAP_READ, 0, &m))) {
+                            rec::push((const uint8_t*)m.pData, (int)m.RowPitch, rec_stamp[r]);
+                            ctx->Unmap(rec_staging[r], 0);
+                        }
+                    }
+                    rec_k++;
+                } else rec_k = 0;
+                if (g_app.photo_request) {
+                    g_app.photo_request = false;
+                    ctx->CopyResource(rec_staging[0], mr_tex);
+                    D3D11_MAPPED_SUBRESOURCE m;
+                    std::wstring png = rec::stamped(L".png");
+                    bool ok = false;
+                    if (SUCCEEDED(ctx->Map(rec_staging[0], 0, D3D11_MAP_READ, 0, &m))) {
+                        ok = rec::save_png(png, (const uint8_t*)m.pData, MR_W, MR_H, (int)m.RowPitch);
+                        ctx->Unmap(rec_staging[0], 0);
+                    }
+                    g_app.notice = ok ? "photo : " + rec::utf8(png) : "photo : échec";
+                    g_app.notice_until = -1;  // the dashboard starts the 6 s
+                }
             }
         }
+        if (g_app.rec_request == 1) { g_app.rec_request = 0; if (MR_W) rec::start(MR_W, MR_H, g_app.rec_mbps, g_app.rec_audio); }
+        else if (g_app.rec_request == 2) { g_app.rec_request = 0; rec::stop(); }
         UINT present_id = 0;
         sc->GetLastPresentCount(&present_id);
         pending.push_back({present_id, pose_qpc});
@@ -1331,8 +1365,8 @@ int main(int argc, char** argv) {
             if (!g_stats_paused) {
                 std::lock_guard<std::mutex> l(hands::g_mu);
                 auto& r = hands::g_result;
-                printf("      hands: %zu  %.0f/s  %.0f ms/pair (palm %.0f, %d/s)  image->hand %.0f ms", r.hands.size(), r.rate, r.ms_total, r.ms_palm, r.palm_runs, r.latency_ms);
-                for (auto& h : r.hands) printf("  [%s gap %.0f mm pinch %.1f cm wrist %.2f %.2f %.2f]", h.right ? "R" : "L", h.gap_mm, h.pinch_m * 100, h.joints[0][0], h.joints[0][1], h.joints[0][2]);
+                printf("      hands (VITURE): %zu  %.0f/s  RGB fit %d/s %.0f ms  no pose %ld", r.hands.size(), r.rate, r.rgb_runs, r.rgb_ms, r.pose_fails);
+                for (auto& h : r.hands) printf("  [%s pinch %.1f cm %.2f m/s%s]", h.right ? "R" : "L", h.pinch_m * 100, h.speed, h.rgb_seen ? " rgb" : "");
                 printf("\n");
             }
             for (long& c : comp_counts) c = 0;
@@ -1376,11 +1410,18 @@ int main(int argc, char** argv) {
         }
 
         if (run_seconds > 0 && qpc_ms(qpc_now() - frame_t0) > run_seconds * 1000) g_quit = true;
+        if (record_s > 0) {
+            static int rec_phase = 0;
+            double el = qpc_ms(qpc_now() - frame_t0) / 1000;
+            if (rec_phase == 0 && el > 5) { g_app.rec_request = 1; g_app.photo_request = true; rec_phase = 1; }
+            else if (rec_phase == 1 && el > 5 + record_s) { g_app.rec_request = 2; rec_phase = 2; }
+        }
     }
 
     printf("stopping...\n");
     // Whatever hangs on the way out (engine, camera, GPU), the process ends.
     CreateThread(nullptr, 0, [](LPVOID) -> DWORD { Sleep(6000); fflush(stdout); TerminateProcess(GetCurrentProcess(), 0); return 0; }, nullptr, 0, nullptr);
+    rec::stop();
     room::stop();
     vhands::stop();
     hands::stop();

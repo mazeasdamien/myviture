@@ -1,12 +1,10 @@
-// Stereo hand tracking: MediaPipe's palm detector and hand landmark models (Apache 2.0,
-// ONNX from opencv_zoo) on ONNX Runtime + DirectML, on its own thread.
+// The hands, from VITURE's hand tracking (vhands.hpp), in the head frame, for the
+// dashboard and the RGB camera's fit, on their own thread.
 //
-// Per tracking camera: the palm detector runs only while no hand is followed; once a hand
-// is found, the landmark model runs on a rotated square that follows it from frame to
-// frame (MediaPipe's own scheme). Hands seen by both cameras are matched by side and
-// their 21 joints triangulated with the factory calibration: metric, in the head frame
-// at the image's time (QPC seconds, the engine's clock). Smoothed (One Euro), pinch
-// with hysteresis.
+// The RGB camera is fitted to the hands: where VITURE's 3D joints of a still hand are
+// found in the RGB image by MediaPipe's hand landmark model (Apache 2.0, ONNX from
+// opencv_zoo, on the CPU), at most 4 times a second. The same joints are projected into
+// the two tracking cameras for the dashboard's views.
 
 #pragma once
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +17,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,8 +27,8 @@
 #include "state.hpp"
 #include "rgbcam.hpp"
 #include "rgbcal.hpp"
+#include "vhands.hpp"
 #include "third_party/onnxruntime/include/onnxruntime_cxx_api.h"
-#include "third_party/onnxruntime/include/dml_provider_factory.h"
 
 #pragma comment(lib, "third_party/onnxruntime/lib/onnxruntime.lib")
 
@@ -68,14 +67,12 @@ inline int classify(const float j[21][3], bool pinching, float ext[5]) {
 struct Hand {
     bool right = false;           // from the wearer's point of view
     float joints[N_JOINTS][3];    // head frame (OpenGL axes), metres, at `t`
-    float image[2][N_JOINTS][2];  // pixel landmarks in the left / right image
-    bool pinching = false;
+    float image[2][N_JOINTS][2];  // projected into the left / right tracking image (pixels)
+    bool in_image[2] = {false, false};
     float pinch_m = 1;
-    float gap_mm = 0;             // mean distance between the two cameras' rays
-    bool held = false;            // not measured this frame: the last measurement, kept briefly
     int gesture = 0;              // GESTURES[]: none, pinch, fist (grab), point (poke), open
     float ext[5] = {};            // extension per finger (thumb..pinky): tip distance / hand size
-    float scale_ratio = 0;        // stereo hand size / the model's metric hand size (1 = consistent depth)
+    float speed = 0;              // wrist, m/s
     bool rgb_seen = false;        // the hand model found this hand in the RGB image too
     float rgb[N_JOINTS][2];       // where it is in the RGB image (pixels)
 };
@@ -85,11 +82,11 @@ struct Result {
     double t = 0;                 // image time (QPC seconds)
     uint32_t seq = 0;
     // diagnostics
-    float rate = 0, ms_palm = 0, ms_landmarks = 0, ms_total = 0, latency_ms = 0;
-    int palm_runs = 0;            // palm detections in the last second
+    float rate = 0;               // VITURE answers per second
+    float rgb_ms = 0;             // the last RGB landmark run
+    int rgb_runs = 0;             // RGB landmark runs in the last second
+    long pose_fails = 0;          // answers dropped: no engine pose at their image's time
     std::string status = "chargement…";
-    std::string device;
-    int rgb_w = 0, rgb_h = 0;
 };
 
 inline std::mutex g_mu;
@@ -105,46 +102,16 @@ inline void logf(const char* fmt, ...) {
     if (g_log) { fprintf(g_log, "%.3f %s", GetTickCount64() / 1000.0, buf); fflush(g_log); }
 }
 inline std::atomic<bool> g_stop{false}, g_enabled{true};
-/** Run the models on the CPU: the GPU is shared with the glasses, depth and dashboard. */
-inline bool g_use_cpu = true;
 inline std::thread g_thread;
+/** Engine pose at device time t: head -> world, row-major 4x4. */
+typedef std::function<bool(double, float*)> PoseFn;
 
 // ------------------------------------------------------------------ small helpers
 
 inline double qpc_s() { LARGE_INTEGER f, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q); return (double)q.QuadPart / f.QuadPart; }
 
-/** One Euro filter, per coordinate. */
-struct OneEuro {
-    double min_cutoff = 2.5, beta = 8, d_cutoff = 1;
-    double x = 0, dx = 0, t = -1;
-    static double alpha(double cutoff, double dt) { double tau = 1 / (2 * 3.14159265 * cutoff); return 1 / (1 + tau / dt); }
-    double apply(double v, double now) {
-        if (t < 0 || now - t > 0.3) { x = v; dx = 0; t = now; return v; }
-        double dt = std::max(1e-4, now - t);
-        double d = (v - x) / dt;
-        dx += alpha(d_cutoff, dt) * (d - dx);
-        double a = alpha(min_cutoff + beta * std::fabs(dx), dt);
-        x += a * (v - x);
-        t = now;
-        return x;
-    }
-};
-
 /** Square, rotated region of interest in an image (pixels). */
 struct Roi { double cx = 0, cy = 0, size = 0, angle = 0; };
-
-/** Wrist speed (m/s) of one side between calls, for the RGB sampling. */
-inline float last_speed_rgb(int sd, const Hand& h, double t) {
-    static float w[2][3]; static double tw[2] = {-1, -1}; static float v[2] = {1, 1};
-    double dt = t - tw[sd];
-    if (tw[sd] >= 0 && dt > 0.005 && dt < 0.3) {
-        float dx = h.joints[0][0] - w[sd][0], dy = h.joints[0][1] - w[sd][1], dz = h.joints[0][2] - w[sd][2];
-        v[sd] = (float)(std::sqrt(dx * dx + dy * dy + dz * dz) / dt);
-    } else if (dt >= 0.3 || tw[sd] < 0) v[sd] = 1;
-    for (int a = 0; a < 3; a++) w[sd][a] = h.joints[0][a];
-    tw[sd] = t;
-    return v[sd];
-}
 
 /** Samples `roi` into an n x n RGB float image in [0, 1] (bilinear, black outside). `px(x, y, rgb)` reads one pixel. */
 template <typename Px>
@@ -162,11 +129,6 @@ inline void crop_with(Px px, int w, int h, const Roi& r, int n, float* out) {
         px(x0, y0, a); px(x0 + 1, y0, b); px(x0, y0 + 1, cc); px(x0 + 1, y0 + 1, d);
         for (int k = 0; k < 3; k++) o[k] = (float)((a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (cc[k] * (1 - fx) + d[k] * fx) * fy);
     }
-}
-
-/** Gray image (the tracking cameras), replicated to RGB. */
-inline void crop(const uint8_t* img, int w, int h, const Roi& r, int n, float* out) {
-    crop_with([&](int x, int y, float* rgb) { rgb[0] = rgb[1] = rgb[2] = img[y * w + x] / 255.0f; }, w, h, r, n, out);
 }
 
 /** BGRA image (the RGB camera). */
@@ -188,14 +150,12 @@ inline double hand_angle(double x0, double y0, double x1, double y1) {
     return a - 2 * 3.14159265 * std::floor((a + 3.14159265) / (2 * 3.14159265));
 }
 
-// ------------------------------------------------------------------ models
+// ------------------------------------------------------------------ model
 
 struct Models {
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "myviture"};
-    Ort::Session palm{nullptr}, lm{nullptr};
-    std::vector<std::string> palm_in, palm_out, lm_in, lm_out;
-    std::vector<std::array<float, 2>> anchors;  // palm detector SSD anchors (normalised)
-    std::string device;
+    Ort::Session lm{nullptr};
+    std::vector<std::string> lm_in, lm_out;
 
     static std::vector<std::string> names(Ort::Session& s, bool input) {
         Ort::AllocatorWithDefaultOptions a;
@@ -205,99 +165,21 @@ struct Models {
         return v;
     }
 
+    /** The landmark model, on the CPU (the GPU is the glasses' and the depth's). */
     bool load(const std::wstring& dir) {
-        auto open = [&](const std::wstring& file, bool dml) {
-            Ort::SessionOptions so;
-            so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-            if (dml) {
-                // DirectML wants sequential execution and no memory pattern.
-                so.DisableMemPattern();
-                so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-                Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(so, 0));
-            } else so.SetIntraOpNumThreads(4);
-            return Ort::Session(env, (dir + file).c_str(), so);
-        };
-        for (bool dml : {true, false}) {
-            if (dml && g_use_cpu) continue;
-            try {
-                palm = open(L"palm_detection_mediapipe_2023feb.onnx", dml);
-                lm = open(L"handpose_estimation_mediapipe_2023feb.onnx", dml);
-                device = dml ? "GPU (DirectML)" : "CPU";
-                break;
-            } catch (const Ort::Exception& e) {
-                fprintf(stderr, "hands: %s session failed: %s\n", dml ? "DirectML" : "CPU", e.what());
-                palm = Ort::Session(nullptr); lm = Ort::Session(nullptr);
-            }
+        Ort::SessionOptions so;
+        so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        so.SetIntraOpNumThreads(2);
+        try {
+            lm = Ort::Session(env, (dir + L"handpose_estimation_mediapipe_2023feb.onnx").c_str(), so);
+        } catch (const Ort::Exception& e) {
+            fprintf(stderr, "hands: landmark model failed: %s\n", e.what());
+            return false;
         }
-        if (!palm || !lm) return false;
-        palm_in = names(palm, true); palm_out = names(palm, false);
         lm_in = names(lm, true); lm_out = names(lm, false);
-        for (size_t i = 0; i < lm_out.size(); i++) {
-            auto sh = lm.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape();
-            std::string dims;
-            for (auto d : sh) dims += std::to_string(d) + " ";
-            logf("hands: landmark output %zu '%s' [%s]\n", i, lm_out[i].c_str(), dims.c_str());
-        }
-        // MediaPipe palm SSD anchors, 192 x 192: stride 8 (2 per cell) then stride 16 (6 per cell).
-        for (int y = 0; y < 24; y++) for (int x = 0; x < 24; x++) for (int k = 0; k < 2; k++) anchors.push_back({(x + 0.5f) / 24, (y + 0.5f) / 24});
-        for (int y = 0; y < 12; y++) for (int x = 0; x < 12; x++) for (int k = 0; k < 6; k++) anchors.push_back({(x + 0.5f) / 12, (y + 0.5f) / 12});
         return true;
     }
 };
-
-struct Palm { double x0, y0, x1, y1, score; double kp[7][2]; };
-
-/** Palm detections in a w x h gray image (letterboxed to 192 x 192). */
-inline std::vector<Palm> detect_palms(Models& M, const uint8_t* img, int w, int h) {
-    const int N = 192;
-    double scale = std::max(w, h);                 // the letterbox square, in pixels
-    double padx = (scale - w) / 2, pady = (scale - h) / 2;
-    static std::vector<float> in(N * N * 3);
-    Roi sq{w / 2.0, h / 2.0, scale, 0};
-    crop(img, w, h, sq, N, in.data());
-    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    int64_t shape[4] = {1, N, N, 3};
-    Ort::Value t = Ort::Value::CreateTensor<float>(mem, in.data(), in.size(), shape, 4);
-    const char* in_names[] = {M.palm_in[0].c_str()};
-    std::vector<const char*> out_names;
-    for (auto& s : M.palm_out) out_names.push_back(s.c_str());
-    auto out = M.palm.Run(Ort::RunOptions{nullptr}, in_names, &t, 1, out_names.data(), out_names.size());
-    // Outputs: regressors (1, 2016, 18) and scores (1, 2016, 1), in either order.
-    int ri = out[0].GetTensorTypeAndShapeInfo().GetShape().back() == 18 ? 0 : 1;
-    const float* reg = out[ri].GetTensorData<float>();
-    const float* sc = out[1 - ri].GetTensorData<float>();
-    std::vector<Palm> cand;
-    for (size_t i = 0; i < M.anchors.size(); i++) {
-        double s = 1 / (1 + std::exp(-sc[i]));
-        if (s < 0.4) continue;
-        const float* r = reg + i * 18;
-        double ax = M.anchors[i][0], ay = M.anchors[i][1];
-        double cx = r[0] / N + ax, cy = r[1] / N + ay, bw = r[2] / N, bh = r[3] / N;
-        Palm p{(cx - bw / 2) * scale - padx, (cy - bh / 2) * scale - pady, (cx + bw / 2) * scale - padx, (cy + bh / 2) * scale - pady, s, {}};
-        for (int k = 0; k < 7; k++) { p.kp[k][0] = (r[4 + 2 * k] / N + ax) * scale - padx; p.kp[k][1] = (r[5 + 2 * k] / N + ay) * scale - pady; }
-        cand.push_back(p);
-    }
-    std::sort(cand.begin(), cand.end(), [](const Palm& a, const Palm& b) { return a.score > b.score; });
-    std::vector<Palm> keep;
-    for (auto& c : cand) {
-        bool dup = false;
-        for (auto& k : keep) {
-            double ix = std::max(0.0, std::min(c.x1, k.x1) - std::max(c.x0, k.x0)), iy = std::max(0.0, std::min(c.y1, k.y1) - std::max(c.y0, k.y0));
-            double inter = ix * iy, uni = (c.x1 - c.x0) * (c.y1 - c.y0) + (k.x1 - k.x0) * (k.y1 - k.y0) - inter;
-            if (inter / uni > 0.3) { dup = true; break; }
-        }
-        if (!dup) keep.push_back(c);
-        if (keep.size() == 2) break;
-    }
-    return keep;
-}
-
-/** MediaPipe's palm -> hand region: rotate wrist->middle finger up, shift up half a box, x2.6. */
-inline Roi roi_from_palm(const Palm& p) {
-    double w = p.x1 - p.x0, h = p.y1 - p.y0, a = hand_angle(p.kp[0][0], p.kp[0][1], p.kp[2][0], p.kp[2][1]);
-    double cx = (p.x0 + p.x1) / 2 + 0.5 * h * std::sin(a), cy = (p.y0 + p.y1) / 2 - 0.5 * h * std::cos(a);
-    return {cx, cy, std::max(w, h) * 2.6, a};
-}
 
 /** Next region from the landmarks (MediaPipe's tracking): wrist->middle MCP up, x2, shift -0.1. */
 inline Roi roi_from_landmarks(const float lm[N_JOINTS][2]) {
@@ -320,7 +202,7 @@ constexpr float PRESENCE_MIN = 0.3f;
  * Landmarks of the hand in `roi`; false if the model says there is no hand. presence and
  * hand (handedness, 1 = the wearer's right) are returned for the diagnostics.
  */
-inline bool landmarks_run(Models& M, std::vector<float>& in, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand, float world[N_JOINTS][3]) {
+inline bool landmarks_run(Models& M, std::vector<float>& in, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand) {
     const int N = 224;
     auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     int64_t shape[4] = {1, N, N, 3};
@@ -331,14 +213,13 @@ inline bool landmarks_run(Models& M, std::vector<float>& in, const Roi& roi, flo
     auto o = M.lm.Run(Ort::RunOptions{nullptr}, in_names, &t, 1, out_names.data(), out_names.size());
     // Outputs: landmarks (63, in 224 px), presence, handedness, world landmarks (63); the
     // two scalars told apart by name when the export names them, else by order.
-    const float* lmk = nullptr; const float* wld = nullptr; int scalars = 0;
+    const float* lmk = nullptr; int scalars = 0;
     presence = hand = 0;
     for (size_t i = 0; i < o.size(); i++) {
         size_t n = o[i].GetTensorTypeAndShapeInfo().GetElementCount();
         const std::string& name = M.lm_out[i];
         float v = n == 1 ? o[i].GetTensorData<float>()[0] : 0;
         if (n == 63 && !lmk) lmk = o[i].GetTensorData<float>();
-        else if (n == 63) wld = o[i].GetTensorData<float>();
         else if (n == 1 && name.find("hand") != std::string::npos) hand = v;
         else if (n == 1 && (name.find("conf") != std::string::npos || name.find("pres") != std::string::npos || name.find("flag") != std::string::npos)) presence = v;
         else if (n == 1) { (scalars++ == 0 ? presence : hand) = v; }
@@ -349,429 +230,140 @@ inline bool landmarks_run(Models& M, std::vector<float>& in, const Roi& roi, flo
         from_roi(roi, lmk[k * 3] / N, lmk[k * 3 + 1] / N, x, y);
         out[k][0] = (float)x; out[k][1] = (float)y;
     }
-    if (world && wld) {
-        // Metres, hand-centred, in the crop's orientation: turn back like the image points.
-        double c = std::cos(roi.angle), sn = std::sin(roi.angle);
-        for (int k = 0; k < N_JOINTS; k++) {
-            float wx = wld[k * 3], wy = wld[k * 3 + 1];
-            world[k][0] = (float)(wx * c - wy * sn); world[k][1] = (float)(wx * sn + wy * c); world[k][2] = wld[k * 3 + 2];
-        }
-    }
     return true;
 }
 
-inline bool landmarks(Models& M, const uint8_t* img, int w, int h, const Roi& roi, float out[N_JOINTS][2], float& presence, float& hand, float world[N_JOINTS][3] = nullptr) {
-    static std::vector<float> in(224 * 224 * 3);
-    crop(img, w, h, roi, 224, in.data());
-    return landmarks_run(M, in, roi, out, presence, hand, world);
-}
+// ------------------------------------------------------------------ thread
 
-/**
- * Where a hand seen by camera `from` should be in the other camera: its depth from the
- * ratio of the metric hand (world landmarks) to the hand in the image, then the 3D
- * joints projected into the other camera. The region covers the projected joints.
- */
-inline bool predict_roi(const calib::Rig& rig, int from, const float lm[N_JOINTS][2], const float world[N_JOINTS][3], Roi& out, double& depth) {
-    const calib::Camera& A = rig.cam[from];
-    const calib::Camera& B = rig.cam[1 - from];
-    double n[N_JOINTS][2];
-    for (int k = 0; k < N_JOINTS; k++) A.undistort(lm[k][0], lm[k][1], n[k][0], n[k][1]);
-    // Scale: metric distances over normalised-image distances, summed over all joint pairs.
-    double num = 0, den = 0;
-    for (int i = 0; i < N_JOINTS; i++) for (int j = i + 1; j < N_JOINTS; j++) {
-        double dn = std::hypot(n[i][0] - n[j][0], n[i][1] - n[j][1]);
-        double dw = std::hypot(world[i][0] - world[j][0], world[i][1] - world[j][1]);
-        num += dw; den += dn;
-    }
-    if (den < 1e-6) return false;
-    depth = num / den;
-    if (depth < 0.12 || depth > 1.5) return false;
-    float proj[N_JOINTS][2];
-    for (int k = 0; k < N_JOINTS; k++) {
-        double c[3] = {n[k][0] * depth, n[k][1] * depth, depth}, p[3], u, v;
-        A.to_head(c, p);
-        if (!B.project(p, u, v)) return false;
-        proj[k][0] = (float)u; proj[k][1] = (float)v;
-    }
-    out = roi_from_landmarks(proj);
-    out.size *= 1.25;  // the depth is rough: a little margin
-    return true;
-}
-
-// ------------------------------------------------------------------ tracking thread
-
-/**
- * One hand followed in one camera. Its side is a running average of the model's
- * handedness: one frame's flip (fingers folded in a pinch) does not change it.
- */
-struct Track {
-    bool on = false;
-    Roi roi;
-    float side = 0.5f;  // 1 = right
-    float lm[N_JOINTS][2];
-    float world[N_JOINTS][3];
-    int misses = 0;
-    float presence = 0;
-    bool fresh = false;  // landmarks from this frame
-    bool assisted = false;  // started from the other camera's hand
-    bool right() const { return side > 0.5f; }
-};
-constexpr int MAX_MISSES = 4;  // frames a hand may be missed before it is dropped
-
-inline void run(std::wstring model_dir, calib::Rig rig) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+inline void run(std::wstring model_dir, calib::Rig rig, PoseFn pose_at) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     Models M;
-    if (!M.load(model_dir)) { std::lock_guard<std::mutex> l(g_mu); g_result.status = "modèles de mains introuvables (native\\models)"; return; }
-    { std::lock_guard<std::mutex> l(g_mu); g_result.status = ""; g_result.device = M.device; }
-    printf("hands: models loaded on %s\n", M.device.c_str());
-
-    Track tracks[2][2];  // [camera][slot]
-    OneEuro filters[2][N_JOINTS][3];  // [side][joint][axis]
-    bool pinch_state[2] = {};
+    bool have_model = M.load(model_dir);
+    { std::lock_guard<std::mutex> l(g_mu); g_result.status = have_model ? "" : "modèle de main introuvable : pas de calage RGB"; }
     uint32_t seen = 0;
-    std::vector<uint8_t> img[2];
-    int w = 0, h = 0;
-    double rate_t0 = qpc_s(); int frames = 0, palms = 0;
-    float rate = 0; int palm_rate = 0;
+    double last_rgb_t = 0, rate_t0 = qpc_s();
+    int answers = 0, rgb_runs = 0;
+    float rate = 0; int rgb_rate = 0;
+    float prev_w[2][3] = {}; double prev_t[2] = {-1, -1};
+    std::vector<float> crop_in(224 * 224 * 3);
 
     while (!g_stop) {
-        double t_img = 0;
-        {
-            std::lock_guard<std::mutex> l(g_cams.mu);
-            if (g_cams.seq != seen && g_cams.w) {
-                seen = g_cams.seq; img[0] = g_cams.px[0]; img[1] = g_cams.px[1]; w = g_cams.w; h = g_cams.h; t_img = g_cams.t;
-            }
-        }
-        if (!t_img || !g_enabled) { Sleep(2); continue; }
-        if (img[0].size() < (size_t)w * h || img[1].size() < (size_t)w * h) continue;
-
-        double t0 = qpc_s(), t_palm = 0;
-        // Per camera: follow the known hands, look for new ones when fewer than two.
-        for (int c = 0; c < 2; c++) {
-            for (int k = 0; k < 2; k++) {
-                auto& tr = tracks[c][k];
-                tr.fresh = false;
-                if (!tr.on) continue;
-                float pres, hand;
-                float lm[N_JOINTS][2];
-                if (landmarks(M, img[c].data(), w, h, tr.roi, lm, pres, hand, tr.world)) {
-                    memcpy(tr.lm, lm, sizeof lm);
-                    tr.side = 0.85f * tr.side + 0.15f * hand;
-                    tr.roi = roi_from_landmarks(tr.lm);
-                    tr.misses = 0; tr.presence = pres; tr.fresh = true;
-                } else if (++tr.misses > MAX_MISSES) {
-                    tr.on = false;
-                    logf("hands: cam %d slot %d lost (presence %.2f, handedness %.2f)\n", c, k, pres, hand);
-                }
-            }
-            int on = tracks[c][0].on + tracks[c][1].on;
-            if (on < 2) {
-                double tp = qpc_s();
-                auto found = detect_palms(M, img[c].data(), w, h);
-                t_palm += qpc_s() - tp;
-                palms++;
-                for (auto& p : found) {
-                    Roi r = roi_from_palm(p);
-                    // Skip palms inside a hand already followed.
-                    bool known = false;
-                    for (auto& tr : tracks[c]) if (tr.on && std::hypot(tr.roi.cx - r.cx, tr.roi.cy - r.cy) < tr.roi.size * 0.3) known = true;
-                    if (known) continue;
-                    for (int k = 0; k < 2; k++) {
-                        auto& tr = tracks[c][k];
-                        if (tr.on) continue;
-                        float pres, hand;
-                        if (landmarks(M, img[c].data(), w, h, r, tr.lm, pres, hand, tr.world)) {
-                            tr.on = true; tr.side = hand; tr.roi = roi_from_landmarks(tr.lm); tr.misses = 0; tr.presence = pres; tr.fresh = true; tr.assisted = false;
-                            logf("hands: cam %d slot %d found (presence %.2f, handedness %.2f, palm %.2f)\n", c, k, pres, hand, p.score);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Stereo assistance: a hand fresh in one camera and absent from the other is
-        // looked for in the other at its predicted place, without the palm detector.
-        for (int c = 0; c < 2; c++) {
-            int o = 1 - c;
-            for (auto& src : tracks[c]) {
-                if (!src.on || !src.fresh) continue;
-                // Already matched by a fresh track in the other camera?
-                bool have = false;
-                for (auto& tr : tracks[o]) if (tr.on && tr.fresh) {
-                    double sum = 0; int n = 0;
-                    for (int k : {0, 5, 9, 13, 17}) {
-                        double d1[3], d2[3], p[3], gap;
-                        rig.cam[c].ray(src.lm[k][0], src.lm[k][1], d1);
-                        rig.cam[o].ray(tr.lm[k][0], tr.lm[k][1], d2);
-                        if (calib::triangulate(rig.cam[c].origin, d1, rig.cam[o].origin, d2, p, gap)) { sum += gap; n++; }
-                    }
-                    if (n && sum / n < 0.04) have = true;
-                }
-                if (have) continue;
-                Roi r; double depth;
-                if (!predict_roi(rig, c, src.lm, src.world, r, depth)) continue;
-                Track* slot = nullptr;
-                for (auto& tr : tracks[o]) if (!tr.on) { slot = &tr; break; }
-                if (!slot) for (auto& tr : tracks[o]) if (!tr.fresh) { slot = &tr; break; }  // a stale track: replace it
-                if (!slot) continue;
-                float pres, hand;
-                float lm[N_JOINTS][2], wd[N_JOINTS][3];
-                if (landmarks(M, img[o].data(), w, h, r, lm, pres, hand, wd)) {
-                    memcpy(slot->lm, lm, sizeof lm); memcpy(slot->world, wd, sizeof wd);
-                    slot->on = true; slot->side = src.side; slot->roi = roi_from_landmarks(lm); slot->misses = 0; slot->presence = pres; slot->fresh = true; slot->assisted = true;
-                    logf("hands: cam %d found from cam %d (depth %.2f m, presence %.2f)\n", o, c, depth, pres);
-                } else if (frames % 25 == 0) logf("hands: cam %d assist from cam %d failed (depth %.2f m, presence %.2f)\n", o, c, depth, pres);
-            }
-        }
-
-        // Stereo: pair the two cameras' hands by geometry (the pairing whose rays meet
-        // best on the palm joints), not by their handedness guesses.
-        auto pair_gap = [&](const Track& a, const Track& b) {
-            double sum = 0;
-            for (int k : {0, 5, 9, 13, 17}) {
-                double d1[3], d2[3], p[3], gap;
-                rig.cam[0].ray(a.lm[k][0], a.lm[k][1], d1);
-                rig.cam[1].ray(b.lm[k][0], b.lm[k][1], d2);
-                if (!calib::triangulate(rig.cam[0].origin, d1, rig.cam[1].origin, d2, p, gap)) return 1e9;
-                sum += gap;
-            }
-            return sum / 5;
+        Sleep(10);
+        vhands::Out vo;
+        { std::lock_guard<std::mutex> l(vhands::g_mu); if (vhands::g_out.seq == seen) continue; vo = vhands::g_out; }
+        seen = vo.seq;
+        answers++;
+        if (!g_enabled || vo.img_t <= 0) continue;
+        float pose[16];
+        if (!pose_at(vo.img_t, pose)) { std::lock_guard<std::mutex> l(g_mu); g_result.pose_fails++; continue; }
+        // World -> head: the pose's inverse (rigid).
+        auto to_head = [&](const float* w, float* h) {
+            float d[3] = {w[0] - pose[3], w[1] - pose[7], w[2] - pose[11]};
+            for (int i = 0; i < 3; i++) h[i] = pose[0 + i] * d[0] + pose[4 + i] * d[1] + pose[8 + i] * d[2];
         };
-        struct Match { Track* L; Track* R; double gap; };
-        std::vector<Match> matches;
-        {
-            Track* Ls[2]; Track* Rs[2]; int nl = 0, nr = 0;
-            // A camera that missed this frame still has last frame's landmarks: close enough.
-            for (auto& tr : tracks[0]) if (tr.on && tr.misses <= 2) Ls[nl++] = &tr;
-            for (auto& tr : tracks[1]) if (tr.on && tr.misses <= 2) Rs[nr++] = &tr;
-            if (nl == 2 && nr == 2) {
-                double a = pair_gap(*Ls[0], *Rs[0]) + pair_gap(*Ls[1], *Rs[1]), b = pair_gap(*Ls[0], *Rs[1]) + pair_gap(*Ls[1], *Rs[0]);
-                if (a <= b) { matches.push_back({Ls[0], Rs[0], pair_gap(*Ls[0], *Rs[0])}); matches.push_back({Ls[1], Rs[1], pair_gap(*Ls[1], *Rs[1])}); }
-                else { matches.push_back({Ls[0], Rs[1], pair_gap(*Ls[0], *Rs[1])}); matches.push_back({Ls[1], Rs[0], pair_gap(*Ls[1], *Rs[0])}); }
-            } else if (nl && nr) {
-                Match best{nullptr, nullptr, 1e9};
-                for (int i = 0; i < nl; i++) for (int j = 0; j < nr; j++) { double g = pair_gap(*Ls[i], *Rs[j]); if (g < best.gap) best = {Ls[i], Rs[j], g}; }
-                matches.push_back(best);
-            }
-        }
-        // Where each side's hand was last seen (raw wrist, tracking frame), for continuity.
-        static double side_wrist[2][3];
-        static double side_t[2] = {-1, -1};
-        std::vector<Hand> out;
-        for (auto& m : matches) {
-            if (m.gap > 0.04) { logf("hands: stereo pair rejected, palm rays %.0f mm apart\n", m.gap * 1000); continue; }
-            Track* L = m.L; Track* R = m.R;
-            // Side: a hand within 12 cm of where one side was seen in the last 0.4 s keeps
-            // that side (the model's handedness flips on a single hand); else both
-            // cameras' running handedness together.
-            bool right = L->side + R->side > 1.0f;
-            {
-                double d1[3], d2[3], p[3], gap;
-                rig.cam[0].ray(L->lm[0][0], L->lm[0][1], d1);
-                rig.cam[1].ray(R->lm[0][0], R->lm[0][1], d2);
-                if (calib::triangulate(rig.cam[0].origin, d1, rig.cam[1].origin, d2, p, gap)) {
-                    double best = 0.12; int keep = -1;
-                    for (int sd = 0; sd < 2; sd++) {
-                        if (side_t[sd] < 0 || t_img - side_t[sd] > 0.4) continue;
-                        if (std::any_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == (sd == 1); })) continue;
-                        double d = std::sqrt((p[0] - side_wrist[sd][0]) * (p[0] - side_wrist[sd][0]) + (p[1] - side_wrist[sd][1]) * (p[1] - side_wrist[sd][1]) + (p[2] - side_wrist[sd][2]) * (p[2] - side_wrist[sd][2]));
-                        if (d < best) { best = d; keep = sd; }
-                    }
-                    if (keep >= 0) right = keep == 1;
-                    int sd = right ? 1 : 0;
-                    if (!std::any_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == right; })) {
-                        for (int a = 0; a < 3; a++) side_wrist[sd][a] = p[a];
-                        side_t[sd] = t_img;
-                    }
-                }
-            }
-            int side = right ? 1 : 0;
-            if (std::any_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == right; })) side = 1 - side, right = !right;
-            Hand hd; hd.right = right;
-            double gap_sum = 0; bool ok = true;
-            for (int k = 0; k < N_JOINTS && ok; k++) {
-                double d1[3], d2[3], p[3], gap;
-                rig.cam[0].ray(L->lm[k][0], L->lm[k][1], d1);
-                rig.cam[1].ray(R->lm[k][0], R->lm[k][1], d2);
-                ok = calib::triangulate(rig.cam[0].origin, d1, rig.cam[1].origin, d2, p, gap);
-                gap_sum += gap;
-                for (int a = 0; a < 3; a++) hd.joints[k][a] = (float)filters[side][k][a].apply(p[a], t_img);
-                for (int a = 0; a < 2; a++) { hd.image[0][k][a] = L->lm[k][a]; hd.image[1][k][a] = R->lm[k][a]; }
-            }
-            hd.gap_mm = (float)(gap_sum / N_JOINTS * 1000);
-            if (!ok) continue;
-            // Depth check: the stereo hand's size against the model's metric hand (pairwise distances).
-            {
-                double ds = 0, dw = 0;
-                for (int i = 0; i < N_JOINTS; i++) for (int j = i + 1; j < N_JOINTS; j++) {
-                    ds += std::sqrt((hd.joints[i][0] - hd.joints[j][0]) * (hd.joints[i][0] - hd.joints[j][0]) + (hd.joints[i][1] - hd.joints[j][1]) * (hd.joints[i][1] - hd.joints[j][1]) + (hd.joints[i][2] - hd.joints[j][2]) * (hd.joints[i][2] - hd.joints[j][2]));
-                    dw += std::sqrt((L->world[i][0] - L->world[j][0]) * (L->world[i][0] - L->world[j][0]) + (L->world[i][1] - L->world[j][1]) * (L->world[i][1] - L->world[j][1]) + (L->world[i][2] - L->world[j][2]) * (L->world[i][2] - L->world[j][2]));
-                }
-                hd.scale_ratio = dw > 0 ? (float)(ds / dw) : 0;
-            }
-            float* a = hd.joints[4]; float* b = hd.joints[8];
-            hd.pinch_m = std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
-            pinch_state[side] = pinch_state[side] ? hd.pinch_m < 0.04f : hd.pinch_m < 0.025f;
-            hd.pinching = pinch_state[side];
-            // Gesture, switched only after 3 frames agree (no flicker between two).
-            {
-                static int shown[2] = {0, 0}, cand[2] = {0, 0}, count[2] = {0, 0};
-                int g = classify(hd.joints, hd.pinching, hd.ext);
-                if (g == cand[side]) count[side]++; else { cand[side] = g; count[side] = 1; }
-                if (count[side] >= 3 || g == 1) shown[side] = g;  // the pinch shows at once
-                hd.gesture = shown[side];
-            }
-            out.push_back(hd);
-        }
-        // A hand missed for a few frames stays where it was, instead of blinking.
-        static Hand last_hand[2];
-        static double last_hand_t[2] = {-1, -1};
-        static float last_speed[2] = {0, 0};  // wrist speed, m/s
+        Result res;
+        res.t = vo.img_t; res.seq = vo.seq;
         for (int side = 0; side < 2; side++) {
-            auto it = std::find_if(out.begin(), out.end(), [&](const Hand& x) { return x.right == (side == 1); });
-            if (it != out.end()) {
-                double dt = t_img - last_hand_t[side];
-                if (last_hand_t[side] >= 0 && dt > 0.01 && dt < 0.2) {
-                    const float* a = it->joints[0]; const float* b = last_hand[side].joints[0];
-                    last_speed[side] = (float)(std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2])) / dt);
+            float w[N_JOINTS][3];
+            if (!vhands::hand_world(vo.data, side, w)) { prev_t[side] = -1; continue; }
+            Hand h;
+            h.right = side == 1;
+            for (int k = 0; k < N_JOINTS; k++) to_head(w[k], h.joints[k]);
+            for (int c = 0; c < 2 && rig.ok; c++) {
+                h.in_image[c] = true;
+                for (int k = 0; k < N_JOINTS; k++) {
+                    double p[3] = {h.joints[k][0], h.joints[k][1], h.joints[k][2]}, u, v;
+                    if (!rig.cam[c].project(p, u, v)) { h.in_image[c] = false; break; }
+                    h.image[c][k][0] = (float)u; h.image[c][k][1] = (float)v;
                 }
-                last_hand[side] = *it; last_hand_t[side] = t_img; continue;
             }
-            // Only briefly, and not for a hand that was moving: a stale pose then reads as lag.
-            if (last_hand_t[side] >= 0 && t_img - last_hand_t[side] < 0.08 && last_speed[side] < 0.4) { Hand h = last_hand[side]; h.held = true; h.rgb_seen = false; out.push_back(h); }
-            else pinch_state[side] = false;
+            float dx = w[4][0] - w[8][0], dy = w[4][1] - w[8][1], dz = w[4][2] - w[8][2];
+            h.pinch_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+            h.gesture = classify(h.joints, h.pinch_m < 0.025f, h.ext);
+            double dt = vo.t - prev_t[side];
+            if (prev_t[side] > 0 && dt > 0.005 && dt < 0.5) {
+                float mx = w[0][0] - prev_w[side][0], my = w[0][1] - prev_w[side][1], mz = w[0][2] - prev_w[side][2];
+                h.speed = (float)(std::sqrt(mx * mx + my * my + mz * mz) / dt);
+            } else h.speed = 1;
+            for (int a = 0; a < 3; a++) prev_w[side][a] = w[0][a];
+            prev_t[side] = vo.t;
+            res.hands.push_back(h);
         }
 
-        // RGB camera: each stereo hand is looked for in the newest RGB image where the
-        // current RGB model projects it; found, the joints feed the model's fit (only
-        // while the hand is still, so the two cameras' timings do not matter).
-        int rgb_w = 0, rgb_h = 0;
-        static double rgb_last_t = 0;
-        bool rgb_due = t_img - rgb_last_t > (rgbcal::get().fitted ? 0.5 : 0.25);
+        // RGB camera fit: still hands, at most 4 per second (2 once fitted).
+        bool fitted = rgbcal::get().fitted;
         bool any_still = false;
-        for (auto& hd : out) {
-            int sd = hd.right ? 1 : 0;
-            if (!hd.held && last_speed_rgb(sd, hd, t_img) < 0.15f) any_still = true;
-        }
-        if (!out.empty() && rgb_due && any_still) {
-            rgb_last_t = t_img;
-            static uint32_t rgb_seq = 0;
-            static std::vector<float> crops[2];
-            static Roi crop_roi[2];
-            static bool cropped[2];
-            static float last_wrist[2][3];
-            static double last_wrist_t[2] = {0, 0};
-            cropped[0] = cropped[1] = false;
-            rgbcal::Cam cam;
+        for (auto& h : res.hands) if (h.speed < 0.15f) any_still = true;
+        if (have_model && any_still && qpc_s() - last_rgb_t > (fitted ? 0.5 : 0.25)) {
+            last_rgb_t = qpc_s();
+            Roi rois[2]; bool cropped[2] = {false, false};
+            std::vector<float> crops[2];
             {
                 std::lock_guard<std::mutex> l(rgbcam::g_frame.mu);
                 auto& f = rgbcam::g_frame;
-                if (f.w && f.seq != rgb_seq && f.bgra.size() >= (size_t)f.w * f.h) {
-                    rgb_seq = f.seq;
-                    rgb_w = f.w; rgb_h = f.h;
-                    cam = rgbcal::current(f.w, f.h);
-                    for (size_t i = 0; i < out.size() && i < 2; i++) {
+                if (f.w && f.bgra.size() >= (size_t)f.w * f.h) {
+                    rgbcal::Cam cam = rgbcal::current(f.w, f.h);
+                    for (size_t i = 0; i < res.hands.size() && i < 2; i++) {
+                        if (res.hands[i].speed >= 0.15f) continue;
                         float proj[N_JOINTS][2];
                         bool ok = true;
                         for (int k = 0; k < N_JOINTS && ok; k++) {
-                            double p[3] = {out[i].joints[k][0], out[i].joints[k][1], out[i].joints[k][2]}, u, v;
+                            double p[3] = {res.hands[i].joints[k][0], res.hands[i].joints[k][1], res.hands[i].joints[k][2]}, u, v;
                             ok = rgbcal::project(cam, p, u, v);
                             proj[k][0] = (float)u; proj[k][1] = (float)v;
                         }
                         if (!ok) continue;
-                        crop_roi[i] = roi_from_landmarks(proj);
-                        crop_roi[i].size *= cam.fitted ? 1.3 : 1.8;  // more margin before the first fit
+                        rois[i] = roi_from_landmarks(proj);
+                        rois[i].size *= cam.fitted ? 1.3 : 1.8;  // more margin before the first fit
                         crops[i].resize(224 * 224 * 3);
-                        crop_bgra(f.bgra.data(), f.w, f.h, crop_roi[i], 224, crops[i].data());
+                        crop_bgra(f.bgra.data(), f.w, f.h, rois[i], 224, crops[i].data());
                         cropped[i] = true;
                     }
                 }
             }
             std::vector<rgbcal::Pair> pairs;
-            double wrist_of_pairs[3] = {0, 0, 0};
-            for (size_t i = 0; i < out.size() && i < 2; i++) {
-                if (!cropped[i] || out[i].held) continue;
-                float pres, hand, wd[N_JOINTS][3];
-                if (!landmarks_run(M, crops[i], crop_roi[i], out[i].rgb, pres, hand, wd) || pres < 0.5f) continue;
-                out[i].rgb_seen = true;
-                int sd = out[i].right ? 1 : 0;
-                const float* wr = out[i].joints[0];
-                double dt = t_img - last_wrist_t[sd];
-                double moved = std::sqrt((wr[0] - last_wrist[sd][0]) * (wr[0] - last_wrist[sd][0]) + (wr[1] - last_wrist[sd][1]) * (wr[1] - last_wrist[sd][1]) + (wr[2] - last_wrist[sd][2]) * (wr[2] - last_wrist[sd][2]));
-                bool still = dt > 0 && dt < 0.2 && moved / dt < 0.15;
-                for (int k = 0; k < 3; k++) last_wrist[sd][k] = wr[k];
-                last_wrist_t[sd] = t_img;
-                if (!still || out[i].gap_mm > 15) continue;
-                for (int k = 0; k < 3; k++) wrist_of_pairs[k] = wr[k];
-                for (int k = 0; k < N_JOINTS; k++) pairs.push_back({{out[i].joints[k][0], out[i].joints[k][1], out[i].joints[k][2]}, out[i].rgb[k][0], out[i].rgb[k][1]});
+            double wrist[3] = {0, 0, 0};
+            for (size_t i = 0; i < res.hands.size() && i < 2; i++) {
+                if (!cropped[i]) continue;
+                double t0 = qpc_s();
+                float pres, hand;
+                bool found = landmarks_run(M, crops[i], rois[i], res.hands[i].rgb, pres, hand) && pres >= 0.5f;
+                res.rgb_ms = (float)((qpc_s() - t0) * 1000);
+                rgb_runs++;
+                if (!found) continue;
+                res.hands[i].rgb_seen = true;
+                for (int a = 0; a < 3; a++) wrist[a] = res.hands[i].joints[0][a];
+                for (int k = 0; k < N_JOINTS; k++)
+                    pairs.push_back({{res.hands[i].joints[k][0], res.hands[i].joints[k][1], res.hands[i].joints[k][2]}, res.hands[i].rgb[k][0], res.hands[i].rgb[k][1]});
             }
             if (!pairs.empty()) {
                 static int logged = 0;
-                rgbcal::add(pairs, wrist_of_pairs);
+                rgbcal::add(pairs, wrist);
                 rgbcal::Fit fi; int runs;
                 { std::lock_guard<std::mutex> l(rgbcal::g_mu); fi = rgbcal::g_fit; runs = rgbcal::g_fit_runs; }
-                if (runs != logged && (logged = runs))  // a fit finished
+                if (runs != logged && (logged = runs))
                     logf("rgb fit: %s rms %.1f px on %d points, rot %.1f deg, shift %.1f %.1f %.1f cm, f x%.2f\n", fi.ok ? "ok" : "rejected", fi.rms_px, fi.n, fi.rot_deg, fi.shift_cm[0], fi.shift_cm[1], fi.shift_cm[2], fi.f_rel);
             }
         }
 
-        double t1 = qpc_s();
-        frames++;
-        // Per-frame trace (native/hands_frames.csv): timing of each step and what each
-        // camera follows, to find stalls and losses.
+        double now = qpc_s();
+        if (now - rate_t0 >= 1) { rate = (float)(answers / (now - rate_t0)); rgb_rate = rgb_runs; answers = 0; rgb_runs = 0; rate_t0 = now; }
+        res.rate = rate; res.rgb_runs = rgb_rate;
         {
-            static FILE* csv = nullptr;
-            static double last_end = 0, t_start = qpc_s();
-            if (!csv && g_log_dir.size()) {
-                csv = _wfopen((g_log_dir + L"hands_frames.csv").c_str(), L"w");
-                if (csv) fprintf(csv, "t_s,gap_ms,loop_ms,palm_ms,image_age_ms,cam0_on,cam0_pres,cam0_miss,cam1_on,cam1_pres,cam1_miss,hands,h0_side,h0_gap_mm,h0_scale,h0_gesture,h0_held,h1_side,h1_gap_mm,h1_scale,h1_gesture,h1_held\n");
-            }
-            if (csv) {
-                auto cam = [&](int c, float& pres, int& miss) { int on = 0; pres = 0; miss = 0; for (auto& tr : tracks[c]) if (tr.on) { on++; pres = std::max(pres, tr.presence); miss = std::max(miss, tr.misses); } return on; };
-                float p0, p1; int m0, m1;
-                int on0 = cam(0, p0, m0), on1 = cam(1, p1, m1);
-                fprintf(csv, "%.3f,%.1f,%.1f,%.1f,%.1f,%d,%.2f,%d,%d,%.2f,%d,%zu", t1 - t_start, last_end > 0 ? (t0 - last_end) * 1000 : 0, (t1 - t0) * 1000, t_palm * 1000, (t1 - t_img) * 1000, on0, p0, m0, on1, p1, m1, out.size());
-                for (size_t i = 0; i < 2; i++) {
-                    if (i < out.size()) fprintf(csv, ",%s,%.1f,%.2f,%d,%d", out[i].right ? "R" : "L", out[i].gap_mm, out[i].scale_ratio, out[i].gesture, out[i].held ? 1 : 0);
-                    else fprintf(csv, ",,,,,");
-                }
-                fprintf(csv, "\n");
-                static int lines = 0;
-                if (++lines % 25 == 0) fflush(csv);
-            }
-            last_end = t1;
+            std::lock_guard<std::mutex> l(g_mu);
+            res.status = g_result.status;
+            if (!res.rgb_ms) res.rgb_ms = g_result.rgb_ms;
+            res.pose_fails = g_result.pose_fails;
+            g_result = std::move(res);
         }
-        if (t1 - rate_t0 > 1) {
-            rate = (float)(frames / (t1 - rate_t0)); palm_rate = palms; frames = palms = 0; rate_t0 = t1;
-            // Once a second: what each camera follows, and the stereo hands.
-            char line[400]; int n = 0;
-            for (int c = 0; c < 2; c++) for (int k = 0; k < 2; k++) {
-                auto& tr = tracks[c][k];
-                if (tr.on) n += snprintf(line + n, sizeof line - n, " cam%d.%d[%s p%.2f m%d]", c, k, tr.right() ? "R" : "L", tr.presence, tr.misses);
-            }
-            for (auto& hd : out) n += snprintf(line + n, sizeof line - n, " stereo[%s gap %.0fmm scale %.2f pinch %.1fcm%s%s]", hd.right ? "R" : "L", hd.gap_mm, hd.scale_ratio, hd.pinch_m * 100, hd.pinching ? " P" : "", hd.held ? " held" : "");
-            logf("hands: %.0f/s%s\n", rate, n ? line : " (none)");
-        }
-        std::lock_guard<std::mutex> l(g_mu);
-        g_result.hands = std::move(out);
-        g_result.t = t_img;
-        g_result.seq++;
-        g_result.rate = rate;
-        g_result.palm_runs = palm_rate;
-        g_result.ms_palm = (float)(t_palm * 1000);
-        g_result.ms_total = (float)((t1 - t0) * 1000);
-        g_result.ms_landmarks = g_result.ms_total - g_result.ms_palm;
-        g_result.latency_ms = (float)((t1 - t_img) * 1000);
-        if (rgb_w) { g_result.rgb_w = rgb_w; g_result.rgb_h = rgb_h; }
     }
 }
 
-inline void start(const std::wstring& model_dir, const calib::Rig& rig) {
+inline void start(const std::wstring& model_dir, const calib::Rig& rig, PoseFn pose_at) {
     std::wstring dir = model_dir.substr(0, model_dir.find_last_of(L'\\', model_dir.size() - 2) + 1);
     g_log = _wfopen((dir + L"myviture.log").c_str(), L"w");
     g_log_dir = dir;
-    g_thread = std::thread(run, model_dir, rig);
+    g_thread = std::thread(run, model_dir, rig, pose_at);
 }
 inline void stop() { g_stop = true; if (g_thread.joinable()) g_thread.join(); }
 
