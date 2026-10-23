@@ -34,10 +34,6 @@ The native Windows app (`native/`, C++ / Direct3D 11):
 
 The first version, a WebUSB web app with its own USB driver, is in `src/`. It is documented in [docs/web-app.md](docs/web-app.md), with the decoded USB protocol.
 
-## Status
-
-Work on the PC version stopped in October 2026. The next step is a standalone version on the VITURE neckband (Unity SDK).
-
 ## Build and run
 
 Windows 11, Visual Studio 2026 (C++), and VITURE SpaceWalker installed (the app loads its `carina_vio.dll`, not included here). Glasses connected, display set to Extend (Win+P).
