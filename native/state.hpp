@@ -16,12 +16,26 @@ struct Stats {
     float corr_deg = 0, corr_mm = 0;  // their mean size
     float lead_ms = 0;          // prediction used: pose read -> vblank -> screen
     float pred_err_still = 0, pred_err_moving = 0, pred_err_fast = 0;  // prediction error p95 (deg): head still, slow, fast
+    float tw_err_moving = 0, tw_err_fast = 0;  // the same after the timewarp
+    float fallback_hz = 0;      // frames without the engine's prediction (it failed), per second
+    float imu_gap_p99 = 0;      // IMU callbacks: gap between arrivals, p99 (ms; 1 = steady 1 kHz)
+    long missed_fast = 0;       // missed vblanks while the head turned fast (> 60 deg/s)
 };
 
 struct AppState {
     // ---- written by the dashboard (or the glasses window's keys)
     float predict_ms = 12;      // the screen's own latency after the vblank (prediction goes to vblank + this)
+    // Stability test: a thin cross, world-locked, laid on a real edge (a door frame); the
+    // screen latency is tuned until it neither trails nor leads when the head shakes.
+    bool stab_test = false;
+    int stab_request = 0;       // 1: place the cross at the gaze, 2: remove it
+    int stab_mode = 0;          // compared settings: 0 smoothing + timewarp, 1 no smoothing, 2 no timewarp, 3 neither
     bool late_latch = false;    // read the pose and draw just before the vblank (off: GPU sharing made it miss vblanks)
+    bool tracking_lost = false; // (written) the engine pose jumps impossibly: the scene holds the last good pose
+    long tracking_losses = 0;
+    bool timewarp = true;       // turn the rendered eyes by the head's rotation read just before the vblank
+    float tw_margin_ms = 4;     // (written) how long before the vblank the warp reads the pose
+    float tw_deg = 0;           // (written) mean rotation the warp corrected per frame
     float latch_margin_ms = 5;  // how long before the vblank (adapts: more when a vblank is missed)
     bool engine_predict = true;
     float vfov = 28.147f;   // per-eye vertical field, degrees
@@ -39,9 +53,6 @@ struct AppState {
     bool scene = true;
     bool floor_grid = false;
     bool hands = true;
-    bool real_hands = true;    // the realistic (skinned) hands, else bone volumes
-    bool sleeves = true;       // long sleeves, elbow to wrist
-    float sleeve_color[3] = {0.16f, 0.17f, 0.19f};
     bool room_light = true;    // the virtual takes the room's light level and colour (RGB camera)
     bool shadows = true;       // contact shadows under virtual objects and hands (RGB view)
     bool camera_look = true;   // the RGB view's virtual softened and grained like the camera
@@ -56,7 +67,15 @@ struct AppState {
     bool rgb_reset = false;    // forget the RGB camera fit
     bool smooth_corrections = true;  // blend the engine's visual corrections instead of jumping
     bool scan = true;            // accumulate the room from the depth maps
-    bool show_map = false;       // draw the scanned room's mesh (debug: it fills the view)
+    bool show_map = false;       // draw the room as thin lines: floor-wall seams, wall edges, tables, walkable area
+    bool show_mesh = false;      // draw the clutter mesh (debug: it fills the view)
+    // The virtual human: shown, wandering on its own; requests from the dashboard or the MCP.
+    bool human = true;
+    bool human_wander = true;
+    int human_request = 0;       // 1: come in front of me, 2: go to human_target (tracking frame)
+    float human_target[2] = {0, 0};
+    std::string human_state;     // (written) what it is doing
+    float human_pos[3] = {0, 0, 0};  // (written) tracking frame, on the floor
     bool occlusion = true;       // real surfaces (the room mesh) hide the virtual behind them
     bool place_on_planes = true; // rest the test objects on the floor / tables found
     int room_request = 0;        // 1: anchor at the gaze, 2: forget the room
@@ -76,6 +95,13 @@ struct AppState {
     float head_scene[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // row-major
     /** the RGB view: the newest RGB frame with the virtual scene over it (BGRA), for the dashboard */
     void* mr_srv = nullptr;
+    // The 3D debug view of the scene (dashboard tab): drawn only while the tab is open.
+    bool v3_open = false;              // set by the dashboard every frame the tab shows
+    void* v3_srv = nullptr; int v3_w = 1280, v3_h = 800;
+    float v3_yaw = 0.6f, v3_pitch = 0.6f, v3_dist = 5.0f;   // orbit around the target (rad, m)
+    float v3_target[3] = {0, 0, 0};    // tracking frame
+    bool v3_follow = true;             // target = the head
+    bool v3_voxels = true, v3_evidence = false, v3_live = true, v3_planes = true, v3_walk = true, v3_mesh = false, v3_trail = true;
     int mr_w = 0, mr_h = 0;
     std::vector<float> shake_history;    // deg per frame, newest last
     std::vector<float> latency_history;  // pose -> vblank, ms

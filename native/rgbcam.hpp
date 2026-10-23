@@ -39,6 +39,8 @@ struct Frame {
 };
 inline Frame g_frame;
 inline std::atomic<bool> g_stop{false};
+/** Allow 1920x1080 (MJPG): uncompressed 1080p starved the glasses' tracking cameras (no 6DoF until replugged). */
+inline bool g_allow_1080 = true;
 inline std::thread g_thread;
 
 inline void set_status(const std::string& s) { std::lock_guard<std::mutex> l(g_frame.mu); g_frame.status = s; }
@@ -114,6 +116,9 @@ inline void run() {
                 double fps = den ? (double)num / den : 0;
                 GUID sub{}; nt->GetGUID(MF_MT_SUBTYPE, &sub);
                 if (!listed) printf("rgb camera mode %u: %ux%u %.0f fps %c%c%c%c\n", (unsigned)i, nw, nh, fps, (char)(sub.Data1 & 255), (char)((sub.Data1 >> 8) & 255), (char)((sub.Data1 >> 16) & 255), (char)(sub.Data1 >> 24));
+                // MJPG, at most 1280x720 unless allowed: above that the glasses can stop sending
+                // the tracking images and the engine loses its 6DoF.
+                if (sub != MFVideoFormat_MJPG || (!g_allow_1080 && (UINT64)nw * nh > 1280ull * 720)) { nt->Release(); continue; }
                 bool fast = fps >= 24;
                 UINT64 area = (UINT64)nw * nh;
                 if ((fast && !best_fast) || (fast == best_fast && area > best_area)) {

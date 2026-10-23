@@ -26,6 +26,7 @@
 #include "recorder.hpp"
 #include "rgbcal.hpp"
 #include "roommap.hpp"
+#include "mcp.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -42,7 +43,7 @@ static std::string ini_path;
 
 // Camera images as RGBA textures (ImGui draws a single-channel texture in red).
 struct CamTex { ID3D11Texture2D* tex = nullptr; ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0; };
-static CamTex cams[2], rgb, depth_tex;
+static CamTex cams[2], rgb, depth_tex, sem_tex;
 static void ensure_tex(CamTex& t, int w, int h, DXGI_FORMAT fmt);
 
 /** The last depth map as a colour image: near warm, far cold, black where unknown. */
@@ -64,6 +65,24 @@ static void update_depth() {
         }
     }
     ctx->Unmap(depth_tex.tex, 0);
+}
+/** The newest labelled RGB image, one colour per category. */
+static void update_sem() {
+    static uint32_t seen = 0;
+    std::vector<uint8_t> cat;
+    { std::lock_guard<std::mutex> l(semseg::g_mu); if (semseg::g_map.seq == seen) return; seen = semseg::g_map.seq; cat = semseg::g_map.cat; }
+    if (cat.size() != (size_t)semseg::OUT_PX * semseg::OUT_PX) return;
+    ensure_tex(sem_tex, semseg::OUT_PX, semseg::OUT_PX, DXGI_FORMAT_B8G8R8A8_UNORM);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx->Map(sem_tex.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    for (int y = 0; y < semseg::OUT_PX; y++) {
+        uint32_t* row = (uint32_t*)((uint8_t*)m.pData + y * m.RowPitch);
+        for (int x = 0; x < semseg::OUT_PX; x++) {
+            const float* cc = semseg::CAT_COLOR[std::min<int>(cat[y * semseg::OUT_PX + x], semseg::NCAT - 1)];
+            row[x] = 0xff000000u | ((int)(cc[0] * 255) << 16) | ((int)(cc[1] * 255) << 8) | (int)(cc[2] * 255);
+        }
+    }
+    ctx->Unmap(sem_tex.tex, 0);
 }
 static uint32_t cam_seq = 0, rgb_seq = 0;
 static std::vector<uint32_t> rgba;
@@ -254,6 +273,85 @@ static void fit_numbers(double& rms, int& n) {
  * The RGB view in large: the RGB camera's picture with the virtual scene drawn from that
  * camera, and what to record it with.
  */
+/** The scene in 3D, for debugging: the image the renderer drew, the mouse orbits it. */
+static void scene3d_view(AppState& s) {
+    s.v3_open = true;
+    const float side = 330 * ImGui::GetFontSize() / 16;
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float w = std::max(200.0f, avail.x - side - ImGui::GetStyle().ItemSpacing.x), h = std::max(150.0f, avail.y);
+    float k = std::min(w / s.v3_w, h / s.v3_h);
+    ImVec2 size(s.v3_w * k, s.v3_h * k);
+    ImGui::BeginGroup();
+    if (s.v3_srv) {
+        ImGui::Image((ImTextureID)(intptr_t)s.v3_srv, size);
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+        if (ImGui::IsItemHovered()) {
+            ImGuiIO& io = ImGui::GetIO();
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) { s.v3_yaw -= io.MouseDelta.x * 0.008f; s.v3_pitch = std::clamp(s.v3_pitch + io.MouseDelta.y * 0.008f, -1.5f, 1.55f); }
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+                // Pan in the ground plane, along the view's right and forward.
+                float m = s.v3_dist * 0.0025f, cy = cosf(s.v3_yaw), sy = sinf(s.v3_yaw);
+                s.v3_follow = false;
+                s.v3_target[0] += (-io.MouseDelta.x * cy - io.MouseDelta.y * sy) * m;
+                s.v3_target[2] += (io.MouseDelta.x * sy - io.MouseDelta.y * cy) * m;
+            }
+            if (io.MouseWheel != 0) s.v3_dist = std::clamp(s.v3_dist * powf(0.88f, io.MouseWheel), 0.5f, 40.0f);
+        }
+    }
+    ImGui::EndGroup();
+    ImGui::SameLine();
+    ImGui::BeginChild("v3side", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    ImGui::SeparatorText("Caméra");
+    ImGui::TextWrapped("Glisser : tourner. Clic droit : déplacer. Molette : zoom.");
+    ImGui::Checkbox("Suivre la tête", &s.v3_follow);
+    if (ImGui::Button("Vue de dessus")) { s.v3_pitch = 1.55f; s.v3_dist = 8; }
+    ImGui::SameLine();
+    if (ImGui::Button("Vue de côté")) { s.v3_pitch = 0.25f; s.v3_dist = 5; }
+    ImGui::SeparatorText("Couches");
+    ImGui::Checkbox("Voxels confirmés (couleur = catégorie, sinon hauteur)", &s.v3_voxels);
+    ImGui::Checkbox("Indices de plans (catégorie, sinon vert/orange)", &s.v3_evidence);
+    ImGui::Checkbox("Profondeur de l'image courante (blanc)", &s.v3_live);
+    ImGui::Checkbox("Plans : sol, murs, tables (bleu, fil de fer)", &s.v3_planes);
+    ImGui::Checkbox("Lignes : jonctions, zone marchable (cyan)", &s.v3_walk);
+    ImGui::Checkbox("Maillage", &s.v3_mesh);
+    ImGui::Checkbox("Trajet de la tête au sol", &s.v3_trail);
+    ImGui::SeparatorText("Lecture");
+    {
+        std::lock_guard<std::mutex> l(room::g.mu);
+        auto& r = room::g;
+        int tables = 0, walls = 0;
+        for (auto& p : r.planes) { tables += p.kind == 1; walls += p.kind == 2; }
+        if (r.has_floor) ImGui::Text("Sol : %.2f m sous l'origine · yeux à %.2f m du sol", -r.floor_y, s.pos[1] - r.floor_y);
+        else ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Sol pas trouvé (grille : yeux à %.2f m, réglage)", s.floor_m);
+        ImGui::Text("%d mur(s) · %d table(s) · marchable %.1f m²", walls, tables, std::count(r.walk.c.begin(), r.walk.c.end(), (uint8_t)1) * r.walk.cell * r.walk.cell);
+        ImGui::Text("%zu voxels · indices %zu", r.voxels, r.dbg_evidence.size() / 6);
+    }
+    ImGui::TextDisabled("Jaune : la tête, son champ et son regard. Rose : le chemin de l'humain.");
+    ImGui::SeparatorText("Segmentation (IA)");
+    {
+        std::string st; float ms, hz;
+        { std::lock_guard<std::mutex> l(semseg::g_mu); st = semseg::g_status; ms = semseg::g_ms; hz = semseg::g_hz; }
+        ImGui::TextDisabled("SegFormer-B0 ADE20K · %s · %.0f ms · %.1f/s", st.c_str(), ms, hz);
+        {
+            std::lock_guard<std::mutex> l(room::g.mu);
+            ImGui::TextDisabled("%zu cellules étiquetées · sol %s · %zu porte(s)/fenêtre(s)", room::g.labelled, room::g.floor_source.empty() ? "pas trouvé" : ("par " + room::g.floor_source).c_str(), room::g.openings.size());
+        }
+        update_sem();
+        if (sem_tex.srv) {
+            float wpx = ImGui::GetContentRegionAvail().x;
+            ImGui::Image((ImTextureID)(intptr_t)sem_tex.srv, ImVec2(wpx, wpx * 9 / 16));
+        }
+        for (int k = 1; k < semseg::NCAT; k++) {
+            const float* cc = semseg::CAT_COLOR[k];
+            ImGui::ColorButton(semseg::CAT_NAME[k], ImVec4(cc[0], cc[1], cc[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(ImGui::GetFontSize(), ImGui::GetFontSize()));
+            ImGui::SameLine(); ImGui::TextUnformatted(semseg::CAT_NAME[k]);
+            if (k % 3 && k + 1 < semseg::NCAT) ImGui::SameLine(0, ImGui::GetFontSize());
+        }
+    }
+    ImGui::TextDisabled("Humain : %s", s.human_state.c_str());
+    ImGui::EndChild();
+}
+
 static void rgb_view(AppState& s) {
     const float em = ImGui::GetFontSize();
     const ImGuiStyle& sty = ImGui::GetStyle();
@@ -348,14 +446,6 @@ static void rgb_view(AppState& s) {
         if (!st.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "VITURE : %s", st.c_str());
         else ImGui::TextDisabled("VITURE : gauche %s · droite %s", l ? "vue" : "—", r ? "vue" : "—");
     }
-    ImGui::Checkbox("Mains réalistes", &s.real_hands);
-    ImGui::SameLine();
-    ImGui::Checkbox("Manches", &s.sleeves);
-    if (s.sleeves) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(7 * ImGui::GetFontSize());
-        ImGui::ColorEdit3("##manche", s.sleeve_color, ImGuiColorEditFlags_NoInputs);
-    }
     ImGui::Checkbox("Ombres de contact", &s.shadows);
     ImGui::SameLine();
     ImGui::Checkbox("Grain et flou de la caméra", &s.camera_look);
@@ -401,6 +491,20 @@ static void build(AppState& s) {
         rec::Status rs; { std::lock_guard<std::mutex> l(rec::g_mu); rs = rec::g_status; }
         if (rs.on) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "● REC %02d:%02d", (int)rs.seconds / 60, (int)rs.seconds % 60); }
     }
+    {
+        // The tracking cameras gone quiet: the engine has no 6DoF until the glasses are replugged.
+        static long last_count = -1; static double last_change = 0;
+        long n; { std::lock_guard<std::mutex> l(g_cams.mu); n = g_cams.count; }
+        double now = ImGui::GetTime();
+        if (n != last_count) { last_count = n; last_change = now; }
+        if (now - last_change > 5 && now > 15) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "Caméras de suivi muettes : pas de 6DoF. Quitter, débrancher 30 s et rebrancher les lunettes.");
+        } else if (s.tracking_lost) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Suivi perdu : scène figée sur la dernière pose valide");
+        }
+    }
     if (!s.notice.empty() && ImGui::GetTime() < s.notice_until) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1, 0.6f, 1), "%s", s.notice.c_str());
@@ -410,6 +514,7 @@ static void build(AppState& s) {
     if (!ImGui::BeginTabBar("vues")) { ImGui::End(); return; }
     int req = s.tab_request; s.tab_request = -1;
     if (ImGui::BeginTabItem("Vue RGB + virtuel", nullptr, req == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { rgb_view(s); ImGui::EndTabItem(); }
+    if (ImGui::BeginTabItem("Scène 3D", nullptr, req == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { scene3d_view(s); ImGui::EndTabItem(); }
     if (!ImGui::BeginTabItem("Diagnostics", nullptr, req == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::EndTabBar(); ImGui::End(); return; }
 
     const float col = ImGui::GetContentRegionAvail().x / 3 - ImGui::GetStyle().ItemSpacing.x;
@@ -424,16 +529,26 @@ static void build(AppState& s) {
     ImGui::Text("Pose %.0f Hz   CPU %.2f ms/image", t.pose_hz, t.cpu_ms);
     ImGui::Text("Tremblement %.2f° (p99 %.2f°)", t.shake_p50, t.shake_p99);
     ImGui::Text("Flottement (erreur de prédiction p95) : %.2f° immobile · %.2f° lent · %.2f° rapide", t.pred_err_still, t.pred_err_moving, t.pred_err_fast);
+    if (s.timewarp) ImGui::Text("après le timewarp : %.2f° lent · %.2f° rapide", t.tw_err_moving, t.tw_err_fast);
     ImGui::TextDisabled("Prédiction utilisée : %.0f %% du mouvement", t.lead_used * 100);
     ImGui::Text("Corrections visuelles  %d en 2 s · %.2f° · %.1f mm", t.corrections, t.corr_deg, t.corr_mm);
     ImGui::Checkbox("Lisser les corrections (sinon elles sautent)", &s.smooth_corrections);
     plot("##shake", tail(s.shake_history, 300), 0, 1.0f, 2.5f * em, "tremblement par image (0–1°)");
     plot("##lat", tail(s.latency_history, 300), 0, 40, 2.5f * em, "pose → écran (0–40 ms)");
     ImGui::SeparatorText("Prédiction");
+    ImGui::Checkbox("Timewarp (rotation relue juste avant l'affichage)", &s.timewarp);
+    if (s.timewarp) ImGui::TextDisabled("pose relue %.1f ms avant le vblank · correction moyenne %.2f° par image", s.tw_margin_ms, s.tw_deg);
     ImGui::Checkbox("Rendu au dernier moment avant l'affichage", &s.late_latch);
     ImGui::TextDisabled("pose lue %.1f ms avant le vblank (marge auto) · prédiction totale %.1f ms", s.late_latch ? s.latch_margin_ms : 16.6f, s.stats.lead_ms);
-    ImGui::SliderFloat("latence de l'écran (ms)", &s.predict_ms, 0, 40, "%.0f");
+    ImGui::SliderFloat("latence de l'écran (ms)", &s.predict_ms, 0, 60, "%.0f");
     ImGui::TextDisabled("Les objets traînent : +   ·   ils partent en avance : −");
+    ImGui::SeparatorText("Test de stabilité");
+    if (ImGui::Button(s.stab_test ? "Enlever la croix (Ctrl+L)" : "Poser la croix devant moi (Ctrl+L)")) s.stab_request = s.stab_test ? 2 : 1;
+    static const char* MODES[4] = {"lissage + timewarp", "sans lissage", "sans timewarp", "ni lissage ni timewarp"};
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    ImGui::Combo("réglage (Ctrl+K)", &s.stab_mode, MODES, 4);
+    ImGui::TextWrapped("Regarde un bord vertical réel (chambranle) et pose la croix dessus. Secoue la tête : si elle traîne, Ctrl+haut ; si elle part en avance, Ctrl+bas. Les touches marchent même sans cliquer sur cette fenêtre.");
+    ImGui::TextDisabled("prédiction du moteur ratée %.1f/s · IMU p99 %.2f ms · vblank ratées en mouvement %ld", s.stats.fallback_hz, s.stats.imu_gap_p99, s.stats.missed_fast);
     ImGui::TextDisabled("Prédiction du moteur VITURE (IMU, ~520 Hz)");
     ImGui::EndChild();
 
@@ -492,7 +607,8 @@ static void build(AppState& s) {
         ImGui::Text("%zu voxels · profondeur %.0f/s · %.0f %% mesurés · %.0f ms", r.voxels, r.rate, r.valid_ratio * 100, r.ms);
         int tables = 0, walls = 0; float floor_y = NAN;
         for (auto& p : r.planes) { if (p.kind == 0) floor_y = p.y; else if (p.kind == 1) tables++; else walls++; }
-        if (!std::isnan(floor_y)) ImGui::Text("Sol à %.2f m sous l'origine · %d surface(s) horizontale(s) · %d mur(s) · maillage %zu triangles", -floor_y, tables, walls, r.mesh.size() / 18);
+        if (!std::isnan(floor_y)) ImGui::Text("Sol à %.2f m sous l'origine · %d table(s) · %d mur(s) · zone marchable %.1f m² · maillage %zu triangles", -floor_y, tables, walls,
+                                              std::count(r.walk.c.begin(), r.walk.c.end(), (uint8_t)1) * r.walk.cell * r.walk.cell, r.mesh_tris);
         // Depth under the gaze (median of the centre 20x20), to check against a tape measure.
         if (r.depth.size() == (size_t)depth::W * depth::H) {
             std::vector<float> c;
@@ -505,9 +621,23 @@ static void build(AppState& s) {
     }
     ImGui::Checkbox("Scanner", &s.scan);
     ImGui::SameLine();
-    ImGui::Checkbox("Afficher le maillage", &s.show_map);
+    ImGui::Checkbox("Afficher la pièce (lignes)", &s.show_map);
+    ImGui::SameLine();
+    ImGui::Checkbox("Maillage (debug)", &s.show_mesh);
     ImGui::SameLine();
     ImGui::Checkbox("Occultation par la pièce", &s.occlusion);
+    ImGui::SeparatorText("Humain virtuel");
+    ImGui::Checkbox("Afficher", &s.human);
+    ImGui::SameLine();
+    ImGui::Checkbox("Se promène", &s.human_wander);
+    ImGui::SameLine();
+    if (ImGui::Button("Viens devant moi")) s.human_request = 1;
+    ImGui::TextDisabled("%s", s.human_state.c_str());
+    {
+        std::lock_guard<std::mutex> l(mcp::g_mu);
+        ImGui::TextDisabled("MCP de la scène : %s · %d appel(s) · repère robot %s", mcp::g_status.c_str(), mcp::g_calls.load(),
+                            mcp::g_robot_ok ? ("calé (" + std::to_string((int)std::lround(mcp::g_robot_rms * 1000)) + " mm)").c_str() : "pas calé");
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Objets posés sur les surfaces", &s.place_on_planes);
     if (ImGui::Button("Ancrer là où je regarde (A)")) s.room_request = 1;

@@ -19,5 +19,11 @@ copy /y "%TMPD%\dml\LICENSE.txt" third_party\directml >nul
 set ZOO=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models
 curl -sL -o models\palm_detection_mediapipe_2023feb.onnx %ZOO%/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx || exit /b 1
 curl -sL -o models\handpose_estimation_mediapipe_2023feb.onnx %ZOO%/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx || exit /b 1
+rem SegFormer-B0 ADE20K (NVIDIA, research licence), ONNX export by Xenova: the room's categories.
+rem Its labels.txt and configs are kept in git.
+set HF=https://huggingface.co/Xenova/segformer-b0-finetuned-ade-512-512/resolve/main
+curl -sL -o models\segformer\model.onnx %HF%/onnx/model.onnx || exit /b 1
+rem The virtual human for the native app, from public/models (Python + numpy).
+python ..\tools\avatar\bake_native.py || echo bake_native.py failed: the human will be missing
 rmdir /s /q "%TMPD%"
 echo done

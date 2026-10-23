@@ -18,7 +18,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <string>
 #include <type_traits>
 
@@ -39,6 +43,8 @@ struct Api {
 };
 inline Api api;
 inline std::atomic<bool> g_on{false};
+inline std::thread g_feeder;  // gives the images to the hand tracking (below)
+inline void feeder();
 
 struct Out {
     float data[N] = {};
@@ -191,14 +197,47 @@ inline bool start(const std::string& sdk, const std::string& yaml, const std::st
     printf("vhands: VITURE hand tracking started (fx %.1f, baseline %.1f mm)\n", inL[0], 1000 * std::sqrt(extLR[12] * extLR[12] + extLR[13] * extLR[13] + extLR[14] * extLR[14]));
     set("");
     g_on = true;
+    g_feeder = std::thread(feeder);
     return true;
 }
 
-/** From the engine's camera callback: the two tracking images (8-bit, w x h each). */
+// The images go to the hand tracking on its own thread: the engine's camera callback only
+// copies them. Calling the hand tracking from the callback held the engine's images back
+// ("gap of image is too large"), and its 6DoF drifted.
+inline std::mutex g_img_mu;
+inline std::condition_variable g_img_cv;
+inline std::vector<unsigned char> g_img[2];
+inline int g_img_w = 0, g_img_h = 0;
+inline double g_img_t = 0;
+inline bool g_img_new = false;
+
+inline void feeder() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    std::vector<unsigned char> l, r;
+    while (g_on) {
+        int w, h; double t;
+        {
+            std::unique_lock<std::mutex> lk(g_img_mu);
+            g_img_cv.wait_for(lk, std::chrono::milliseconds(100), [] { return g_img_new || !g_on; });
+            if (!g_img_new) continue;
+            g_img_new = false;
+            l.swap(g_img[0]); r.swap(g_img[1]); w = g_img_w; h = g_img_h; t = g_img_t;
+        }
+        g_last_img_t = t;
+        api.camera(l.data(), r.data(), (unsigned)(w * h * 2), t);
+    }
+}
+
+/** From the engine's camera callback: the two tracking images (8-bit, w x h each), copied. */
 inline void feed_images(unsigned char* l, unsigned char* r, int w, int h, double t) {
     if (!g_on || !l || !r) return;
-    g_last_img_t = t;
-    api.camera(l, r, (unsigned)(w * h * 2), t);
+    {
+        std::lock_guard<std::mutex> lk(g_img_mu);
+        g_img[0].assign(l, l + (size_t)w * h);
+        g_img[1].assign(r, r + (size_t)w * h);
+        g_img_w = w; g_img_h = h; g_img_t = t; g_img_new = true;  // an unread pair is replaced: the newest wins
+    }
+    g_img_cv.notify_one();
 }
 
 /** From the engine's pose callback: its 16 floats, as SpaceWalker forwards them. */
@@ -210,6 +249,8 @@ inline void feed_pose(float* pose, double t) {
 inline void stop() {
     if (!g_on) return;
     g_on = false;
+    g_img_cv.notify_all();
+    if (g_feeder.joinable()) g_feeder.join();
     api.reg(nullptr, nullptr, nullptr, nullptr);
     api.stop();
     api.uninit();
