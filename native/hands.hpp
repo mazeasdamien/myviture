@@ -95,6 +95,7 @@ struct Result {
 inline std::mutex g_mu;
 inline Result g_result;
 inline FILE* g_log = nullptr;
+inline std::wstring g_log_dir;  // native/, for the per-frame trace
 
 /** Diagnostics to myviture.log (next to the exe) and the console. */
 inline void logf(const char* fmt, ...) {
@@ -104,6 +105,8 @@ inline void logf(const char* fmt, ...) {
     if (g_log) { fprintf(g_log, "%.3f %s", GetTickCount64() / 1000.0, buf); fflush(g_log); }
 }
 inline std::atomic<bool> g_stop{false}, g_enabled{true};
+/** Run the models on the CPU: the GPU is shared with the glasses, depth and dashboard. */
+inline bool g_use_cpu = true;
 inline std::thread g_thread;
 
 // ------------------------------------------------------------------ small helpers
@@ -129,6 +132,19 @@ struct OneEuro {
 
 /** Square, rotated region of interest in an image (pixels). */
 struct Roi { double cx = 0, cy = 0, size = 0, angle = 0; };
+
+/** Wrist speed (m/s) of one side between calls, for the RGB sampling. */
+inline float last_speed_rgb(int sd, const Hand& h, double t) {
+    static float w[2][3]; static double tw[2] = {-1, -1}; static float v[2] = {1, 1};
+    double dt = t - tw[sd];
+    if (tw[sd] >= 0 && dt > 0.005 && dt < 0.3) {
+        float dx = h.joints[0][0] - w[sd][0], dy = h.joints[0][1] - w[sd][1], dz = h.joints[0][2] - w[sd][2];
+        v[sd] = (float)(std::sqrt(dx * dx + dy * dy + dz * dz) / dt);
+    } else if (dt >= 0.3 || tw[sd] < 0) v[sd] = 1;
+    for (int a = 0; a < 3; a++) w[sd][a] = h.joints[0][a];
+    tw[sd] = t;
+    return v[sd];
+}
 
 /** Samples `roi` into an n x n RGB float image in [0, 1] (bilinear, black outside). `px(x, y, rgb)` reads one pixel. */
 template <typename Px>
@@ -198,10 +214,11 @@ struct Models {
                 so.DisableMemPattern();
                 so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
                 Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(so, 0));
-            } else so.SetIntraOpNumThreads(2);
+            } else so.SetIntraOpNumThreads(4);
             return Ort::Session(env, (dir + file).c_str(), so);
         };
         for (bool dml : {true, false}) {
+            if (dml && g_use_cpu) continue;
             try {
                 palm = open(L"palm_detection_mediapipe_2023feb.onnx", dml);
                 lm = open(L"handpose_estimation_mediapipe_2023feb.onnx", dml);
@@ -538,12 +555,37 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
                 matches.push_back(best);
             }
         }
+        // Where each side's hand was last seen (raw wrist, tracking frame), for continuity.
+        static double side_wrist[2][3];
+        static double side_t[2] = {-1, -1};
         std::vector<Hand> out;
         for (auto& m : matches) {
             if (m.gap > 0.04) { logf("hands: stereo pair rejected, palm rays %.0f mm apart\n", m.gap * 1000); continue; }
             Track* L = m.L; Track* R = m.R;
-            // Side: both cameras' running handedness together.
+            // Side: a hand within 12 cm of where one side was seen in the last 0.4 s keeps
+            // that side (the model's handedness flips on a single hand); else both
+            // cameras' running handedness together.
             bool right = L->side + R->side > 1.0f;
+            {
+                double d1[3], d2[3], p[3], gap;
+                rig.cam[0].ray(L->lm[0][0], L->lm[0][1], d1);
+                rig.cam[1].ray(R->lm[0][0], R->lm[0][1], d2);
+                if (calib::triangulate(rig.cam[0].origin, d1, rig.cam[1].origin, d2, p, gap)) {
+                    double best = 0.12; int keep = -1;
+                    for (int sd = 0; sd < 2; sd++) {
+                        if (side_t[sd] < 0 || t_img - side_t[sd] > 0.4) continue;
+                        if (std::any_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == (sd == 1); })) continue;
+                        double d = std::sqrt((p[0] - side_wrist[sd][0]) * (p[0] - side_wrist[sd][0]) + (p[1] - side_wrist[sd][1]) * (p[1] - side_wrist[sd][1]) + (p[2] - side_wrist[sd][2]) * (p[2] - side_wrist[sd][2]));
+                        if (d < best) { best = d; keep = sd; }
+                    }
+                    if (keep >= 0) right = keep == 1;
+                    int sd = right ? 1 : 0;
+                    if (!std::any_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == right; })) {
+                        for (int a = 0; a < 3; a++) side_wrist[sd][a] = p[a];
+                        side_t[sd] = t_img;
+                    }
+                }
+            }
             int side = right ? 1 : 0;
             if (std::any_of(out.begin(), out.end(), [&](const Hand& x) { return x.right == right; })) side = 1 - side, right = !right;
             Hand hd; hd.right = right;
@@ -605,7 +647,15 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
         // current RGB model projects it; found, the joints feed the model's fit (only
         // while the hand is still, so the two cameras' timings do not matter).
         int rgb_w = 0, rgb_h = 0;
-        if (!out.empty()) {
+        static double rgb_last_t = 0;
+        bool rgb_due = t_img - rgb_last_t > (rgbcal::get().fitted ? 0.5 : 0.25);
+        bool any_still = false;
+        for (auto& hd : out) {
+            int sd = hd.right ? 1 : 0;
+            if (!hd.held && last_speed_rgb(sd, hd, t_img) < 0.15f) any_still = true;
+        }
+        if (!out.empty() && rgb_due && any_still) {
+            rgb_last_t = t_img;
             static uint32_t rgb_seq = 0;
             static std::vector<float> crops[2];
             static Roi crop_roi[2];
@@ -668,6 +718,30 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
 
         double t1 = qpc_s();
         frames++;
+        // Per-frame trace (native/hands_frames.csv): timing of each step and what each
+        // camera follows, to find stalls and losses.
+        {
+            static FILE* csv = nullptr;
+            static double last_end = 0, t_start = qpc_s();
+            if (!csv && g_log_dir.size()) {
+                csv = _wfopen((g_log_dir + L"hands_frames.csv").c_str(), L"w");
+                if (csv) fprintf(csv, "t_s,gap_ms,loop_ms,palm_ms,image_age_ms,cam0_on,cam0_pres,cam0_miss,cam1_on,cam1_pres,cam1_miss,hands,h0_side,h0_gap_mm,h0_scale,h0_gesture,h0_held,h1_side,h1_gap_mm,h1_scale,h1_gesture,h1_held\n");
+            }
+            if (csv) {
+                auto cam = [&](int c, float& pres, int& miss) { int on = 0; pres = 0; miss = 0; for (auto& tr : tracks[c]) if (tr.on) { on++; pres = std::max(pres, tr.presence); miss = std::max(miss, tr.misses); } return on; };
+                float p0, p1; int m0, m1;
+                int on0 = cam(0, p0, m0), on1 = cam(1, p1, m1);
+                fprintf(csv, "%.3f,%.1f,%.1f,%.1f,%.1f,%d,%.2f,%d,%d,%.2f,%d,%zu", t1 - t_start, last_end > 0 ? (t0 - last_end) * 1000 : 0, (t1 - t0) * 1000, t_palm * 1000, (t1 - t_img) * 1000, on0, p0, m0, on1, p1, m1, out.size());
+                for (size_t i = 0; i < 2; i++) {
+                    if (i < out.size()) fprintf(csv, ",%s,%.1f,%.2f,%d,%d", out[i].right ? "R" : "L", out[i].gap_mm, out[i].scale_ratio, out[i].gesture, out[i].held ? 1 : 0);
+                    else fprintf(csv, ",,,,,");
+                }
+                fprintf(csv, "\n");
+                static int lines = 0;
+                if (++lines % 25 == 0) fflush(csv);
+            }
+            last_end = t1;
+        }
         if (t1 - rate_t0 > 1) {
             rate = (float)(frames / (t1 - rate_t0)); palm_rate = palms; frames = palms = 0; rate_t0 = t1;
             // Once a second: what each camera follows, and the stereo hands.
@@ -696,6 +770,7 @@ inline void run(std::wstring model_dir, calib::Rig rig) {
 inline void start(const std::wstring& model_dir, const calib::Rig& rig) {
     std::wstring dir = model_dir.substr(0, model_dir.find_last_of(L'\\', model_dir.size() - 2) + 1);
     g_log = _wfopen((dir + L"myviture.log").c_str(), L"w");
+    g_log_dir = dir;
     g_thread = std::thread(run, model_dir, rig);
 }
 inline void stop() { g_stop = true; if (g_thread.joinable()) g_thread.join(); }

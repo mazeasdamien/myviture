@@ -19,3 +19,6 @@ native/models/*.onnx
 native/*.dll
 native/*.err
 native/*.png
+native/*.csv
+native/viture_config.yaml
+native/myviture_settings.txt

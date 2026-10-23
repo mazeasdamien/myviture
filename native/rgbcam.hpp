@@ -80,6 +80,7 @@ inline IMFMediaSource* open_source(std::string& name) {
 }
 
 inline void run() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
     while (!g_stop) {

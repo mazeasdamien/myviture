@@ -239,7 +239,9 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
         std::vector<float> pts;
         if (refresh) {
             last_planes = now;
+            double tr0 = hands::qpc_s();
             planes = find_planes(map, head_min_y);
+            double tr1 = hands::qpc_s();
             // Drawing snapshot: confirmed voxels, coloured by height, at most 120k.
             size_t n_conf = 0;
             for (auto& [k, v] : map) if (confirmed(v)) n_conf++;
@@ -252,6 +254,7 @@ inline void run(calib::Rig rig, PoseFn pose_at) {
                 float t = std::clamp((y - floor_y) / 2.0f, 0.0f, 1.0f);
                 pts.insert(pts.end(), {x, y, z, 0.2f + 0.8f * t, 0.5f + 0.3f * (1 - t), 1.0f - 0.7f * t});
             }
+            hands::logf("room: refresh %zu voxels, planes %.0f ms, snapshot %.0f ms\n", map.size(), (tr1 - tr0) * 1000, (hands::qpc_s() - tr1) * 1000);
         }
         std::lock_guard<std::mutex> l(g.mu);
         g.depth = df.depth;

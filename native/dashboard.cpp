@@ -22,6 +22,7 @@
 #include "orange.hpp"
 #include "rgbcam.hpp"
 #include "hands.hpp"
+#include "vhands.hpp"
 #include "rgbcal.hpp"
 #include "roommap.hpp"
 
@@ -389,9 +390,25 @@ static void build(AppState& s) {
     { std::lock_guard<std::mutex> l(hands::g_mu); hr = hands::g_result; }
     // Fixed height (three lines), so the images below never move.
     const float line = ImGui::GetTextLineHeightWithSpacing();
-    ImGui::BeginChild("handinfo", ImVec2(0, 3 * line + sty.FramePadding.y * 2), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild("handinfo", ImVec2(0, 4 * line + sty.FramePadding.y * 2), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     ImGui::Checkbox("Mains", &s.hands);
     hands::g_enabled = s.hands;
+    ImGui::SameLine();
+    ImGui::TextDisabled("dans la scène :");
+    ImGui::SameLine();
+    ImGui::RadioButton("VITURE", &s.hand_source, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("les nôtres", &s.hand_source, 0);
+    {
+        static long last_n = 0; static double last_t = 0; static float rate = 0;
+        long n; std::string st; bool l = false, r = false;
+        { std::lock_guard<std::mutex> lk(vhands::g_mu); n = vhands::g_out.count; st = vhands::g_out.status; l = vhands::g_out.data[0] != 0; r = vhands::g_out.data[vhands::PER_HAND] != 0; }
+        double now = ImGui::GetTime();
+        if (now - last_t > 1) { rate = (float)((n - last_n) / (now - last_t)); last_n = n; last_t = now; }
+        if (!st.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "VITURE : %s", st.c_str());
+        else ImGui::TextDisabled("VITURE : %.0f réponses/s · gauche %s · droite %s", rate, l ? "vue" : "—", r ? "vue" : "—");
+    }
+    ImGui::TextDisabled("les nôtres :");
     ImGui::SameLine();
     if (!hr.status.empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", hr.status.c_str());
     else ImGui::TextDisabled("%.0f/s · %s · %.0f ms/paire · image → main %.0f ms", hr.rate, hr.device.c_str(), hr.ms_total, hr.latency_ms);

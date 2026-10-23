@@ -19,6 +19,7 @@
 #include "hands.hpp"
 #include "rgbcal.hpp"
 #include "roommap.hpp"
+#include "vhands.hpp"
 #include "textpanel.hpp"
 #include "state.hpp"
 
@@ -392,6 +393,7 @@ static std::vector<Vertex> grid_vertices() {
 // ------------------------------------------------------------------ window
 
 static AppState g_app;
+static bool g_no_room = false, g_no_rgb = false, g_no_vhands = false;  // test switches: --no-room, --no-rgb
 static std::string g_settings_path;
 static void save_settings() {
     if (g_settings_path.empty()) return;
@@ -417,8 +419,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 static BOOL WINAPI on_ctrl(DWORD) { g_quit = true; return TRUE; }
 
-// Engine callbacks: only the pose is used for now (polled), the rest comes later.
-static void on_pose(float*, double) {}
+// Engine callbacks: the pose is polled; its callback and the images also feed VITURE's
+// hand tracking.
+static void on_pose(float* d, double t) { vhands::feed_pose(d, t); }
 static void on_vsync(double) {}
 static void on_imu(float* d, double t) {
     g_imu_qpc = qpc_now();
@@ -432,6 +435,7 @@ static void on_imu(float* d, double t) {
     g_imu.count++;
 }
 static void on_cam(unsigned char* l, unsigned char* r, unsigned char*, unsigned char*, double t, int w, int h) {
+    vhands::feed_images(l, r, w, h, t);
     std::lock_guard<std::mutex> lk(g_cams.mu);
     if (l) g_cams.px[0].assign(l, l + (size_t)w * h);
     if (r) g_cams.px[1].assign(r, r + (size_t)w * h);
@@ -463,6 +467,10 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--sdk") && i + 1 < argc) sdk = argv[++i];
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) run_seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--probe")) probe_only = true;
+        else if (!strcmp(argv[i], "--hands-gpu")) hands::g_use_cpu = false;
+        else if (!strcmp(argv[i], "--no-room")) g_no_room = true;
+        else if (!strcmp(argv[i], "--no-rgb")) g_no_rgb = true;
+        else if (!strcmp(argv[i], "--no-vhands")) g_no_vhands = true;
         else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) snapshot_s = atof(argv[++i]);
     }
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -694,7 +702,7 @@ int main(int argc, char** argv) {
         if (!dash::init(dev, ctx, mi.rcWork, ini)) fprintf(stderr, "dashboard window failed\n");
     }
     g_app.screen_w = W; g_app.screen_h = H;
-    rgbcam::start();
+    if (!g_no_rgb) rgbcam::start();
     {
         // Hands: factory calibration (cached by the web app's dev server) and the models.
         wchar_t exe[MAX_PATH];
@@ -712,9 +720,19 @@ int main(int argc, char** argv) {
             fclose(f);
         }
         { std::lock_guard<std::mutex> l(rgbcal::g_mu); if (rgbcal::load(rgbcal::g_path, rgbcal::g_cam)) printf("RGB camera fit loaded\n"); }
+        // VITURE's hand tracking, with the engine's camera calibration (its YAML, kept next
+        // to the exe for reference).
+        {
+            typedef const char* (*ConfigFn)();
+            auto cfg = (ConfigFn)GetProcAddress(GetModuleHandleA("carina_vio.dll"), "carina_a1088_viture_get_config");
+            std::string yaml = cfg && cfg() ? cfg() : "";
+            std::string d8(dir.begin(), dir.end());
+            if (FILE* f = fopen((d8 + "viture_config.yaml").c_str(), "w")) { fputs(yaml.c_str(), f); fclose(f); }
+            if (!g_no_vhands) vhands::start(sdk, yaml, d8 + "vhands_raw.csv");
+        }
         if (rig.ok) {
             hands::start(dir + L"models\\", rig);
-            room::start(rig, [](double t, float* out) { M4 r; if (!engine_pose(t, r)) return false; memcpy(out, r.m, sizeof r.m); return true; },
+            if (!g_no_room) room::start(rig, [](double t, float* out) { M4 r; if (!engine_pose(t, r)) return false; memcpy(out, r.m, sizeof r.m); return true; },
                         std::string(dir.begin(), dir.end()) + "myviture_anchors.txt");
         }
         else { std::lock_guard<std::mutex> l(hands::g_mu); hands::g_result.status = "calibration.bin introuvable (dossier du projet)"; }
@@ -885,7 +903,76 @@ int main(int argc, char** argv) {
         std::vector<SceneHand> scene_hands;
         hands::Result hr;
         { std::lock_guard<std::mutex> l(hands::g_mu); if (qpc_now() / qpc_freq() - hands::g_result.t < 0.25) hr.hands = hands::g_result.hands; hr.t = hands::g_result.t; hr.seq = hands::g_result.seq; }
-        if (g_app.hands) {
+        // Side by side, for VITURE's joint frame: our hands (head frame) with the engine's pose
+        // at their image, and VITURE's latest raw answer (vhands_pairs.csv).
+        if (vhands::g_on && !hr.hands.empty()) {
+            static uint32_t logged_seq = 0;
+            static FILE* pairs = nullptr;
+            static int rows = 0;
+            vhands::Out vo;
+            { std::lock_guard<std::mutex> l(vhands::g_mu); vo = vhands::g_out; }
+            M4 at;
+            if (hr.seq != logged_seq && rows < 4000 && (vo.data[0] != 0 || vo.data[vhands::PER_HAND] != 0) && std::fabs(vo.t - hr.t) < 0.2 && engine_pose(hr.t, at)) {
+                logged_seq = hr.seq;
+                if (!pairs) {
+                    char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
+                    std::string d = exe; d = d.substr(0, d.find_last_of('\\') + 1);
+                    pairs = fopen((d + "vhands_pairs.csv").c_str(), "w");
+                }
+                if (pairs) {
+                    fprintf(pairs, "%.4f,%.4f", hr.t, vo.t);
+                    for (int i = 0; i < 16; i++) fprintf(pairs, ",%.5f", at.m[i]);
+                    for (int hh = 0; hh < 2; hh++) {
+                        const hands::Hand* h = hh < (int)hr.hands.size() ? &hr.hands[hh] : nullptr;
+                        fprintf(pairs, ",%d", h ? (h->right ? 1 : 0) : -1);
+                        for (int k = 0; k < hands::N_JOINTS; k++) for (int a = 0; a < 3; a++) fprintf(pairs, ",%.4f", h ? h->joints[k][a] : 0.f);
+                    }
+                    for (int hh = 0; hh < 2; hh++) {
+                        const float* v = vo.data + hh * vhands::PER_HAND;
+                        fprintf(pairs, ",%g", v[0]);
+                        for (int k = 0; k < vhands::JOINTS; k++) for (int a = 0; a < 3; a++) fprintf(pairs, ",%.4f", v[1 + k * vhands::STRIDE + a]);
+                    }
+                    fprintf(pairs, "\n");
+                    if (++rows % 50 == 0) fflush(pairs);
+                }
+            }
+        }
+        if (g_app.hands && g_app.hand_source == 1 && vhands::g_on) {
+            // VITURE's hands: already in the engine's world, so only the recentring remains.
+            vhands::Out vo;
+            { std::lock_guard<std::mutex> l(vhands::g_mu); vo = vhands::g_out; }
+            static bool pinch_state[2] = {false, false};
+            static int shown[2] = {0, 0}, cand[2] = {0, 0}, count[2] = {0, 0};
+            static uint32_t seen_seq = 0;
+            bool fresh = vo.seq != seen_seq;
+            seen_seq = vo.seq;
+            if (qpc_now() / qpc_freq() - vo.t < 0.25) {
+                for (int side = 0; side < 2; side++) {
+                    float w[21][3];
+                    if (!vhands::hand_world(vo.data, side, w)) { pinch_state[side] = false; continue; }
+                    SceneHand sh{side == 1, false, 0, {}};
+                    for (int k = 0; k < hands::N_JOINTS; k++) {
+                        const float* q = w[k];
+                        sh.j[k] = {recenter(0, 0) * q[0] + recenter(0, 1) * q[1] + recenter(0, 2) * q[2] + recenter(0, 3),
+                                   recenter(1, 0) * q[0] + recenter(1, 1) * q[1] + recenter(1, 2) * q[2] + recenter(1, 3),
+                                   recenter(2, 0) * q[0] + recenter(2, 1) * q[1] + recenter(2, 2) * q[2] + recenter(2, 3)};
+                    }
+                    // Pinch with hysteresis, gesture after 3 agreeing answers (as for ours).
+                    float dx = w[4][0] - w[8][0], dy = w[4][1] - w[8][1], dz = w[4][2] - w[8][2];
+                    float pinch = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    pinch_state[side] = pinch_state[side] ? pinch < 0.04f : pinch < 0.025f;
+                    sh.pinching = pinch_state[side];
+                    if (fresh) {
+                        float ext[5];
+                        int g = hands::classify(w, sh.pinching, ext);
+                        if (g == cand[side]) count[side]++; else { cand[side] = g; count[side] = 1; }
+                        if (count[side] >= 3 || g == 1) shown[side] = g;
+                    }
+                    sh.gesture = shown[side];
+                    scene_hands.push_back(sh);
+                }
+            }
+        } else if (g_app.hands) {
             M4 at;
             if (!hr.hands.empty() && engine_pose(hr.t, at)) {
                 M4 to_scene = mul(recenter, at);
@@ -961,18 +1048,28 @@ int main(int argc, char** argv) {
         // Test panel: gestures per hand, poke on its button with the index tip.
         if (panel_ok && g_app.panel) {
             using namespace panel;
-            // Hysteresis: pressed under 1 cm from the surface, released only beyond 3 cm or
-            // 1.5 cm outside the button, so the fingertip's jitter does not toggle it.
+            // Hysteresis: pressed within 2.5 cm around the button and under 2 cm from the
+            // surface (or through it), released only 4 cm outside or 5 cm in front, so the
+            // fingertip's jitter does not toggle it. The tracked hand and the drawn panel
+            // differ by the calibration's error: the margin absorbs it.
             bool pressed = false, released = true;
+            float best_d = 1e9f, best[3] = {0, 0, 0};
             for (auto& h : scene_hands) {
                 V3 t = h.j[8];
                 float lx = t.x - PANEL_AT.x, ly = t.y - PANEL_AT.y, lz = t.z - PANEL_AT.z;
-                if (lx > BX0 && lx < BX1 && ly > BY0 && ly < BY1 && lz < 0.01f && lz > -0.06f) pressed = true;
-                const float m = 0.015f;
-                if (lx > BX0 - m && lx < BX1 + m && ly > BY0 - m && ly < BY1 + m && lz < 0.03f && lz > -0.08f) released = false;
+                const float m = 0.025f, r = 0.04f;
+                if (lx > BX0 - m && lx < BX1 + m && ly > BY0 - m && ly < BY1 + m && lz < 0.02f && lz > -0.12f) pressed = true;
+                if (lx > BX0 - r && lx < BX1 + r && ly > BY0 - r && ly < BY1 + r && lz < 0.05f && lz > -0.15f) released = false;
+                // Index tip relative to the button's centre, for the panel's line.
+                float dx = lx - (BX0 + BX1) / 2, dy = ly - (BY0 + BY1) / 2;
+                float d = dx * dx + dy * dy + lz * lz;
+                if (d < best_d) { best_d = d; best[0] = dx; best[1] = dy; best[2] = lz; }
             }
             double now_s = qpc_now() / qpc_freq();
-            if (!poke_inside && pressed) { poke_inside = true; pokes++; }
+            if (!poke_inside && pressed) {
+                poke_inside = true; pokes++;
+                hands::logf("panel: poke %d, index %.1f %.1f %.1f cm from the button\n", pokes, best[0] * 100, best[1] * 100, best[2] * 100);
+            }
             else if (poke_inside && released) poke_inside = false;
             if (poke_inside) lit_until = now_s + 0.3;
             lit = now_s < lit_until;
@@ -985,6 +1082,11 @@ int main(int argc, char** argv) {
             char buf[96];
             snprintf(buf, sizeof buf, "Bouton touché %d fois (index dans le carré)", pokes);
             lines.push_back(buf);
+            // Where the tracked index tip is against the button: shows the overlay's error.
+            if (best_d < 1e8f) {
+                snprintf(buf, sizeof buf, "Index : %+.0f cm droite, %+.0f cm haut, %.0f cm %s", best[0] * 100, best[1] * 100, std::fabs(best[2]) * 100, best[2] > 0 ? "devant" : "derrière");
+                lines.push_back(buf);
+            }
             test_panel.draw(ctx, "myViture · test des mains", lines, lit ? "touché !" : "touche-moi", lit);
         }
 
@@ -1280,6 +1382,7 @@ int main(int argc, char** argv) {
     // Whatever hangs on the way out (engine, camera, GPU), the process ends.
     CreateThread(nullptr, 0, [](LPVOID) -> DWORD { Sleep(6000); fflush(stdout); TerminateProcess(GetCurrentProcess(), 0); return 0; }, nullptr, 0, nullptr);
     room::stop();
+    vhands::stop();
     hands::stop();
     rgbcam::stop();
     dash::shutdown();
